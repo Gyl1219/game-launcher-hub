@@ -1,0 +1,44 @@
+# 项目数据（非缓存，但含本地配置与运行态，不进版本控制）
+.workbuddy/
+
+# 本地镜像仓库（含嵌套 git，且为运行时生成，不进版本控制）
+repos/
+
+# 本机临时启动脚本（含非 ASCII 路径编码风险，不进版本控制）
+启动OK游戏助手.cmd
+改名_OKApps_一键.bat
+*.lnk
+
+# 运行日志
+logs/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 本地临时脚本
+*.tmp
+
+# 用户本机可能生成的配置备份
+*.bak
+*.lnk
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# 运行期缓存（本地数据，不进版本控制）
+.cache/
+
+# 本机开发草稿：含硬编码的本机绝对路径（D:\OKApps\、D:\桌面\），不进版本控制
+_patch_mc.py
+rebuild_lnk.py
+*.bak_preprog*
+
+# 本机一键脚本（含中文路径，跨平台不可用）
+*.cmd
+*.bat
+
+# 本机实际配置（含个人安装路径与 MirrorChyan CDK），不进版本控制。
+# 新用户请复制 config.example.json 为 config.json 后自行修改。
+config.json
