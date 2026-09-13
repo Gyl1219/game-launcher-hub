@@ -59,11 +59,25 @@ from qfluentwidgets import (
 # 现已改为直接读本地 git 仓库（GitVersionFetcher），只读本地文件、不需要管理员，
 # 故删除自提权逻辑：既消除每次启动的 UAC 弹窗 + 命令行闪烁，也不再无谓地重启进程。
 
+# 启动器自身版本（打包版 / 源码版共用）。发新版时只改这一处，
+# 显示在「设置」页页脚，便于报 bug 时说清自己在跑哪个版本。
+APP_VERSION = "0.1.0"
+
 # ===== 应用配置（从 config.json 加载，避免硬编码路径） =====
-LAUNCHER_DIR = os.path.dirname(os.path.abspath(__file__))
+# 打包后（PyInstaller）两个目录必须分开算，否则图标全找不到：
+#   APP_DIR = exe 所在目录  → 放用户数据（config.json / repos / logs / .cache）
+#   RES_DIR = sys._MEIPASS  → 放随包只读资源（assets 图标、config.example.json）
+# 源码直接运行时两者都是脚本所在目录，行为与以前完全一致。
+if getattr(sys, "frozen", False):
+    APP_DIR = os.path.dirname(sys.executable)
+    RES_DIR = getattr(sys, "_MEIPASS", APP_DIR)
+else:
+    APP_DIR = RES_DIR = os.path.dirname(os.path.abspath(__file__))
+
+LAUNCHER_DIR = APP_DIR
 # 图标统一使用 ok-script 官网 project-icons（已缓存到启动器自身 assets 目录），
 # 各 app 的 app.json / working 默认只读展示；「应用到 working 目录」为用户主动授权的写入动作。
-ASSETS_DIR = os.path.join(LAUNCHER_DIR, "assets")
+ASSETS_DIR = os.path.join(RES_DIR, "assets")
 # 独立镜像仓库目录：clone / fetch  ️只发生在这里，原启动器的 repo/ 完全不碰。
 # 目录结构：LAUNCHER_REPOS_DIR/<key>/  （即一份独立的 git 仓库）
 REPOS_DIR = os.path.join(LAUNCHER_DIR, "repos")
@@ -96,6 +110,15 @@ def load_apps():
     这样他人 clone 后只需改 config.json 的 install_root 即可，无需改动代码。
     """
     cfg_path = os.path.join(LAUNCHER_DIR, "config.json")
+    # 首次运行（典型场景：打包版解压后直接双击 exe）还没有 config.json —— 从随包带的
+    # config.example.json 复制一份当初始配置，免得一启动就抛错把人劝退。
+    if not os.path.isfile(cfg_path):
+        example_path = os.path.join(RES_DIR, "config.example.json")
+        try:
+            if os.path.isfile(example_path):
+                shutil.copyfile(example_path, cfg_path)
+        except Exception:
+            pass
     try:
         with open(cfg_path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
@@ -4291,6 +4314,11 @@ class SettingsPage(QWidget):
         self.save_btn.clicked.connect(self._on_save)
         root.addWidget(self.save_btn)
         root.addStretch(1)
+        # 版本号固定钉在页脚：报 bug 时能说清自己在跑哪个版本（不占标题栏）
+        ver = CaptionLabel("版本 v%s" % APP_VERSION)
+        ver.setStyleSheet("color:#888780; font-size:11px;")
+        ver.setAlignment(Qt.AlignLeft)
+        root.addWidget(ver)
 
     def _cfg_path(self):
         return os.path.join(LAUNCHER_DIR, "config.json")
