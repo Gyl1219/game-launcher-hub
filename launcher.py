@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-OK 游戏助手 - 统一管理窗口（WeGame 风格游戏库）
+游戏助手启动器 - 统一管理窗口（WeGame 风格游戏库）
 
 设计原则：本窗口只做「启动器」该做的事，默认不碰原启动器的目录；但 working/ 属于
 官方仓库范畴（用户已授权可写），仅在用户明确点击「应用到 working 目录」时才写入：
@@ -4052,14 +4052,14 @@ class SideBar(QWidget):
         bl.setContentsMargins(12, 0, 8, 0)
         bl.setSpacing(10)
         logo = QLabel()
-        logo_path = os.path.join(ASSETS_DIR, "ok-script-app.png")
+        logo_path = os.path.join(ASSETS_DIR, "launcher-icon.png")
         if os.path.exists(logo_path):
             logo.setPixmap(QPixmap(logo_path).scaled(
                 28, 28, Qt.KeepAspectRatio, Qt.SmoothTransformation))
         logo.setFixedSize(28, 28)
         logo.setStyleSheet("background:transparent;")
         bl.addWidget(logo)
-        name = QLabel("OK 游戏助手")
+        name = QLabel("游戏助手启动器")
         name.setStyleSheet(
             "color:#ffffff; font-size:15px; font-weight:700; background:transparent;")
         bl.addWidget(name)
@@ -4388,11 +4388,11 @@ def _make_scroll_page(child, max_width=900):
 class Launcher(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("OK 游戏助手")
+        self.setWindowTitle("游戏助手启动器")
         self.setMinimumSize(1080, 680)
         self.resize(1240, 800)
-        # 窗口图标用「OK 游戏助手」通用图标，而不是某个具体游戏图标
-        self.setWindowIcon(QIcon(os.path.join(ASSETS_DIR, "ok-script-app.png")))
+        # 窗口图标用「游戏助手启动器」通用图标，而不是某个具体游戏图标
+        self.setWindowIcon(QIcon(os.path.join(ASSETS_DIR, "launcher-icon.png")))
 
         root = QHBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
