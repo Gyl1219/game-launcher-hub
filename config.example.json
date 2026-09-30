@@ -33,6 +33,17 @@
       "pythonw": "ok-end-field/data/apps/ok-end-field/python/pythonw.exe",
       "icon": "assets/ok-end-field.png",
       "website": "https://ok-script.com/ok-end-field/"
+    },
+    {
+      "key": "whimbox",
+      "display": "奇想盒",
+      "lite": true,
+      "exe": "D:/Users/16101/AppData/Local/Programs/whimbox_app/whimbox_app.exe",
+      "app_json": "",
+      "working": "",
+      "pythonw": "",
+      "icon": "whimbox.png",
+      "website": "https://github.com/nikkigallery/Whimbox"
     }
   ]
 }

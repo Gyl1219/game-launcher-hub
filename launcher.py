@@ -61,7 +61,7 @@ from qfluentwidgets import (
 
 # 启动器自身版本（打包版 / 源码版共用）。发新版时只改这一处，
 # 显示在「设置」页页脚，便于报 bug 时说清自己在跑哪个版本。
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"
 
 # ===== 应用配置（从 config.json 加载，避免硬编码路径） =====
 # 打包后（PyInstaller）两个目录必须分开算，否则图标全找不到：
@@ -2526,6 +2526,11 @@ class AppCard(CardWidget):
 
     def rebuild_body(self):
         """根据当前 app.json 是否有效，重建动态区。"""
+        # lite 模式（非 ok-script 系助手，如奇想盒 Whimbox）：没有 app_json/working/pythonw，
+        # 不参与版本与更新体系，只保留「启动 / 强制关闭 / 运行状态 / 卸载」四件套。
+        if self.app.get("lite"):
+            return self._rebuild_lite_body()
+
         self.data = load_app_json(self.app["app_json"])
         self.profile = get_current_profile(self.data)
         # 三态：
@@ -2612,6 +2617,93 @@ class AppCard(CardWidget):
 
         # 更新进度（含未安装时若 app.json 仍含更新状态，也显示）
         self.update_progress_ui()
+
+    def _rebuild_lite_body(self):
+        """lite 模式专用重建：exe 存在即视为「已安装」，全程不读 app.json。"""
+        cfg_exe = self.app.get("exe", "") or ""
+        self._lite = True
+        self._installed = bool(cfg_exe) and os.path.isfile(cfg_exe)
+        self._host_ready = False
+        self._host_actual = ""
+        self._install_dir = os.path.dirname(cfg_exe) or ""
+        self.data = {}
+        self.profile = {}
+
+        self.cover.setPixmap(make_icon(self.app["icon"]).pixmap(96, 96))
+        self.profile_tag.clear()
+        self.profile_tag.setVisible(False)
+
+        if self._installed:
+            self.ver_tag.setText("lite")
+            self.ver_tag.setStyleSheet(
+                "background-color:#455a64; color:#ffffff; border-radius:6px; "
+                "padding:2px 8px; font-size:11px;"
+            )
+            self.status_label.setText("")
+            self.badge.setText("已安装")
+            self.badge.setStyleSheet(
+                "background-color:#2e7d32; color:#ffffff; border-radius:9px; "
+                "padding:3px 12px; font-size:12px; font-weight:600;"
+            )
+        else:
+            self.ver_tag.setText("未安装")
+            self.ver_tag.setStyleSheet(
+                "background-color:#616161; color:#ffffff; border-radius:6px; "
+                "padding:2px 8px; font-size:11px;"
+            )
+            self.status_label.setText("未检测到本地安装")
+            self.badge.setText("未安装")
+            self.badge.setStyleSheet(
+                "background-color:rgba(255,255,255,0.15); color:#cfcfcf; "
+                "border-radius:9px; padding:3px 12px; font-size:12px; font-weight:600;"
+            )
+
+        self.clear_body()
+        self.build_lite_body()
+
+        # 兜底：与 ok-script 卡一致，强制隐藏安装进度三件套
+        self._hide_install_progress_ui()
+        self.update_progress_ui()
+        # 立即刷一次运行态（refresh_badge 内部会调 _refresh_start_btn + run_tag，
+        # 否则按钮要等下一轮 5 秒轮询才有槽，点了没反应）
+        self.refresh_badge()
+
+    def build_lite_body(self):
+        """lite 模式动态区：已安装 = 启动/强关 + 卸载；未安装 = 提示 + 官网按钮。"""
+        if self._installed:
+            self.start_btn = PushButton("▶  启动应用")
+            self.start_btn.setFixedHeight(42)
+            self.start_btn.setStyleSheet(
+                "QPushButton { background-color:#2e7d32; color:white; border-radius:8px; "
+                "font-weight:600; } QPushButton:hover { background-color:#1b5e20; }"
+            )
+            # 槽随运行态切换（见 _refresh_start_btn），与 ok-script 卡一致
+            self.body_box.addWidget(self.start_btn)
+
+            self.uninstall_btn = PushButton("卸载此助手")
+            self.uninstall_btn.setFixedHeight(38)
+            self.uninstall_btn.setStyleSheet(
+                "QPushButton { background-color:rgba(255,82,82,0.10); "
+                "color:#ff6b6b; border:1px solid #ff5252; border-radius:8px; "
+                "font-weight:600; } "
+                "QPushButton:hover { background-color:rgba(255,82,82,0.22); "
+                "color:#ff8585; } "
+                "QPushButton:pressed { background-color:rgba(255,82,82,0.35); }"
+            )
+            self.uninstall_btn.setCursor(Qt.PointingHandCursor)
+            self.uninstall_btn.clicked.connect(self.uninstall_app)
+            self.body_box.addWidget(self.uninstall_btn)
+        else:
+            self.status_label.setText(
+                "未检测到本地安装。lite 助手不支持一键安装，请从官方渠道获取。")
+            site = self.app.get("website", "")
+            if site:
+                btn = PushButton("打开官网")
+                btn.setFixedHeight(36)
+                btn.setCursor(Qt.PointingHandCursor)
+                btn.clicked.connect(
+                    lambda url=site: QDesktopServices.openUrl(QUrl(url)))
+                self.body_box.addWidget(btn)
 
     def build_installed_body(self):
         # 按钮行
@@ -2828,6 +2920,18 @@ class AppCard(CardWidget):
         self.changelog_text.setMinimumHeight(max(120, doc_h + extra))
 
     def refresh_data(self):
+        # lite 模式：无 app_json 可读，只维护「安装态 + 运行态」
+        if self.app.get("lite"):
+            exe = self.app.get("exe", "") or ""
+            now_installed = bool(exe) and os.path.isfile(exe)
+            if now_installed != self._installed:
+                self.rebuild_body()
+                return
+            if not self._installed:
+                return
+            self.refresh_badge()
+            return
+
         data = load_app_json(self.app["app_json"])
         now_installed = bool(data)
         if now_installed != self._installed:
@@ -3027,8 +3131,22 @@ class AppCard(CardWidget):
         )
         if ans != QMessageBox.StandardButton.Yes:
             return
-        key = _pyapp_title_key(self.app)  # PyAppify 内部名，如 ok-ef / ok-nte
-        ok, msg = _kill_app_by_title(key)
+        if self.app.get("lite"):
+            # Electron 等普通 exe：按镜像名整棵进程树终止。
+            # _kill_app_by_title 只匹配 pythonw.exe（PyAppify 形态），对 whimbox_app.exe 无效。
+            exe_name = os.path.basename(self.app.get("exe", "")) or ""
+            r = subprocess.run(
+                ["taskkill", "/IM", exe_name, "/F", "/T"],
+                capture_output=True, text=True,
+                encoding="gbk", errors="replace",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            ok = r.returncode == 0
+            msg = ("已终止 %s" % exe_name) if ok else (
+                "终止失败：%s" % ((r.stderr or r.stdout or "").strip() or "未知错误"))
+        else:
+            key = _pyapp_title_key(self.app)  # PyAppify 内部名，如 ok-ef / ok-nte
+            ok, msg = _kill_app_by_title(key)
         QMessageBox.information(self.window(), "强制关闭", msg)
         # 立即刷新状态（不依赖下次 5 秒轮询）
         self.refresh_data()
@@ -3379,6 +3497,22 @@ class AppCard(CardWidget):
     # ===== 动作：启动（直接跑游戏助手本体，这是启动器的本职） =====
     def launch_app(self):
         app = self.app
+        # lite 模式：没有 working/pythonw，直接启动 exe 本体
+        if app.get("lite"):
+            exe = app.get("exe", "") or ""
+            if not exe or not os.path.isfile(exe):
+                QMessageBox.critical(
+                    self.window(), "启动失败",
+                    f"找不到程序：\n{exe or '（未配置 exe 路径）'}",
+                )
+                return
+            ok = run_exe(self.window(), exe, cwd=os.path.dirname(exe) or None,
+                         need_admin=False, show_errors=True)
+            if ok:
+                self.status_label.setText("已发起启动（等待窗口出现）")
+                QTimer.singleShot(5000, lambda: self.status_label.setText(""))
+            return
+
         main_script = (self.profile or {}).get("main_script", "main.py")
         admin = bool((self.profile or {}).get("admin", False))
         main_path = os.path.join(app["working"], main_script)
