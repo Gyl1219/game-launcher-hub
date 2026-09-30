@@ -90,6 +90,9 @@ GITHUB_RELEASE_REPO = {
     "ok-nte":      ("BnanZ0",      "ok-nte"),
     "ok-ww":       ("ok-oldking",   "ok-wuthering-waves"),
     "ok-end-field": ("AliceJump",   "ok-end-field"),
+    # lite 助手同样走 GitHub Releases 检测更新：奇想盒的 App 安装包（whimbox_app-setup-
+    # <ver>.exe）自 3.1.0 起随主仓库 Whimbox 一起发布，版本号与 Python 后端统一为 3.x
+    "whimbox":     ("nikkigallery", "Whimbox"),
 }
 # 7-Zip 便携版持久化目录（与 install_root/_dl_<key>/ 解耦）。
 # 旧 bug：7z 装到 tmp/7zportable/，run() 成功后 shutil.rmtree(tmp) 把它一起删了，
@@ -2222,6 +2225,106 @@ def scan_local_game(key):
     return ""
 
 
+def _exe_file_version(path):
+    """读 exe 的 FileVersion 资源（如 "2.1.1"），读不到返回 ""。"""
+    try:
+        from ctypes import wintypes  # 局部导入：模块级未引入 wintypes（与 send_to_trash 同风格）
+        size = ctypes.windll.version.GetFileVersionInfoSizeW(path, None)
+        if not size:
+            return ""
+        data = ctypes.create_string_buffer(size)
+        if not ctypes.windll.version.GetFileVersionInfoW(path, 0, size, data):
+            return ""
+        val = ctypes.c_void_p()
+        ln = wintypes.UINT()
+        if not ctypes.windll.version.VerQueryValueW(
+                data, "\\VarFileInfo\\Translation", ctypes.byref(val), ctypes.byref(ln)):
+            return ""
+        trans = ctypes.cast(val, ctypes.POINTER(wintypes.WORD * 2)).contents
+        key = "\\StringFileInfo\\%04x%04x\\FileVersion" % (trans[0], trans[1])
+        if not ctypes.windll.version.VerQueryValueW(data, key, ctypes.byref(val), ctypes.byref(ln)):
+            return ""
+        return ctypes.wstring_at(val, ln.value - 1).strip()
+    except Exception:
+        return ""
+
+
+class LiteReleaseCheckWorker(QThread):
+    """lite 助手更新检查：GitHub releases/latest → (tag, 安装包资产 URL, release body)。"""
+
+    done = Signal(str, str, str, int)
+    failed = Signal(str)
+
+    def __init__(self, owner, repo, parent=None):
+        super().__init__(parent)
+        self._owner, self._repo = owner, repo
+
+    def run(self):
+        try:
+            url = ("https://api.github.com/repos/%s/%s/releases/latest"
+                   % (self._owner, self._repo))
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "game-launcher-hub",
+                "Accept": "application/vnd.github+json",
+            })
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode())
+            tag = (data.get("tag_name") or "").strip()
+            asset_url, asset_size = "", 0
+            for a in data.get("assets", []):
+                an = (a.get("name") or "").lower()
+                # 主仓库同页还发 whl 包（后端），只认 App 安装包
+                if an.startswith("whimbox_app-setup-") and an.endswith(".exe"):
+                    asset_url = a.get("browser_download_url") or ""
+                    asset_size = int(a.get("size") or 0)
+                    break
+            self.done.emit(tag, asset_url, data.get("body") or "", asset_size)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class LiteDownloadWorker(QThread):
+    """lite 助手更新包下载：urllib 直下官方安装包，progress 报 (已下字节, 总字节)。"""
+
+    progress = Signal(int, int)
+    finished_ok = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, url, save_path, parent=None):
+        super().__init__(parent)
+        self._url = url
+        self._save = save_path
+
+    def run(self):
+        try:
+            os.makedirs(os.path.dirname(self._save), exist_ok=True)
+            req = urllib.request.Request(self._url, headers={"User-Agent": "game-launcher-hub"})
+            with urllib.request.urlopen(req, timeout=60) as resp, \
+                    open(self._save, "wb") as f:
+                total = int(resp.headers.get("Content-Length") or 0)
+                done = 0
+                while True:
+                    if self.isInterruptionRequested():
+                        raise InterruptedError("已取消")
+                    chunk = resp.read(256 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    done += len(chunk)
+                    if total:
+                        self.progress.emit(done, total)
+            if self.isInterruptionRequested():
+                raise InterruptedError("已取消")
+            if os.path.getsize(self._save) <= 0:
+                self.failed.emit("下载的文件为空")
+                return
+            self.finished_ok.emit(self._save)
+        except InterruptedError as e:
+            self.failed.emit(str(e))
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
 class GameScanWorker(QThread):
     """后台扫描多个游戏本体，避免注册表枚举 + 大目录 walk 卡 UI。"""
 
@@ -2634,7 +2737,8 @@ class AppCard(CardWidget):
         self.profile_tag.setVisible(False)
 
         if self._installed:
-            self.ver_tag.setText("lite")
+            # 显示真实版本（exe 版本资源，如 2.1.1）；读不到再回退 "lite" 占位
+            self.ver_tag.setText(_exe_file_version(cfg_exe) or "lite")
             self.ver_tag.setStyleSheet(
                 "background-color:#455a64; color:#ffffff; border-radius:6px; "
                 "padding:2px 8px; font-size:11px;"
@@ -2667,6 +2771,9 @@ class AppCard(CardWidget):
         # 立即刷一次运行态（refresh_badge 内部会调 _refresh_start_btn + run_tag，
         # 否则按钮要等下一轮 5 秒轮询才有槽，点了没反应）
         self.refresh_badge()
+        # lite 更新检查（内部有一次性守卫，5s 轮询不会重复触发）
+        if self._installed:
+            self._lite_start_check()
 
     def build_lite_body(self):
         """lite 模式动态区：已安装 = 启动/强关 + 卸载；未安装 = 提示 + 官网按钮。"""
@@ -2693,6 +2800,14 @@ class AppCard(CardWidget):
             self.uninstall_btn.setCursor(Qt.PointingHandCursor)
             self.uninstall_btn.clicked.connect(self.uninstall_app)
             self.body_box.addWidget(self.uninstall_btn)
+
+            # 更新按钮：lite 助手走 GitHub Releases 检测（奇想盒 App 安装包随主仓库发布）
+            self.update_btn = PushButton("检查更新中…")
+            self.update_btn.setFixedHeight(38)
+            self.update_btn.setEnabled(False)
+            self.update_btn.setCursor(Qt.PointingHandCursor)
+            self.update_btn.clicked.connect(self._on_lite_update)
+            self.body_box.addWidget(self.update_btn)
         else:
             self.status_label.setText(
                 "未检测到本地安装。lite 助手不支持一键安装，请从官方渠道获取。")
@@ -2704,6 +2819,162 @@ class AppCard(CardWidget):
                 btn.clicked.connect(
                     lambda url=site: QDesktopServices.openUrl(QUrl(url)))
                 self.body_box.addWidget(btn)
+
+    # ===== lite 更新：exe 版本资源 + GitHub Releases latest =====
+    def _lite_start_check(self):
+        """lite 更新检查。每次 rebuild 只触发一次，避免 5s 轮询打爆 GitHub API
+        （releases/latest 未登录限 60 次/小时）。"""
+        if getattr(self, "_lite_check_started", False):
+            return
+        self._lite_check_started = True
+        repo = GITHUB_RELEASE_REPO.get(self.app.get("key", ""))
+        if not repo:
+            self._lite_set_btn("版本检测不可用")
+            return
+        self._lite_check_worker = LiteReleaseCheckWorker(repo[0], repo[1], parent=self)
+        self._lite_check_worker.done.connect(self._on_lite_check_done)
+        self._lite_check_worker.failed.connect(self._on_lite_check_failed)
+        self._lite_check_worker.start()
+
+    def _lite_set_btn(self, text, enabled=False, style=None):
+        if not hasattr(self, "update_btn"):
+            return
+        self.update_btn.setText(text)
+        self.update_btn.setEnabled(enabled)
+        if style:
+            self.update_btn.setStyleSheet(style)
+
+    def _on_lite_check_failed(self, err):
+        self._lite_set_btn("检查更新失败（网络）", enabled=False)
+
+    def _on_lite_check_done(self, tag, asset_url, body, asset_size):
+        tag = (tag or "").strip()
+        if not tag:
+            self._lite_set_btn("检查更新失败", enabled=False)
+            return
+        cur = _exe_file_version(self.app.get("exe", ""))
+        if not cur:
+            self._lite_set_btn("无法识别本机版本", enabled=False)
+            return
+        self._lite_remote = (tag, asset_url, body)
+        try:
+            has_new = compare_version(_normalize_tag(tag), _normalize_tag(cur)) > 0
+        except Exception:
+            has_new = False
+        # 存标志位供 snapshot() 用：QStackedWidget 里非当前页控件 isVisible()
+        # 恒为 False，靠 update_btn.isVisible() 判断会让总览页永远看不到更新提示
+        self._lite_has_update = has_new
+        if not has_new:
+            self._lite_set_btn("已是最新（%s）" % cur, enabled=False,
+                               style="QPushButton { background-color:rgba(255,255,255,0.10); "
+                                     "color:#9aa0a6; border-radius:8px; font-weight:600; }")
+            return
+        self._lite_set_btn("更新到 %s" % tag, enabled=True,
+                           style="QPushButton { background-color:#e65100; color:white; "
+                                 "border-radius:8px; font-weight:600; } "
+                                 "QPushButton:hover { background-color:#bf360c; }")
+
+    def _on_lite_update(self):
+        tag, asset_url, body = getattr(self, "_lite_remote", ("", "", ""))
+        if not tag:
+            return
+        if not asset_url:
+            # latest release 未附带 App 安装包（部分版本只发后端 whl）：引导去 releases 页
+            repo = GITHUB_RELEASE_REPO.get(self.app.get("key", ""))
+            url = ("https://github.com/%s/%s/releases/latest" % repo) if repo \
+                else (self.app.get("website", "") or "")
+            if url:
+                QDesktopServices.openUrl(QUrl(url))
+            return
+        note = (body or "").strip()
+        if len(note) > 500:
+            note = note[:500] + "…"
+        ans = QMessageBox.question(
+            self.window(), "更新「%s」到 %s" % (self.app.get("display", ""), tag),
+            "将下载官方安装包并运行。\n\n更新说明：\n%s\n\n"
+            "开始前会先关闭正在运行的奇想盒，继续吗？" % (note or "（无）"),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        self._lite_download(tag, asset_url)
+
+    def _lite_download(self, tag, asset_url):
+        cache = os.path.join(LAUNCHER_CACHE_DIR, "whimbox-update")
+        fname = "whimbox_app-setup-%s.exe" % tag.lstrip("v")
+        save = os.path.join(cache, fname)
+        if os.path.isfile(save) and os.path.getsize(save) > 0:
+            # 已下过直接进安装（重复点击不重复下载）
+            self._lite_run_installer(save)
+            return
+        # 复用 ok-script 卡的持久进度三件套（lite 分支 rebuild 时已隐藏）
+        self.install_progress.setRange(0, 100)
+        self.install_progress.setValue(0)
+        self.install_progress.setVisible(True)
+        self.install_status.setText("正在连接下载源…")
+        self.install_status.setVisible(True)
+        self.install_cancel_btn.setText("✕ 取消下载")
+        self.install_cancel_btn.setVisible(True)
+        try:
+            self.install_cancel_btn.clicked.disconnect()
+        except Exception:
+            pass
+        self.install_cancel_btn.clicked.connect(self._lite_cancel_download)
+        self.update_btn.setEnabled(False)
+
+        self._lite_dl_worker = LiteDownloadWorker(asset_url, save, parent=self)
+        self._lite_dl_worker.progress.connect(self._on_lite_progress)
+        self._lite_dl_worker.finished_ok.connect(self._on_lite_downloaded)
+        self._lite_dl_worker.failed.connect(self._on_lite_dl_failed)
+        self._lite_dl_worker.start()
+
+    def _on_lite_progress(self, done, total):
+        pct = int(done * 100 / total) if total else 0
+        self.install_progress.setValue(pct)
+        self.install_status.setText("正在下载更新包… %d%%（%.1f / %.1f MB）"
+                                    % (pct, done / 1048576, max(total, 1) / 1048576))
+
+    def _on_lite_downloaded(self, path):
+        self._hide_install_progress_ui()
+        self.install_status.setText("下载完成")
+        self.install_status.setVisible(True)
+        self._lite_run_installer(path)
+
+    def _on_lite_dl_failed(self, err):
+        self._hide_install_progress_ui()
+        self.update_btn.setEnabled(True)
+        self.install_status.setText("下载失败：%s" % err)
+        self.install_status.setVisible(True)
+
+    def _lite_cancel_download(self):
+        w = getattr(self, "_lite_dl_worker", None)
+        if w and w.isRunning():
+            w.requestInterruption()
+        self._hide_install_progress_ui()
+        self.update_btn.setEnabled(True)
+
+    def _lite_run_installer(self, setup_path):
+        ans = QMessageBox.question(
+            self.window(), "运行安装程序",
+            "更新包已就绪：\n%s\n\n"
+            "将先关闭正在运行的奇想盒，再启动官方安装程序，是否继续？" % setup_path,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            self.status_label.setText("安装包已就绪，可稍后手动运行")
+            return
+        exe_name = os.path.basename(self.app.get("exe", "")) or ""
+        subprocess.run(
+            ["taskkill", "/IM", exe_name, "/F", "/T"],
+            capture_output=True, text=True, encoding="gbk", errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if run_exe(self.window(), setup_path, cwd=os.path.dirname(setup_path),
+                   need_admin=False, show_errors=True):
+            self.status_label.setText("安装程序已启动，完成后重新启动奇想盒即可")
+            QTimer.singleShot(8000, lambda: self.status_label.setText(""))
 
     def build_installed_body(self):
         # 按钮行
@@ -2960,7 +3231,13 @@ class AppCard(CardWidget):
         总览页不自己起线程拉版本、也不重复跑 tasklist 检测进程，一律读这里，
         保证总览页与游戏详情页状态永远一致，且不额外增加网络请求/进程扫描开销。
         """
-        ub = getattr(self, "update_btn", None)
+        if getattr(self, "_lite", False):
+            # lite 卡：_on_lite_check_done 已把结论存进 _lite_has_update
+            has_update = bool(getattr(self, "_lite_has_update", False))
+        else:
+            # ok-script 卡：badge 文案承载「可更新」语义（update_btn.isVisible()
+            # 在 QStackedWidget 隐藏页上恒 False，不能用于跨页判断）
+            has_update = self.badge.text().startswith("可更新")
         return {
             "installed": bool(getattr(self, "_installed", False)),
             "host_ready": bool(getattr(self, "_host_ready", False)),
@@ -2968,7 +3245,7 @@ class AppCard(CardWidget):
             "running": bool(self.run_tag.isVisible()),
             "badge": self.badge.text(),
             "status": self.status_label.text(),
-            "has_update": bool(ub is not None and ub.isVisible() and ub.isEnabled()),
+            "has_update": has_update,
             "game_found": getattr(self, "game_found_path", ""),
         }
 
@@ -4338,7 +4615,10 @@ class OverviewCard(CardWidget):
             elif not s["installed"]:
                 self.card.install_app()
             elif s["has_update"]:
-                self.card.open_update_dialog()
+                if getattr(self.card, "_lite", False):
+                    self.card._on_lite_update()
+                else:
+                    self.card.open_update_dialog()
             else:
                 self.card.launch_app()
         except Exception as e:
