@@ -719,6 +719,54 @@ def ensure_mirror(key, git_url, target_tag=None, progress_cb=None):
     return repo_dir
 
 
+def _probe_url(url, timeout=4):
+    """对单个候选下载源做「零流量探测」，返回 (ok, latency_s, content_length)。
+
+    ok=False 表示超时 / 非 200/206 / 连不上，调用方直接跳过。
+
+    零流量策略（彻底消除「下完了又下」的 bug）：
+    1) 优先 HEAD 请求——只收响应头，完全不收 body，零字节浪费；
+    2) 若源不支持 HEAD（返回 405/400 等），回退 Range: bytes=0-0 且只读 1 字节即断，
+       最多白收 1 个 TCP 窗口（约几十 KB），远小于旧逻辑（旧逻辑 Range 0-131071 会
+       把不支持 Range 的源整个文件推过来，等于每次测速白下完整安装包）。
+    排序以「延迟最低」为准（就近 CDN 即最快），不再用实测吞吐。
+    """
+    # 1) HEAD：零 body
+    try:
+        req = urllib.request.Request(
+            url, method="HEAD",
+            headers={"User-Agent": "WorkBuddy-OKLauncher"},
+        )
+        t0 = time.time()
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            if r.status not in (200, 206):
+                raise urllib.error.HTTPError(url, r.status, "head", r.headers, None)
+            latency = time.time() - t0
+            cl = int(r.headers.get("Content-Length") or 0)
+            return (True, latency, cl)
+    except urllib.error.HTTPError:
+        # 2) 回退 Range 0-0（极少数只支持 GET 的源）
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": "WorkBuddy-OKLauncher",
+                    "Range": "bytes=0-0",
+                },
+            )
+            t0 = time.time()
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                if r.status not in (200, 206):
+                    return (False, 999.0, 0)
+                r.read(1)  # 只读 1 字节即断
+                latency = time.time() - t0
+                cl = int(r.headers.get("Content-Length") or 0)
+                return (True, latency, cl)
+        except Exception:
+            return (False, 999.0, 0)
+    except Exception:
+        return (False, 999.0, 0)
+
 
 class InstallWorker(QThread):
     """后台从 GitHub release 下载 win32.zip 就地解压到目标安装目录（进度协议同 MirrorUpdater）。"""
@@ -956,52 +1004,8 @@ class InstallWorker(QThread):
 
     # ===== 万载云多节点测速选源 =====
     def _probe(self, url, timeout=4):
-        """对单个候选源做「零流量探测」，返回 (ok, latency_s, content_length)。
-
-        ok=False 表示超时 / 非 200/206 / 连不上，调用方直接跳过。
-
-        零流量策略（彻底消除「下完了又下」的 bug）：
-        1) 优先 HEAD 请求——只收响应头，完全不收 body，零字节浪费；
-        2) 若源不支持 HEAD（返回 405/400 等），回退 Range: bytes=0-0 且只读 1 字节即断，
-           最多白收 1 个 TCP 窗口（约几十 KB），远小于旧逻辑（旧逻辑 Range 0-131071 会
-           把不支持 Range 的源整个文件推过来，等于每次测速白下完整安装包）。
-        排序以「延迟最低」为准（就近 CDN 即最快），不再用实测吞吐。
-        """
-        # 1) HEAD：零 body
-        try:
-            req = urllib.request.Request(
-                url, method="HEAD",
-                headers={"User-Agent": "WorkBuddy-OKLauncher"},
-            )
-            t0 = time.time()
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                if r.status not in (200, 206):
-                    raise urllib.error.HTTPError(url, r.status, "head", r.headers, None)
-                latency = time.time() - t0
-                cl = int(r.headers.get("Content-Length") or 0)
-                return (True, latency, cl)
-        except urllib.error.HTTPError:
-            # 2) 回退 Range 0-0（极少数只支持 GET 的源）
-            try:
-                req = urllib.request.Request(
-                    url,
-                    headers={
-                        "User-Agent": "WorkBuddy-OKLauncher",
-                        "Range": "bytes=0-0",
-                    },
-                )
-                t0 = time.time()
-                with urllib.request.urlopen(req, timeout=timeout) as r:
-                    if r.status not in (200, 206):
-                        return (False, 999.0, 0)
-                    r.read(1)  # 只读 1 字节即断
-                    latency = time.time() - t0
-                    cl = int(r.headers.get("Content-Length") or 0)
-                    return (True, latency, cl)
-            except Exception:
-                return (False, 999.0, 0)
-        except Exception:
-            return (False, 999.0, 0)
+        """零流量探测单个源（实现见模块级 _probe_url，供 LiteDownloadWorker 复用）。"""
+        return _probe_url(url, timeout)
 
     def _select_fastest(self, github_url, tag="", asset_name=""):
         """并发测速所有候选源，挑「延迟最低」的那个返回 (label, url, latency_s)。
@@ -2249,10 +2253,35 @@ def _exe_file_version(path):
         return ""
 
 
+def _site_pkg_version(lib_dir, pkg):
+    """从 site-packages 里的 <pkg>-<ver>.dist-info 目录名读已安装包版本。"""
+    try:
+        pre = (pkg + "-").lower()
+        for n in os.listdir(lib_dir):
+            ln = n.lower()
+            if ln.startswith(pre) and ln.endswith(".dist-info"):
+                return n[len(pkg) + 1:-len(".dist-info")]
+    except Exception:
+        pass
+    return ""
+
+
+def _lite_backend_version(app):
+    """lite 助手的后端版本——奇想盒后端装在内嵌 python 的 site-packages/whimbox。
+
+    注意：奇想盒有**三套互不相干的版本号**：前端 App（exe FileVersion，如 2.1.1）、
+    后端 Python 包（如 2.4.9）、仓库 release tag（如 3.1.0）。必须分开显示，
+    否则用户会以为「选了 2.4.6 却更新成 2.4.9」。
+    """
+    d = os.path.join(os.path.dirname(app.get("exe", "") or ""),
+                     "python-embedded", "Lib", "site-packages")
+    return _site_pkg_version(d, "whimbox")
+
+
 class LiteReleaseCheckWorker(QThread):
     """lite 助手更新检查：GitHub releases/latest → (tag, 安装包资产 URL, release body)。"""
 
-    done = Signal(str, str, str, int)
+    done = Signal(object)   # dict: {tag, exe, whl, body, exe_size, whl_size}
     failed = Signal(str)
 
     def __init__(self, owner, repo, parent=None):
@@ -2261,30 +2290,54 @@ class LiteReleaseCheckWorker(QThread):
 
     def run(self):
         try:
-            url = ("https://api.github.com/repos/%s/%s/releases/latest"
+            # 一次拉最近 20 个 release：首个即 latest；每个 release 自带前端 exe /
+            # 后端 whl 资产信息，同时供「查看版本」下拉与「更新到任意版本」使用
+            url = ("https://api.github.com/repos/%s/%s/releases?per_page=20"
                    % (self._owner, self._repo))
             req = urllib.request.Request(url, headers={
                 "User-Agent": "game-launcher-hub",
                 "Accept": "application/vnd.github+json",
             })
             with urllib.request.urlopen(req, timeout=30) as resp:
-                data = json.loads(resp.read().decode())
-            tag = (data.get("tag_name") or "").strip()
-            asset_url, asset_size = "", 0
-            for a in data.get("assets", []):
-                an = (a.get("name") or "").lower()
-                # 主仓库同页还发 whl 包（后端），只认 App 安装包
-                if an.startswith("whimbox_app-setup-") and an.endswith(".exe"):
-                    asset_url = a.get("browser_download_url") or ""
-                    asset_size = int(a.get("size") or 0)
-                    break
-            self.done.emit(tag, asset_url, data.get("body") or "", asset_size)
+                rels = json.loads(resp.read().decode())
+
+            def pick(assets):
+                """从 release 资产里取 (前端 exe URL, 后端 whl URL)。"""
+                exe_u, whl_u = "", ""
+                for a in assets or []:
+                    an = (a.get("name") or "").lower()
+                    if an.startswith("whimbox_app-setup-") and an.endswith(".exe"):
+                        exe_u = a.get("browser_download_url") or ""
+                    elif an.endswith(".whl"):
+                        whl_u = a.get("browser_download_url") or ""
+                return exe_u, whl_u
+
+            versions = []
+            for r in rels or []:
+                t = (r.get("tag_name") or "").strip()
+                if not t:
+                    continue
+                exe_u, whl_u = pick(r.get("assets"))
+                versions.append({"tag": t, "body": r.get("body") or "",
+                                 "exe": exe_u, "whl": whl_u})
+
+            latest = versions[0] if versions else {
+                "tag": "", "body": "", "exe": "", "whl": ""}
+            self.done.emit({"tag": latest["tag"], "exe": latest["exe"],
+                            "whl": latest["whl"], "body": latest["body"],
+                            "versions": versions})
         except Exception as e:
             self.failed.emit(str(e))
 
 
 class LiteDownloadWorker(QThread):
-    """lite 助手更新包下载：urllib 直下官方安装包，progress 报 (已下字节, 总字节)。"""
+    """lite 助手更新包下载：万载云多节点测速选源，按延迟名次依次回退。
+
+    直连 GitHub release 资产在国内会被掐（Remote end closed connection without
+    response），所以复用 ok-script 卡同款方案：并发零流量探测（HEAD / Range 0-0）
+    万载云节点（带协议 + 去协议两种拼法）+ config.json 自定义反代 + GitHub 直链，
+    按延迟挑最快的下；下载中途断掉换下一名（前 3 名），全部失败才报错。
+    """
 
     progress = Signal(int, int)
     finished_ok = Signal(str)
@@ -2294,31 +2347,178 @@ class LiteDownloadWorker(QThread):
         super().__init__(parent)
         self._url = url
         self._save = save_path
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def _candidates(self):
+        """(label, url) 候选源列表，顺序无关（之后按实测延迟排序）。"""
+        cands = [("GitHub 直链", self._url)]
+        if self._url.startswith("https://github.com/"):
+            no_proto = self._url[len("https://"):]
+            nodes = list(InstallWorker.WANZAIYUN_NODES)
+            # config.json 里单独配的万载云反代域名，排最前（用户特意配的）
+            custom = ""
+            try:
+                cfg_path = os.path.join(LAUNCHER_DIR, "config.json")
+                if os.path.isfile(cfg_path):
+                    with open(cfg_path, encoding="utf-8") as f:
+                        custom = (json.load(f).get("wanzaiyun_proxy", "") or "").strip()
+            except Exception:
+                custom = ""
+            if custom and custom not in nodes:
+                nodes.insert(0, custom)
+            for nd in nodes:
+                cands.append(("万载云 %s" % nd, nd + self._url))
+                cands.append(("万载云 %s(noproto)" % nd, nd + no_proto))
+        return cands
 
     def run(self):
         try:
-            os.makedirs(os.path.dirname(self._save), exist_ok=True)
-            req = urllib.request.Request(self._url, headers={"User-Agent": "game-launcher-hub"})
-            with urllib.request.urlopen(req, timeout=60) as resp, \
-                    open(self._save, "wb") as f:
-                total = int(resp.headers.get("Content-Length") or 0)
-                done = 0
-                while True:
-                    if self.isInterruptionRequested():
-                        raise InterruptedError("已取消")
-                    chunk = resp.read(256 * 1024)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    done += len(chunk)
-                    if total:
-                        self.progress.emit(done, total)
-            if self.isInterruptionRequested():
-                raise InterruptedError("已取消")
-            if os.path.getsize(self._save) <= 0:
-                self.failed.emit("下载的文件为空")
+            cands = self._candidates()
+            # 并发零流量测速：只收响应头 / 1 字节，挑延迟最低且有真文件的源
+            import concurrent.futures as _cf
+
+            def _test(item):
+                label, url = item
+                ok, lat, cl = _probe_url(url)
+                return (label, url, ok, lat, cl)
+
+            scored = []
+            with _cf.ThreadPoolExecutor(max_workers=20) as ex:
+                for label, url, ok, lat, cl in ex.map(_test, cands):
+                    # Content-Length>0 说明该源真有这个文件（防代理对坏 URL 返回 200 空响应）
+                    if ok and cl > 0:
+                        scored.append((label, url, lat))
+            if self._cancelled:
+                self.failed.emit("已取消")
                 return
-            self.finished_ok.emit(self._save)
+            scored.sort(key=lambda x: x[2])
+            order = scored[:3] or [("GitHub 直链", self._url, 0.0)]
+            errs = []
+            for label, url, _lat in order:
+                if self._cancelled:
+                    self.failed.emit("已取消")
+                    return
+                try:
+                    self._download_one(url)
+                except InterruptedError:
+                    self.failed.emit("已取消")
+                    return
+                except Exception as e:
+                    errs.append("%s：%s" % (label, e))
+                    continue
+                self.finished_ok.emit(self._save)
+                return
+            # 全部失败：汇总每个试过的源的报错（最快的源排最前）
+            self.failed.emit("；".join(errs) or "所有下载源均失败（含 GitHub 直链）")
+        except Exception as e:
+            self.failed.emit(str(e))
+
+    def _download_one(self, url):
+        """从单个源下载，成功返回（文件>0 字节），失败/取消抛异常。"""
+        os.makedirs(os.path.dirname(self._save), exist_ok=True)
+        req = urllib.request.Request(url, headers={"User-Agent": "game-launcher-hub"})
+        with urllib.request.urlopen(req, timeout=60) as resp, \
+                open(self._save, "wb") as f:
+            total = int(resp.headers.get("Content-Length") or 0)
+            done = 0
+            while True:
+                if self._cancelled:
+                    raise InterruptedError("已取消")
+                chunk = resp.read(256 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+                done += len(chunk)
+                if total:
+                    self.progress.emit(done, total)
+        if self._cancelled:
+            raise InterruptedError("已取消")
+        if os.path.getsize(self._save) <= 0:
+            raise RuntimeError("下载的文件为空")
+
+
+class LitePipWorker(QThread):
+    """用奇想盒内嵌 python 执行 pip install whl（官方「手动更新后端」的等价操作）。
+
+    后端实测装在 <App目录>/python-embedded/Lib/site-packages/whimbox，
+    所以内嵌 python 装 whl 与官方按钮效果一致。
+    """
+
+    finished_ok = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, python_exe, whl_path, parent=None):
+        super().__init__(parent)
+        self._py = python_exe
+        self._whl = whl_path
+
+    def run(self):
+        try:
+            r = subprocess.run(
+                [self._py, "-m", "pip", "install", "--upgrade",
+                 "--force-reinstall", "--no-warn-script-location", self._whl],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                timeout=1800,
+            )
+            out = (r.stdout or "") + (r.stderr or "")
+            if r.returncode == 0:
+                self.finished_ok.emit(out[-1500:])
+            else:
+                self.failed.emit((out[-600:] or "").strip()
+                                 or "pip 返回码 %s" % r.returncode)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class LiteScriptUpdateWorker(QThread):
+    """更新跑图路线脚本：列 nikkigallery/WhimboxScripts 的 json 并下载到奇想盒脚本目录。
+
+    对应官方「更新脚本」一节：从路线仓库下载脚本 → 放进 App 的脚本目录 → 点「刷新脚本」。
+    最后一步「刷新脚本」是 App 内的 GUI 按钮，无法代劳，下载完会提示用户。
+    """
+
+    API = "https://api.github.com/repos/nikkigallery/WhimboxScripts/contents/"
+
+    progress = Signal(int, int)      # (已完成文件数, 总文件数)
+    finished_ok = Signal(int, str)   # (写入文件数, 脚本目录)
+    failed = Signal(str)
+
+    def __init__(self, script_dir, parent=None):
+        super().__init__(parent)
+        self._dir = script_dir
+
+    def run(self):
+        try:
+            os.makedirs(self._dir, exist_ok=True)
+            req = urllib.request.Request(self.API, headers={
+                "User-Agent": "game-launcher-hub",
+                "Accept": "application/vnd.github+json",
+            })
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                items = json.loads(resp.read().decode())
+            files = [i for i in items
+                     if i.get("type") == "file"
+                     and (i.get("name") or "").lower().endswith(".json")
+                     and i.get("download_url")]
+            total, done = len(files), 0
+            for it in files:
+                if self.isInterruptionRequested():
+                    raise InterruptedError("已取消")
+                raw = urllib.request.Request(
+                    it["download_url"], headers={"User-Agent": "game-launcher-hub"})
+                with urllib.request.urlopen(raw, timeout=60) as r:
+                    data = r.read()
+                if not data:
+                    continue
+                with open(os.path.join(self._dir, it["name"]), "wb") as f:
+                    f.write(data)
+                done += 1
+                self.progress.emit(done, total)
+            self.finished_ok.emit(done, self._dir)
         except InterruptedError as e:
             self.failed.emit(str(e))
         except Exception as e:
@@ -2779,6 +2979,10 @@ class AppCard(CardWidget):
         """lite 模式动态区：已安装 = 启动/强关 + 卸载；未安装 = 提示 + 官网按钮。"""
         if self._installed:
             self.start_btn = PushButton("▶  启动应用")
+            # 当前 / 最新版本提示：ok-script 卡的版本信息由 app.json 提供，
+            # lite 卡这里显式列出，免得最新版本只藏在按钮文案里
+            self.ver_hint = CaptionLabel("当前版本 —")
+            self.body_box.addWidget(self.ver_hint)
             self.start_btn.setFixedHeight(42)
             self.start_btn.setStyleSheet(
                 "QPushButton { background-color:#2e7d32; color:white; border-radius:8px; "
@@ -2808,6 +3012,31 @@ class AppCard(CardWidget):
             self.update_btn.setCursor(Qt.PointingHandCursor)
             self.update_btn.clicked.connect(self._on_lite_update)
             self.body_box.addWidget(self.update_btn)
+
+            # 更新跑图路线（官方「更新脚本」一节）：路线仓库 json → App 脚本目录
+            self.script_btn = PushButton("更新跑图路线")
+            self.script_btn.setFixedHeight(38)
+            self.script_btn.setCursor(Qt.PointingHandCursor)
+            self.script_btn.clicked.connect(self._on_lite_script_update)
+            self.body_box.addWidget(self.script_btn)
+
+            # 查看版本（只读下拉）：与 ok-script 卡一致，可翻看各版本的更新说明
+            ver_row = QHBoxLayout()
+            ver_row.setSpacing(10)
+            ver_row.addWidget(CaptionLabel("查看版本"))
+            self.ver_combo = ComboBox()
+            self.ver_combo.setMinimumWidth(200)
+            self.ver_combo.setPlaceholderText("选择版本查看说明...")
+            ver_row.addWidget(self.ver_combo)
+            self.body_box.addLayout(ver_row)
+
+            # 更新日志：展示在卡片里（不塞进确认弹窗），跟随上方下拉选择
+            self.body_box.addWidget(CaptionLabel("更新说明"))
+            self.changelog_text = QTextEdit()
+            self.changelog_text.setReadOnly(True)
+            self.changelog_text.setMinimumHeight(110)
+            self.changelog_text.setPlainText("正在获取更新说明…")
+            self.body_box.addWidget(self.changelog_text)
         else:
             self.status_label.setText(
                 "未检测到本地安装。lite 助手不支持一键安装，请从官方渠道获取。")
@@ -2847,8 +3076,9 @@ class AppCard(CardWidget):
     def _on_lite_check_failed(self, err):
         self._lite_set_btn("检查更新失败（网络）", enabled=False)
 
-    def _on_lite_check_done(self, tag, asset_url, body, asset_size):
-        tag = (tag or "").strip()
+    def _on_lite_check_done(self, info):
+        info = info or {}
+        tag = (info.get("tag") or "").strip()
         if not tag:
             self._lite_set_btn("检查更新失败", enabled=False)
             return
@@ -2856,7 +3086,46 @@ class AppCard(CardWidget):
         if not cur:
             self._lite_set_btn("无法识别本机版本", enabled=False)
             return
-        self._lite_remote = (tag, asset_url, body)
+        self._lite_remote = (tag, info.get("exe") or "", info.get("body") or "")
+        self._lite_whl = info.get("whl") or ""
+        # 各版本资产映射：选哪个版本，就下哪个版本的包
+        self._lite_assets = {v["tag"]: (v.get("exe") or "", v.get("whl") or "")
+                             for v in (info.get("versions") or [])}
+        # 版本下拉 + 更新说明（与 ok-script 卡同款交互：选版本 → 看该版本说明）
+        self._lite_version_map = {}
+        if hasattr(self, "ver_combo"):
+            try:
+                self.ver_combo.currentTextChanged.disconnect()
+            except Exception:
+                pass
+            self.ver_combo.clear()
+            for v in (info.get("versions") or []):
+                self._lite_version_map[v["tag"]] = v.get("body") or ""
+                self.ver_combo.addItem(v["tag"])
+            if tag and tag not in self._lite_version_map:
+                # 列表没拉到时至少把 latest 放进去
+                self._lite_version_map[tag] = info.get("body") or ""
+                self.ver_combo.insertItem(0, tag)
+            # 本机当前版本未必在官方 release 列表里（2.x 是旧版本体系），单独插一项，
+            # 方便对照「我现在在哪一版」
+            cur_item = "%s（当前）" % cur
+            if cur and cur not in self._lite_version_map:
+                self._lite_version_map[cur_item] = ""
+                # 按版本号倒序插到正确位置（列表是新→旧，2.1.1 比 3.x 老，应排末尾）
+                pos = self.ver_combo.count()
+                try:
+                    cur_n = _normalize_tag(cur)
+                    for i in range(self.ver_combo.count()):
+                        if compare_version(_normalize_tag(self.ver_combo.itemText(i)), cur_n) < 0:
+                            pos = i
+                            break
+                except Exception:
+                    pos = self.ver_combo.count()
+                self.ver_combo.insertItem(pos, cur_item)
+            self.ver_combo.currentTextChanged.connect(self._on_lite_version_changed)
+            if tag and self.ver_combo.findText(tag) >= 0:
+                self.ver_combo.setCurrentText(tag)
+        self._lite_show_changelog(tag)
         try:
             has_new = compare_version(_normalize_tag(tag), _normalize_tag(cur)) > 0
         except Exception:
@@ -2864,55 +3133,203 @@ class AppCard(CardWidget):
         # 存标志位供 snapshot() 用：QStackedWidget 里非当前页控件 isVisible()
         # 恒为 False，靠 update_btn.isVisible() 判断会让总览页永远看不到更新提示
         self._lite_has_update = has_new
-        if not has_new:
-            self._lite_set_btn("已是最新（%s）" % cur, enabled=False,
-                               style="QPushButton { background-color:rgba(255,255,255,0.10); "
-                                     "color:#9aa0a6; border-radius:8px; font-weight:600; }")
+        # 当前 / 最新版本提示（避免最新版本只出现在按钮文案里）
+        if hasattr(self, "ver_hint"):
+            be = _lite_backend_version(self.app)
+            self.ver_hint.setText(
+                "前端 %s · 后端 %s · 仓库最新 %s%s"
+                % (cur, be or "未知", tag,
+                   "（有更新）" if has_new else "（已是最新）"))
+        # 徽章同步一次：rebuild 时调的那次还不知道有没有更新，这里补刷成「可更新 <tag>」
+        self.refresh_badge()
+        # 按钮按「当前选中项」刷新（默认选中 latest）
+        self._lite_refresh_update_btn()
+
+    def _lite_pick_frontend(self, sel):
+        """前端 exe 的实际来源版本——所选版本没发 exe 时向下取最近一个带 exe 的版本。
+
+        官方只给部分版本发 setup exe（实测 2.4.9、2.4.8 都只发了 whl），而后端 whl
+        每个版本都有。所以按官方思路：选 2.4.9 → 2.4.8 也没有 → 用 2.4.7 的 exe。
+        返回 (exe_url, 实际前端版本 tag)；找不到返回 ("", "")。
+        """
+        assets = getattr(self, "_lite_assets", {}) or {}
+        e = assets.get(sel, ("", ""))[0]
+        if e:
+            return e, sel
+        best = ""
+        try:
+            sel_n = _normalize_tag(sel)
+            for t, (eu, _w) in assets.items():
+                if not eu:
+                    continue
+                try:
+                    if compare_version(_normalize_tag(t), sel_n) <= 0 and (
+                            not best
+                            or compare_version(_normalize_tag(t), _normalize_tag(best)) > 0):
+                        best = t
+                except Exception:
+                    continue
+        except Exception:
+            best = ""
+        return (assets.get(best, ("", ""))[0], best) if best else ("", "")
+
+    def _lite_refresh_update_btn(self):
+        """更新按钮跟随「查看版本」下拉的选中项。
+
+        奇想盒有前端（exe）与后端（whl）两条独立版本线，所以对每个组件**分别**
+        评估方向（升 / 降 / 已是该版 / 无资产），再组合成按钮文案：
+          - 所选版本没发前端 exe 时，前端 exe 向下取最近一个带 exe 的版本
+            （如选 2.4.9 → 2.4.8 也没有 → 用 2.4.7 的 exe），按钮写明「取自 X」
+          - 后端 whl 每个版本都有，直接用所选版本
+          - 例：选 2.4.9 → 「更新前端（取自2.4.7）到 2.4.7 + 后端已是 2.4.9（无可执行更新）」
+                选 2.4.7 → 「更新前端到 2.4.7 + 降级后端到 2.4.7」
+          - 全部无可执行动作 → 灰禁用并写明原因
+        """
+        if not hasattr(self, "update_btn") or not hasattr(self, "ver_combo"):
             return
-        self._lite_set_btn("更新到 %s" % tag, enabled=True,
-                           style="QPushButton { background-color:#e65100; color:white; "
-                                 "border-radius:8px; font-weight:600; } "
-                                 "QPushButton:hover { background-color:#bf360c; }")
+        cur_fe = _exe_file_version(self.app.get("exe", ""))
+        cur_be = _lite_backend_version(self.app)
+        sel = self.ver_combo.currentText().replace("（当前）", "").strip()
+        if not sel:
+            return
+
+        assets = getattr(self, "_lite_assets", {}) or {}
+        whl_u = assets.get(sel, ("", ""))[1]          # 后端 whl 直接用所选版本
+        exe_u, fe_tag = self._lite_pick_frontend(sel)  # 前端向下取最近带 exe 的版本
+        self._lite_selected = (sel, exe_u, whl_u, fe_tag)
+
+        def _cmp(a, b):
+            try:
+                return compare_version(_normalize_tag(a), _normalize_tag(b))
+            except Exception:
+                return 0
+
+        grey = ("QPushButton { background-color:rgba(255,255,255,0.10); "
+                "color:#9aa0a6; border-radius:8px; font-weight:600; }")
+        orange = ("QPushButton { background-color:#e65100; color:white; "
+                  "border-radius:8px; font-weight:600; } "
+                  "QPushButton:hover { background-color:#bf360c; }")
+        blue = ("QPushButton { background-color:#1976d2; color:white; "
+                "border-radius:8px; font-weight:600; } "
+                "QPushButton:hover { background-color:#0d47a1; }")
+
+        # 选中「（当前）」且该版本没有任何官方资产：无操作
+        if cur_fe and sel == cur_fe and not exe_u and not whl_u:
+            self._lite_set_btn("已是最新（%s）" % cur_fe, enabled=False, style=grey)
+            return
+
+        # 分别评估前端 / 后端方向：
+        #   - 前端方向基于「实际来源版本 fe_tag」vs 当前前端（所选版可能没发 exe，
+        #     此时 fe_tag 低于 sel，按钮里要写明「取自 fe_tag」）
+        #   - 后端方向基于 sel vs 当前后端
+        # 只把「真正要装」的组件（更新/降级）放进按钮；「已是该版」的组件不占位置
+        parts = []
+        if exe_u:
+            fe = _cmp(fe_tag, cur_fe) if (cur_fe and fe_tag) else 1
+            if fe != 0:
+                src = "（取自%s）" % fe_tag if fe_tag != sel else ""
+                parts.append("%s前端%s到 %s" % ("更新" if fe > 0 else "降级", src, fe_tag))
+        if whl_u:
+            be = _cmp(sel, cur_be) if cur_be else 1
+            if be != 0:
+                parts.append("%s后端到 %s" % ("更新" if be > 0 else "降级", sel))
+        if not parts:
+            # 所选版本前后端都已是该版，或该版本两类资产都不可用
+            self._lite_set_btn("所选版本已是最新（%s）" % sel, enabled=False, style=grey)
+            return
+        # 颜色：全是「降级」 → 蓝；含「更新」 → 橙
+        style = blue if all(p.startswith("降级") for p in parts) else orange
+        self._lite_set_btn(" + ".join(parts), enabled=True, style=style)
 
     def _on_lite_update(self):
-        tag, asset_url, body = getattr(self, "_lite_remote", ("", "", ""))
-        if not tag:
+        """按官方手动更新流程：先装前端（exe），再装后端（whl）。
+
+        顺序不能反——官方明确要求先跑 exe 更新前端、再更新后端；倒过来会被前端
+        安装覆盖掉刚装好的后端（后端就装在内嵌 python 的 site-packages 里）。
+        更新目标跟随「查看版本」下拉的选中项（可与官方流程一样升到最新，也可降级）。
+        """
+        _sel = getattr(self, "_lite_selected", ("", "", "", ""))
+        sel, exe_url, whl_url, fe_tag = (_sel + ("", "", "", ""))[:4]
+        if not sel:
             return
-        if not asset_url:
-            # latest release 未附带 App 安装包（部分版本只发后端 whl）：引导去 releases 页
+        if not exe_url and not whl_url:
+            # 该版本两类资产都没有：引导去 releases 页手动处理
             repo = GITHUB_RELEASE_REPO.get(self.app.get("key", ""))
-            url = ("https://github.com/%s/%s/releases/latest" % repo) if repo \
+            url = ("https://github.com/%s/%s/releases/tag/%s" % (repo + (sel,))) if repo \
                 else (self.app.get("website", "") or "")
             if url:
                 QDesktopServices.openUrl(QUrl(url))
             return
-        note = (body or "").strip()
-        if len(note) > 500:
-            note = note[:500] + "…"
+        cur_fe = _exe_file_version(self.app.get("exe", ""))
+        cur_be = _lite_backend_version(self.app)
+
+        def _cmp(a, b):
+            try:
+                return compare_version(_normalize_tag(a), _normalize_tag(b))
+            except Exception:
+                return 0
+
+        fe_act = bool(exe_url and fe_tag and (not cur_fe or _cmp(fe_tag, cur_fe) != 0))
+        # 后端 whl 两种情况都要装：①所选后端与当前不同；②前端要动——
+        # 前端安装程序会重置内嵌后端，装完必须重装 whl 才能把后端恢复到所选版本
+        be_act = bool(whl_url and (fe_act or not cur_be or _cmp(sel, cur_be) != 0))
+        if not fe_act and not be_act:
+            return
+        self._lite_need_whl = be_act
+        steps = []
+        targets = []
+        if fe_act:
+            targets.append("前端 %s" % fe_tag)
+            note = ("所选 %s 未发布前端 exe，使用 %s 的安装包" % (sel, fe_tag)
+                    if fe_tag != sel else "前端 %s → %s" % (cur_fe or "?", fe_tag))
+            steps.append("1. 前端安装包（exe）：%s" % note)
+        if be_act:
+            targets.append("后端 %s" % sel)
+            be_down = bool(cur_be and _cmp(sel, cur_be) < 0)
+            if not fe_act:
+                # 只动后端：说清从哪到哪
+                note = "后端 %s → %s" % (cur_be or "?", sel)
+            elif cur_be and _cmp(sel, cur_be) == 0:
+                # 后端本来就是所选版本：前端装完被重置，重装 whl 属于「恢复」
+                note = ("前端安装程序会重置内嵌后端，装完前端后重装 whl，"
+                        "恢复后端到 %s" % sel)
+            else:
+                # 后端版本随所选变化：这是真正的更新/降级，不是恢复
+                note = ("前端安装程序会重置内嵌后端，装完前端后安装 whl，"
+                        "%s后端到 %s" % ("降级" if be_down else "更新", sel))
+            steps.append("%d. 后端包（whl）：%s" % (len(steps) + 1, note))
         ans = QMessageBox.question(
-            self.window(), "更新「%s」到 %s" % (self.app.get("display", ""), tag),
-            "将下载官方安装包并运行。\n\n更新说明：\n%s\n\n"
-            "开始前会先关闭正在运行的奇想盒，继续吗？" % (note or "（无）"),
+            self.window(), "更新「%s」：%s"
+            % (self.app.get("display", ""), " · ".join(targets)),
+            "按官方手动更新流程：先安装前端（exe），再安装后端（whl）。\n\n"
+            "%s\n\n更新说明请见卡片内的「更新说明」。\n\n是否开始？" % "\n".join(steps),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes,
         )
         if ans != QMessageBox.StandardButton.Yes:
             return
-        self._lite_download(tag, asset_url)
+        if fe_act:
+            # 前端包的路径按实际来源版本 fe_tag 命名（如选 2.4.9 实际装 2.4.7 的 exe）
+            self._lite_download(fe_tag or sel, exe_url, "exe")
+        else:
+            self._lite_download(sel, whl_url, "whl")
 
-    def _lite_download(self, tag, asset_url):
+    def _lite_download(self, tag, url, stage):
+        """下载更新包（exe 或 whl），下载完按 stage 分派到对应安装步骤。"""
+        self._lite_stage = stage
         cache = os.path.join(LAUNCHER_CACHE_DIR, "whimbox-update")
-        fname = "whimbox_app-setup-%s.exe" % tag.lstrip("v")
+        fname = ("whimbox_app-setup-%s.exe" if stage == "exe"
+                 else "whimbox-%s-py3-none-any.whl") % tag.lstrip("v")
         save = os.path.join(cache, fname)
         if os.path.isfile(save) and os.path.getsize(save) > 0:
-            # 已下过直接进安装（重复点击不重复下载）
-            self._lite_run_installer(save)
+            # 已下过直接进入下一步（重复点击不重复下载）
+            self._lite_after_download(save)
             return
         # 复用 ok-script 卡的持久进度三件套（lite 分支 rebuild 时已隐藏）
         self.install_progress.setRange(0, 100)
         self.install_progress.setValue(0)
         self.install_progress.setVisible(True)
-        self.install_status.setText("正在连接下载源…")
+        self.install_status.setText("正在测速下载源（万载云节点 + 直链）…")
         self.install_status.setVisible(True)
         self.install_cancel_btn.setText("✕ 取消下载")
         self.install_cancel_btn.setVisible(True)
@@ -2923,7 +3340,7 @@ class AppCard(CardWidget):
         self.install_cancel_btn.clicked.connect(self._lite_cancel_download)
         self.update_btn.setEnabled(False)
 
-        self._lite_dl_worker = LiteDownloadWorker(asset_url, save, parent=self)
+        self._lite_dl_worker = LiteDownloadWorker(url, save, parent=self)
         self._lite_dl_worker.progress.connect(self._on_lite_progress)
         self._lite_dl_worker.finished_ok.connect(self._on_lite_downloaded)
         self._lite_dl_worker.failed.connect(self._on_lite_dl_failed)
@@ -2939,7 +3356,74 @@ class AppCard(CardWidget):
         self._hide_install_progress_ui()
         self.install_status.setText("下载完成")
         self.install_status.setVisible(True)
-        self._lite_run_installer(path)
+        self._lite_after_download(path)
+
+    def _lite_after_download(self, path):
+        if getattr(self, "_lite_stage", "exe") == "exe":
+            self._lite_run_installer(path)
+        else:
+            self._lite_install_backend(path)
+
+    def _lite_install_backend(self, whl_path):
+        """官方「手动更新后端」的等价自动化：用奇想盒内嵌 python 装 whl。
+
+        官方流程是 App 设置里选 whl 文件后自动安装；后端实际装在内嵌 python 的
+        site-packages（实测有 whimbox + whimbox-<ver>.dist-info），所以用内嵌
+        python 跑 pip install 是同一效果。
+        """
+        exe = self.app.get("exe", "")
+        py = os.path.join(os.path.dirname(exe), "python-embedded", "python.exe")
+        if not os.path.isfile(py):
+            QMessageBox.warning(
+                self.window(), "后端更新",
+                "找不到奇想盒内嵌 Python：\n%s\n\n请打开奇想盒 → 设置 →「手动更新后端」，"
+                "选择已下载的 whl 文件：\n%s" % (py, whl_path),
+            )
+            return
+        # 先关掉奇想盒，避免占用正在替换的后端文件
+        subprocess.run(
+            ["taskkill", "/IM", os.path.basename(exe), "/F", "/T"],
+            capture_output=True, text=True, encoding="gbk", errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        self.install_progress.setRange(0, 0)   # 不确定进度
+        self.install_progress.setVisible(True)
+        self.install_status.setText("正在安装后端（pip install whl）…")
+        self.install_status.setVisible(True)
+
+        self._lite_pip_worker = LitePipWorker(py, whl_path, parent=self)
+        self._lite_pip_worker.finished_ok.connect(self._on_lite_pip_done)
+        self._lite_pip_worker.failed.connect(self._on_lite_pip_failed)
+        self._lite_pip_worker.start()
+
+    def _on_lite_pip_done(self, out):
+        self._hide_install_progress_ui()
+        _sel = getattr(self, "_lite_selected", ("", "", "", "")) or ("", "", "", "")
+        tag = _sel[0]
+        fe_tag = _sel[3] if len(_sel) > 3 else tag
+        self.install_status.setText("后端更新完成")
+        self.install_status.setVisible(True)
+        self._lite_has_update = False
+        self._lite_set_btn("已是最新", enabled=False,
+                           style="QPushButton { background-color:rgba(255,255,255,0.10); "
+                                 "color:#9aa0a6; border-radius:8px; font-weight:600; }")
+        # 所选版本没发前端 exe 时，前端实际装的是更低的 fe_tag，提示里写清楚
+        fe_note = "" if (fe_tag and fe_tag == tag) else "（前端实际为 %s）" % fe_tag
+        QMessageBox.information(
+            self.window(), "更新完成",
+            "奇想盒已更新到 %s%s，重新打开奇想盒即可生效。" % (tag, fe_note),
+        )
+
+    def _on_lite_pip_failed(self, err):
+        self._hide_install_progress_ui()
+        self.update_btn.setEnabled(True)
+        self.install_status.setText("后端安装失败：%s" % err)
+        self.install_status.setVisible(True)
+        QMessageBox.warning(
+            self.window(), "后端更新失败",
+            "%s\n\n可改用官方方式：打开奇想盒 → 设置 →「手动更新后端」，"
+            "选择已下载的 whl 文件。" % err,
+        )
 
     def _on_lite_dl_failed(self, err):
         self._hide_install_progress_ui()
@@ -2950,7 +3434,7 @@ class AppCard(CardWidget):
     def _lite_cancel_download(self):
         w = getattr(self, "_lite_dl_worker", None)
         if w and w.isRunning():
-            w.requestInterruption()
+            w.cancel()
         self._hide_install_progress_ui()
         self.update_btn.setEnabled(True)
 
@@ -2973,8 +3457,114 @@ class AppCard(CardWidget):
         )
         if run_exe(self.window(), setup_path, cwd=os.path.dirname(setup_path),
                    need_admin=False, show_errors=True):
-            self.status_label.setText("安装程序已启动，完成后重新启动奇想盒即可")
+            self.status_label.setText("前端安装程序已启动，请按向导完成安装")
             QTimer.singleShot(8000, lambda: self.status_label.setText(""))
+            # 前端装完再装后端（顺序原因见 _on_lite_update 的说明）
+            _s4 = getattr(self, "_lite_selected", ("", "", "", ""))
+            sel, _e, whl, _ft = (_s4 + ("", "", "", ""))[:4]
+            tag = sel
+            if whl and getattr(self, "_lite_need_whl", True):
+                ans = QMessageBox.question(
+                    self.window(), "继续更新后端",
+                    "前端安装向导已启动。\n\n请等前端装完（向导走完、奇想盒能正常打开）后，"
+                    "再点「是」开始更新后端。\n\n"
+                    "注意：必须等前端装完再更新后端——反过来会被前端安装覆盖刚装好的后端。",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if ans == QMessageBox.StandardButton.Yes:
+                    self._lite_download(tag, whl, "whl")
+                else:
+                    self.status_label.setText("前端已更新，后端可稍后更新")
+            elif whl:
+                # 该次更新无需重装后端（_lite_need_whl=False）：前端装完即收工
+                self.status_label.setText("前端已更新完成")
+
+    def _on_lite_version_changed(self, text):
+        """下拉切换版本 → 更新说明与更新按钮目标都跟着切换。"""
+        self._lite_show_changelog(text)
+        self._lite_refresh_update_btn()
+
+    def _lite_show_changelog(self, tag):
+        if not hasattr(self, "changelog_text"):
+            return
+        body = (getattr(self, "_lite_version_map", {}) or {}).get(tag, "").strip()
+        if not body:
+            body = ("这是本机当前安装的版本，官方 release 列表里没有它的更新说明。"
+                    if "（当前）" in (tag or "") else "（该版本未提供更新说明）")
+        self.changelog_text.setPlainText("【%s】\n%s" % (tag, body))
+
+    def _lite_script_dir(self):
+        """奇想盒脚本目录（App 设置里「打开脚本目录」指向的就是 <App目录>/scripts）。"""
+        return os.path.join(os.path.dirname(self.app.get("exe", "") or ""), "scripts")
+
+
+    def _on_lite_script_update(self):
+        d = self._lite_script_dir()
+        if not os.path.isdir(d):
+            QMessageBox.warning(
+                self.window(), "更新跑图路线",
+                "找不到奇想盒脚本目录：\n%s\n\n请先手动打开一次奇想盒（它会自动创建）。" % d)
+            return
+        ans = QMessageBox.question(
+            self.window(), "更新跑图路线",
+            "将从 nikkigallery/WhimboxScripts 下载全部路线脚本到：\n%s\n\n"
+            "同名文件会被覆盖。\n\n完成后最后一步要在奇想盒 → 设置 里点「刷新脚本」才能生效"
+            "（那是 App 内的按钮，本启动器无法代劳）。\n\n继续吗？" % d,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        self.install_progress.setRange(0, 100)
+        self.install_progress.setValue(0)
+        self.install_progress.setVisible(True)
+        self.install_status.setText("正在获取路线列表…")
+        self.install_status.setVisible(True)
+        self.install_cancel_btn.setText("✕ 取消")
+        self.install_cancel_btn.setVisible(True)
+        try:
+            self.install_cancel_btn.clicked.disconnect()
+        except Exception:
+            pass
+        self.install_cancel_btn.clicked.connect(self._lite_script_cancel)
+        self.script_btn.setEnabled(False)
+
+        self._lite_script_worker = LiteScriptUpdateWorker(d, parent=self)
+        self._lite_script_worker.progress.connect(self._on_lite_script_progress)
+        self._lite_script_worker.finished_ok.connect(self._on_lite_script_done)
+        self._lite_script_worker.failed.connect(self._on_lite_script_failed)
+        self._lite_script_worker.start()
+
+    def _on_lite_script_progress(self, done, total):
+        pct = int(done * 100 / total) if total else 0
+        self.install_progress.setValue(pct)
+        self.install_status.setText("下载路线脚本 %d/%d" % (done, total))
+
+    def _on_lite_script_done(self, count, d):
+        self._hide_install_progress_ui()
+        self.script_btn.setEnabled(True)
+        self.install_status.setText("路线脚本已更新：%d 个" % count)
+        self.install_status.setVisible(True)
+        QMessageBox.information(
+            self.window(), "路线更新完成",
+            "已写入 %d 个路线脚本到：\n%s\n\n最后一步：打开奇想盒 → 设置 →「刷新脚本」。\n\n"
+            "（官方提示：朝夕心愿 / 星海拾光 / 家园日常 开头的脚本是一条龙必需项，务必保留）"
+            % (count, d),
+        )
+
+    def _on_lite_script_failed(self, err):
+        self._hide_install_progress_ui()
+        self.script_btn.setEnabled(True)
+        self.install_status.setText("路线更新失败：%s" % err)
+        self.install_status.setVisible(True)
+
+    def _lite_script_cancel(self):
+        w = getattr(self, "_lite_script_worker", None)
+        if w and w.isRunning():
+            w.requestInterruption()
+        self._hide_install_progress_ui()
+        self.script_btn.setEnabled(True)
 
     def build_installed_body(self):
         # 按钮行
@@ -3325,6 +3915,22 @@ class AppCard(CardWidget):
                 "background-color:rgba(45,125,50,0.25); color:#8dffb0; "
                 "border-radius:9px; padding:3px 12px; font-size:12px; font-weight:600;"
             )
+            return
+        # lite 卡：没有 app.json 的版本列表，最新版本来自 GitHub release tag
+        if getattr(self, "_lite", False):
+            tag = (getattr(self, "_lite_remote", ("",)) or [""])[0]
+            if getattr(self, "_lite_has_update", False) and tag:
+                self.badge.setText("可更新 %s" % tag)
+                self.badge.setStyleSheet(
+                    "background-color:rgba(230,81,0,0.28); color:#ffb74d; "
+                    "border-radius:9px; padding:3px 12px; font-size:12px; font-weight:600;"
+                )
+            else:
+                self.badge.setText("已安装")
+                self.badge.setStyleSheet(
+                    "background-color:rgba(45,125,50,0.25); color:#8dffb0; "
+                    "border-radius:9px; padding:3px 12px; font-size:12px; font-weight:600;"
+                )
             return
         versions = d.get("available_versions", []) or []
         current = d.get("current_version", "")
