@@ -42,3 +42,8 @@ rebuild_lnk.py
 # 本机实际配置（含个人安装路径与 MirrorChyan CDK），不进版本控制。
 # 新用户请复制 config.example.json 为 config.json 后自行修改。
 config.json
+
+# PyInstaller 构建产物（单文件 exe 约 110MB，构建即生成，不进版本控制）
+build/
+dist/
+*.spec
