@@ -2266,16 +2266,63 @@ def _site_pkg_version(lib_dir, pkg):
     return ""
 
 
+def _dir_writable(d):
+    """真写一个临时文件测可写性——os.access 在 Windows UAC 虚拟化下会谎报 True。"""
+    try:
+        if not os.path.isdir(d):
+            return False
+        p = os.path.join(d, "__wb_wtest__")
+        with open(p, "w") as f:
+            f.write("x")
+        os.remove(p)
+        return True
+    except Exception:
+        return False
+
+
+def _embedded_user_site(py_dir):
+    """内嵌 python 对应的「用户级」site-packages（pip 不可写时的静默回退落点）。
+
+    %APPDATA%\\Python\\Python3xx\\site-packages。实测（2026-10-02）：该目录在
+    sys.path 里排在内嵌 site-packages **之前**，两边都装时 App import 到的是它。
+    """
+    try:
+        best = ""
+        for n in os.listdir(py_dir):
+            ln = n.lower()
+            # 注意：目录里同时有 python3.dll（ABI 转发壳）和 python312.dll（真身），
+            # 必须取版本号最长的那个，否则会拼出不存在的 Python3 用户目录
+            if ln.startswith("python3") and ln.endswith(".dll"):
+                v = ln[6:-4]
+                if v.isdigit() and len(v) > len(best):
+                    best = v
+        if best:
+            base = os.environ.get("APPDATA", "")
+            if base:
+                return os.path.join(base, "Python",
+                                    "Python%s" % best, "site-packages")
+    except Exception:
+        pass
+    return ""
+
+
 def _lite_backend_version(app):
-    """lite 助手的后端版本——奇想盒后端装在内嵌 python 的 site-packages/whimbox。
+    """lite 助手的后端版本——按 sys.path 的真实 import 优先级找：用户目录 > 内嵌。
 
     注意：奇想盒有**三套互不相干的版本号**：前端 App（exe FileVersion，如 2.1.1）、
     后端 Python 包（如 2.4.9）、仓库 release tag（如 3.1.0）。必须分开显示，
     否则用户会以为「选了 2.4.6 却更新成 2.4.9」。
+
+    2026-10-02 实测教训：pip 在目标目录不可写时会静默把包装进用户目录并返回 0
+    （启动器曾误报"后端更新完成"，卡片却显示"未知"）——而用户目录在 sys.path
+    里排在 site-packages 之前、App 真正 import 的就是它，所以必须先查它。
     """
-    d = os.path.join(os.path.dirname(app.get("exe", "") or ""),
-                     "python-embedded", "Lib", "site-packages")
-    return _site_pkg_version(d, "whimbox")
+    emb = os.path.join(os.path.dirname(app.get("exe", "") or ""), "python-embedded")
+    us = _embedded_user_site(emb)
+    v = _site_pkg_version(us, "whimbox") if us else ""
+    if v:
+        return v
+    return _site_pkg_version(os.path.join(emb, "Lib", "site-packages"), "whimbox")
 
 
 class LiteReleaseCheckWorker(QThread):
@@ -2449,29 +2496,390 @@ class LitePipWorker(QThread):
 
     finished_ok = Signal(str)
     failed = Signal(str)
+    progress_text = Signal(str)   # pip 实时输出的一行尾巴 → UI 拼进卡片状态里
+    progress = Signal(int)        # 从 pip 输出解析出的真实百分比（0-100，-1=解析不到）
 
     def __init__(self, python_exe, whl_path, parent=None):
         super().__init__(parent)
         self._py = python_exe
         self._whl = whl_path
+        self._cancelled = False
+        self._proc = None
+        self._ps = None
+        self._poll_interval = 1.0   # 轮询 pip 输出的间隔（测试可置 0）
+        self._log_off = 0           # pip 日志已读到的位置（增量读）
+        self._uninst_done = 0       # 已卸载包数
+        self._pkg_total = 0         # Installing collected packages 里的总包数
+
+    def cancel(self):
+        self._cancelled = True
+        for p in (self._proc, self._ps):
+            if p:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _parse_percent(text):
+        """从 pip 的一行输出里解析真实进度：优先 "43/100"，其次 "45%"，都没有返回 -1。"""
+        import re as _re
+        m = _re.search(r"(\d+)\s*/\s*(\d+)", text or "")
+        if m:
+            try:
+                a, b = int(m.group(1)), int(m.group(2))
+                if b > 0 and a <= b:
+                    return max(0, min(100, int(a * 100 / b)))
+            except Exception:
+                pass
+        m = _re.search(r"(\d{1,3})\s*%", text or "")
+        if m:
+            try:
+                return max(0, min(100, int(m.group(1))))
+            except Exception:
+                pass
+        return -1
+
+    def _pct_from_lines(self, lines):
+        """从已收到的 pip 行里算百分比。
+
+        注意：输出被重定向到文件/管道（非 TTY）时 pip 会关掉终端进度条，行内没有
+        N/M 也没有 %（已实测）。此时改用包计数法：
+          - 总数 ← "Installing collected packages: a, b, c" 里的包数
+          - 已完成 ← 逐行的 "Successfully uninstalled X"（--force-reinstall 会逐个卸载）
+        """
+        for ln in reversed(lines[-5:]):
+            p = self._parse_percent(ln)
+            if p >= 0:
+                return p
+        total = 0
+        for ln in reversed(lines):
+            if ln.startswith("Installing collected packages:"):
+                total = len([x for x in ln.split(":", 1)[1].split(",") if x.strip()])
+                break
+        if total:
+            done = sum(1 for ln in lines
+                       if ln.startswith("Successfully uninstalled")
+                       or ln.startswith("Successfully installed"))
+            if done:
+                return max(0, min(100, int(done * 100 / total)))
+        return -1
+
+    def _emit_line(self, line, lines=None):
+        """发一行进度给 UI：文本 + 百分比（让卡片进度条像终端一样会涨）。"""
+        line = (line or "").strip()
+        if not line:
+            return
+        self.progress_text.emit(line[-90:])
+        pct = self._pct_from_lines(list(lines or []) + [line])
+        if pct >= 0:
+            self.progress.emit(pct)
+
+    def _scan_log(self, path):
+        """增量读 pip --log，用「已卸载包数 / 总包数」算真实百分比。
+
+        控制台输出被重定向后不一定有逐包的卸载行，但 pip 日志里一定有
+        （已用你这次真实提权安装的日志验证：总包 106、卸载行 106、完成 1）。
+        只读上次之后的新增字节，避免每秒重扫几十 MB 的日志。
+        """
+        try:
+            with open(path, "rb") as f:
+                f.seek(self._log_off)
+                data = f.read().decode("utf-8", "replace")
+                self._log_off = f.tell()
+        except Exception:
+            return
+        if not data:
+            return
+        self._uninst_done += data.count("Successfully uninstalled")
+        idx = data.find("Installing collected packages:")
+        if idx >= 0:
+            head = data[idx:].split("\n", 1)[0]
+            try:
+                self._pkg_total = len(
+                    [x for x in head.split(":", 1)[1].split(",") if x.strip()])
+            except Exception:
+                pass
+        if self._pkg_total:
+            self.progress.emit(max(0, min(100,
+                int(self._uninst_done * 100 / self._pkg_total))))
+
+    def _emit_tail(self, path):
+        """读 pip 输出文件：最后一行给文本，整份算一次百分比。"""
+        try:
+            with open(path, "rb") as f:
+                data = f.read().decode("utf-8", "replace")
+            lines = [x.strip() for x in data.replace("\r", "\n").split("\n")
+                     if x.strip()]
+            if lines:
+                self._emit_line(lines[-1], lines)
+        except Exception:
+            pass
 
     def run(self):
         try:
-            r = subprocess.run(
+            lib = os.path.join(os.path.dirname(self._py), "Lib", "site-packages")
+            if not _dir_writable(lib):
+                # 目标目录不可写：pip 不会报错，而是静默把包装进 C 盘用户目录还返回 0
+                # （2026-10-02 实测的假成功，且用户目录在 sys.path 里会压过本尊）。
+                # 直接 UAC 提权，一步装进内嵌 site-packages，不制造 C 盘残留。
+                ok, msg = self._run_elevated()
+                (self.finished_ok if ok else self.failed).emit(msg)
+                return
+            # 流式读 pip 输出（CREATE_NO_WINDOW 不弹窗）：进度实时发卡片，
+            # 不再等装完才一次性拿到输出
+            buf = []
+            self._proc = subprocess.Popen(
                 [self._py, "-m", "pip", "install", "--upgrade",
-                 "--force-reinstall", "--no-warn-script-location", self._whl],
-                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                 "--force-reinstall", "--no-warn-script-location",
+                 # raw：非 TTY 时也让 pip 打出纯文本百分比（默认会关掉进度条）
+                 "--progress-bar", "raw", self._whl],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace",
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                timeout=1800,
             )
-            out = (r.stdout or "") + (r.stderr or "")
-            if r.returncode == 0:
+            last_t = 0.0
+            for line in self._proc.stdout:
+                if self._cancelled:
+                    self._proc.kill()
+                    self.failed.emit("已取消")
+                    return
+                line = (line or "").strip()
+                if line:
+                    buf.append(line)
+                    if time.time() - last_t >= 0.5:   # 限频，别刷爆 UI 事件队列
+                        last_t = time.time()
+                        self._emit_line(line, buf)
+            rc = self._proc.wait()
+            out = "\n".join(buf)
+            low = out.lower()
+            permfail = ("permission denied" in low or "winerror 5" in low
+                        or "access is denied" in low)
+            if rc == 0 and self._target_reached(lib):
                 self.finished_ok.emit(out[-1500:])
-            else:
-                self.failed.emit((out[-600:] or "").strip()
-                                 or "pip 返回码 %s" % r.returncode)
+                return
+            if permfail or rc == 0:
+                # 两种情况都提权重跑：①明确的权限报错；②退出码 0 但包没落在目标
+                # 目录（pip 静默回退到用户目录的另一种假成功形态）
+                ok, msg = self._run_elevated()
+                (self.finished_ok if ok else self.failed).emit(msg)
+                return
+            self.failed.emit((out[-600:] or "").strip()
+                             or "pip 返回码 %s" % rc)
         except Exception as e:
             self.failed.emit(str(e))
+
+    def _target_reached(self, lib):
+        """硬验证：whl 的目标版本必须真的出现在内嵌 site-packages。"""
+        import re as _re
+        # 注意从 whl 文件名解析版本（whimbox-2.4.7-py3-none-any.whl），
+        # 不能套用 dist-info 的正则——whl 名里没有 ".dist-info"
+        m = _re.search(r"whimbox-([0-9][\w.]*)", os.path.basename(self._whl))
+        ver = m.group(1) if m else ""
+        got = _site_pkg_version(lib, "whimbox")
+        return got == ver if ver else bool(got)
+
+    def _run_elevated(self):
+        """权限不足时以管理员重跑 pip。
+
+        写临时 .cmd（缓存目录全 ASCII，无编码风险）→ PowerShell
+        Start-Process -Verb RunAs -WindowStyle Hidden 弹一次 UAC 并等待 →
+        pip 输出重定向到文件（父进程每秒取尾巴，把原本黑窗里的进度实时搬进卡片）
+        → 用 site-packages 里 dist-info 的实际版本做硬验证（比退出码可靠）。
+
+        注意 -WindowStyle Hidden 不能省：提权进程不继承父进程的"无窗口"属性，
+        之前漏了它，pip 卸载/安装上百个依赖包的黑窗会一直挂在屏幕上（用户截图）。
+        """
+        import re as _re
+        log = self._whl + ".elevated.log"
+        bat = self._whl + ".elevated.cmd"
+        prog = self._whl + ".elevated.out"
+        try:
+            with open(bat, "w", encoding="ascii") as f:
+                f.write('@echo off\r\n"%s" -m pip install --upgrade '
+                        '--force-reinstall --no-warn-script-location '
+                        # raw：非 TTY 时也让 pip 打出纯文本百分比（默认会关掉进度条）
+                        '--progress-bar raw --log "%s" "%s" > "%s" 2>&1\r\n'
+                        'echo EXITCODE=%%ERRORLEVEL%%>>"%s"\r\n'
+                        % (self._py, log, self._whl, prog, prog))
+            self._ps = subprocess.Popen(
+                ["powershell", "-NoProfile", "-Command",
+                 "Start-Process -FilePath '%s' -Verb RunAs -WindowStyle Hidden -Wait"
+                 % bat],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            while self._ps.poll() is None:
+                if self._cancelled:
+                    try:
+                        self._ps.kill()
+                    except Exception:
+                        pass
+                    return False, "已取消"
+                self._emit_tail(prog)   # 黑窗藏了，控制台那行文本实时进卡片
+                self._scan_log(log)     # 真实百分比：已卸载包数 / 总包数
+                time.sleep(self._poll_interval)
+            self._emit_tail(prog)
+        except Exception as e:
+            return False, "管理员重跑 pip 失败：%s" % e
+        try:
+            logtxt = open(log, "r", encoding="utf-8", errors="replace").read()
+        except Exception:
+            logtxt = ""
+        # 硬验证：目标版本必须真的出现在 site-packages
+        # （从 whl 文件名解析版本，不能套 dist-info 正则——whl 名里没有它）
+        m = _re.search(r"whimbox-([0-9][\w.]*)", os.path.basename(self._whl))
+        ver = m.group(1) if m else ""
+        lib = os.path.join(os.path.dirname(self._py), "Lib", "site-packages")
+        installed = _site_pkg_version(lib, "whimbox")
+        if ver and installed == ver:
+            return True, "后端 %s 已安装（管理员模式）" % installed
+        if ver and installed and installed != ver:
+            return False, ("管理员重跑后版本仍不符：装到 %s，目标 %s。\n%s"
+                           % (installed, ver, logtxt[-400:]))
+        return False, (logtxt[-600:].strip() or "UAC 被拒绝或安装未完成")
+
+
+class LiteInstallFrontendWorker(QThread):
+    """一条龙第 2 步：静默装前端（NSIS /S /D= 锁目录）并校验 FileVersion。
+
+    在子线程跑 subprocess，UI 线程用走马灯进度 + 每秒文案提示"没卡死"。
+    校验：匹配目标→ok；变了但不等于目标→tolerant；没变→查默认落点是否出现
+    新 exe（防 /D 失效装去系统盘），否则→unchanged。
+    """
+    finished_ok = Signal(str)   # ok / tolerant:<v> / wrong_location:<path> / unchanged
+    failed = Signal(str)
+
+    def __init__(self, setup_path, target_dir, exe, fe_tag, old_ver, parent=None):
+        super().__init__(parent)
+        self._setup = setup_path
+        self._target = target_dir
+        self._exe = exe
+        self._fe = fe_tag
+        self._old = old_ver
+        self._cancelled = False
+        self._proc = None
+        self._ps = None
+        # 不按猜测时长自动杀安装器：写一半被杀会留下残缺安装，比多等一会儿糟得多。
+        # 安装器真卡死时由用户点「取消」（_lite_cancel_install → cancel）决定。
+        self._timeout = None
+
+    def cancel(self):
+        self._cancelled = True
+        for p in (self._proc, self._ps):
+            if p:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+
+    def cancel(self):
+        self._cancelled = True
+        if self._proc and self._proc.poll() is None:
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
+
+    def run(self):
+        try:
+            cno = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            exe_name = os.path.basename(self._exe) or "whimbox_app.exe"
+            subprocess.run(["taskkill", "/IM", exe_name, "/F", "/T"],
+                           capture_output=True, text=True, encoding="gbk",
+                           errors="replace", creationflags=cno)
+            if self._cancelled:
+                self.failed.emit("已取消")
+                return
+            # NSIS 规范：/D 必须是最后一个参数、裸路径不加引号（含空格也别加）
+            cmd = '"%s" /S /D=%s' % (self._setup, self._target)
+            try:
+                self._proc = subprocess.Popen(cmd, shell=False, creationflags=cno)
+            except OSError as e:
+                if not (getattr(e, "winerror", None) == 740 or "740" in str(e)):
+                    raise
+                # WinError 740（请求的操作需要提升）：安装器清单要求管理员。
+                # 直接 CreateProcess 会立刻抛 740 —— 改走 PowerShell -Verb RunAs
+                # 提权启动并等待（与 pip 提权同一套路；旧版 run_exe 的 740 分支
+                # 在改造成 worker 时曾被弄丢，2026-10-02 用户实测踩回）。
+                if not self._run_elevated_installer():
+                    if not self._cancelled:
+                        self.failed.emit("提权启动安装器失败：UAC 被拒绝或出错。"
+                                         "可手动运行安装包重试。")
+                    return
+            else:
+                t0 = time.time()
+                while self._proc.poll() is None:
+                    if self._cancelled:
+                        self._proc.kill()
+                        self.failed.emit("已取消")
+                        return
+                    if self._timeout and time.time() - t0 > self._timeout:
+                        # 仅当调用方显式给了上界才生效（默认 None = 不自动杀）
+                        self._proc.kill()
+                        self.failed.emit("安装超时：超过 %d 秒仍未结束，已终止安装器。"
+                                         "可手动运行安装包重试。" % self._timeout)
+                        return
+                    time.sleep(1)
+            if self._cancelled:
+                return
+            self._verify()
+        except Exception as e:
+            self.failed.emit(str(e))
+
+    def _run_elevated_installer(self):
+        """740 时提权启动安装器：PowerShell -Verb RunAs -WindowStyle Hidden -Wait。
+
+        -Wait 会等提权后的安装器跑完（含 GUI 子系统进程），返回后走常规
+        FileVersion 校验。-WindowStyle Hidden 必须带，否则黑窗挂屏。
+        PS 5.1 不会给 ArgumentList 里的参数自动加引号，/D= 裸路径正好原样透传。
+        """
+        try:
+            ps_cmd = ("Start-Process -FilePath '%s' -ArgumentList '/S','/D=%s' "
+                      "-Verb RunAs -WindowStyle Hidden -Wait"
+                      % (self._setup, self._target))
+            self._ps = subprocess.Popen(
+                ["powershell", "-NoProfile", "-Command", ps_cmd],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            while self._ps.poll() is None:
+                if self._cancelled:
+                    try:
+                        self._ps.kill()
+                    except Exception:
+                        pass
+                    return False
+                time.sleep(1)
+            return True
+        except Exception:
+            return False
+
+    def _verify(self):
+        """装完校验 FileVersion：ok / tolerant / wrong_location / unchanged。"""
+        v = _exe_file_version(self._exe)
+        if v and v == self._fe:
+            self.finished_ok.emit("ok")
+            return
+        if v and v != self._old:
+            self.finished_ok.emit("tolerant:%s" % v)
+            return
+        # 没变：查默认落点是否出现新装（/D 失效的征兆）
+        locs = [
+            r"C:\Program Files\whimbox_app\whimbox_app.exe",
+            os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs",
+                         "whimbox_app", "whimbox_app.exe"),
+        ]
+        for loc in locs:
+            if os.path.isfile(loc):
+                try:
+                    mt = os.path.getmtime(loc)
+                except Exception:
+                    mt = 0
+                if time.time() - mt < 600:
+                    self.finished_ok.emit("wrong_location:%s" % loc)
+                    return
+        self.finished_ok.emit("unchanged")
 
 
 class LiteScriptUpdateWorker(QThread):
@@ -2602,9 +3010,12 @@ def run_exe(parent, exe, args=None, cwd=None, need_admin=False, show_errors=True
     if need_admin:
         return runas(exe, args, cwd)
     try:
+        # 不用 DETACHED_PROCESS(0x8)：Electron/Chromium 系（奇想盒 whimbox_app.exe）
+        # 依赖从父进程继承的句柄映射 ICU 数据，DETACHED_PROCESS 会切断该句柄继承，
+        # 导致启动即报 "Invalid file descriptor to ICU data received" 后直接退出。
+        # 父进程是 pythonw（无控制台），不传该标志也不会闪黑窗。
         subprocess.Popen(
             [exe] + args, cwd=cwd, shell=False,
-            creationflags=0x00000008,  # DETACHED_PROCESS
         )
         return True
     except OSError as e:
@@ -2980,8 +3391,13 @@ class AppCard(CardWidget):
         if self._installed:
             self.start_btn = PushButton("▶  启动应用")
             # 当前 / 最新版本提示：ok-script 卡的版本信息由 app.json 提供，
-            # lite 卡这里显式列出，免得最新版本只藏在按钮文案里
-            self.ver_hint = CaptionLabel("当前版本 —")
+            # lite 卡这里显式列出，免得最新版本只藏在按钮文案里。
+            # 前端/后端本地就能读（exe 版本资源 + site-packages dist-info），
+            # 构建时立即填充，不等网络检查——检查失败（GitHub API 超时/限流）
+            # 也不会出现「当前版本 —」一直空着的僵局。
+            self.ver_hint = CaptionLabel("前端 %s · 后端 %s" % (
+                _exe_file_version(self.app.get("exe", "")) or "未知",
+                _lite_backend_version(self.app) or "未知"))
             self.body_box.addWidget(self.ver_hint)
             self.start_btn.setFixedHeight(42)
             self.start_btn.setStyleSheet(
@@ -3073,18 +3489,52 @@ class AppCard(CardWidget):
         if style:
             self.update_btn.setStyleSheet(style)
 
+    def _rewire_update_btn_retry(self):
+        """把更新按钮临时接到「重试检查」上（检查失败/异常时的统一恢复入口）。"""
+        if not hasattr(self, "update_btn"):
+            return
+        try:
+            self.update_btn.clicked.disconnect()
+        except Exception:
+            pass
+        self.update_btn.clicked.connect(self._on_lite_check_retry)
+
     def _on_lite_check_failed(self, err):
-        self._lite_set_btn("检查更新失败（网络）", enabled=False)
+        # 失败不再灰死按钮：改成可点击重试（GitHub API 未登录限 60 次/小时 +
+        # 国内网络波动，一次失败很常见，必须给用户重试入口）
+        self._lite_set_btn("检查更新失败（网络）· 点击重试", enabled=True)
+        self._rewire_update_btn_retry()
+        if hasattr(self, "changelog_text"):
+            self.changelog_text.setPlainText(
+                "更新检查失败（网络）：%s\n\n点击上方「检查更新失败」按钮重试。" % err)
+
+    def _on_lite_check_retry(self):
+        """检查失败后的手动重试入口：重置一次性守卫后重新走 _lite_start_check。"""
+        w = getattr(self, "_lite_check_worker", None)
+        if w is not None and w.isRunning():
+            return  # 上一次检查还在跑，防连点
+        self._lite_check_started = False
+        self._lite_set_btn("检查更新中…", enabled=False)
+        self._lite_start_check()
 
     def _on_lite_check_done(self, info):
+        # 恢复按钮 → 更新入口：失败路径会把按钮改接到「重试」，成功后必须接回来
+        if hasattr(self, "update_btn"):
+            try:
+                self.update_btn.clicked.disconnect()
+            except Exception:
+                pass
+            self.update_btn.clicked.connect(self._on_lite_update)
         info = info or {}
         tag = (info.get("tag") or "").strip()
         if not tag:
-            self._lite_set_btn("检查更新失败", enabled=False)
+            self._lite_set_btn("检查更新失败 · 点击重试", enabled=True)
+            self._rewire_update_btn_retry()
             return
         cur = _exe_file_version(self.app.get("exe", ""))
         if not cur:
-            self._lite_set_btn("无法识别本机版本", enabled=False)
+            self._lite_set_btn("无法识别本机版本 · 点击重试", enabled=True)
+            self._rewire_update_btn_retry()
             return
         self._lite_remote = (tag, info.get("exe") or "", info.get("body") or "")
         self._lite_whl = info.get("whl") or ""
@@ -3092,6 +3542,7 @@ class AppCard(CardWidget):
         self._lite_assets = {v["tag"]: (v.get("exe") or "", v.get("whl") or "")
                              for v in (info.get("versions") or [])}
         # 版本下拉 + 更新说明（与 ok-script 卡同款交互：选版本 → 看该版本说明）
+        latest_item = tag          # 最新项可能被标成「3.1.0（最新）」，选中/看说明要用标注后的文本
         self._lite_version_map = {}
         if hasattr(self, "ver_combo"):
             try:
@@ -3106,43 +3557,120 @@ class AppCard(CardWidget):
                 # 列表没拉到时至少把 latest 放进去
                 self._lite_version_map[tag] = info.get("body") or ""
                 self.ver_combo.insertItem(0, tag)
-            # 本机当前版本未必在官方 release 列表里（2.x 是旧版本体系），单独插一项，
-            # 方便对照「我现在在哪一版」
-            cur_item = "%s（当前）" % cur
-            if cur and cur not in self._lite_version_map:
-                self._lite_version_map[cur_item] = ""
-                # 按版本号倒序插到正确位置（列表是新→旧，2.1.1 比 3.x 老，应排末尾）
-                pos = self.ver_combo.count()
-                try:
-                    cur_n = _normalize_tag(cur)
-                    for i in range(self.ver_combo.count()):
-                        if compare_version(_normalize_tag(self.ver_combo.itemText(i)), cur_n) < 0:
-                            pos = i
-                            break
-                except Exception:
-                    pos = self.ver_combo.count()
-                self.ver_combo.insertItem(pos, cur_item)
+            # 下拉标注「哪个是哪个」：奇想盒三条版本线（前端 exe / 后端 whl /
+            # release tag）互不相干、经常不同步，只标一个「（当前）」会让人以为是 bug
+            # （2026-10-02 用户反馈：前端 2.4.7 + 后端 2.4.8 时下拉看着怪）。
+            # 现在分别标：当前前端 / 当前后端 / 最新。
+            latest_item = self._lite_mark_combo(tag)
             self.ver_combo.currentTextChanged.connect(self._on_lite_version_changed)
-            if tag and self.ver_combo.findText(tag) >= 0:
-                self.ver_combo.setCurrentText(tag)
-        self._lite_show_changelog(tag)
+            if latest_item and self.ver_combo.findText(latest_item) >= 0:
+                self.ver_combo.setCurrentText(latest_item)
+        self._lite_show_changelog(latest_item)
+        self._lite_refresh_version_info(tag)
+        # 按钮按「当前选中项」刷新（默认选中 latest）
+        self._lite_refresh_update_btn()
+
+    def _lite_refresh_version_info(self, tag=None):
+        """重算卡片上的三条版本线提示（前端/后端/仓库最新）+ 徽章 + 有更新标志。
+
+        后端刚装完时必须调一次：否则「后端 X」停留在更新前 check 时的旧值，
+        用户会以为启动器没刷新（2026-10-02 用户截图反馈）。
+        """
+        cur = _exe_file_version(self.app.get("exe", ""))
+        latest = tag or (getattr(self, "_lite_remote", ("", ""))[0]
+                         if getattr(self, "_lite_remote", None) else "")
         try:
-            has_new = compare_version(_normalize_tag(tag), _normalize_tag(cur)) > 0
+            has_new = bool(latest) and compare_version(
+                _normalize_tag(latest), _normalize_tag(cur)) > 0
         except Exception:
             has_new = False
         # 存标志位供 snapshot() 用：QStackedWidget 里非当前页控件 isVisible()
         # 恒为 False，靠 update_btn.isVisible() 判断会让总览页永远看不到更新提示
         self._lite_has_update = has_new
-        # 当前 / 最新版本提示（避免最新版本只出现在按钮文案里）
         if hasattr(self, "ver_hint"):
             be = _lite_backend_version(self.app)
             self.ver_hint.setText(
                 "前端 %s · 后端 %s · 仓库最新 %s%s"
-                % (cur, be or "未知", tag,
+                % (cur, be or "未知", latest or "—",
                    "（有更新）" if has_new else "（已是最新）"))
         # 徽章同步一次：rebuild 时调的那次还不知道有没有更新，这里补刷成「可更新 <tag>」
         self.refresh_badge()
-        # 按钮按「当前选中项」刷新（默认选中 latest）
+
+    def _lite_mark_one(self, ver, suffix):
+        """给某个版本号打标注：在列表里就改名，不在就按版本号倒序插一项。返回新项文本。"""
+        item = "%s%s" % (ver, suffix)
+        idx = self.ver_combo.findText(ver)
+        if idx >= 0:
+            # 说明文本跟着搬到新 key（选标注项仍能看到该版官方说明）
+            self._lite_version_map[item] = self._lite_version_map.pop(ver, "")
+            self.ver_combo.setItemText(idx, item)
+            return item
+        self._lite_version_map[item] = ""
+        pos = self.ver_combo.count()
+        try:
+            vn = _normalize_tag(ver)
+            for i in range(self.ver_combo.count()):
+                if compare_version(_normalize_tag(self.ver_combo.itemText(i)), vn) < 0:
+                    pos = i
+                    break
+        except Exception:
+            pos = self.ver_combo.count()
+        self.ver_combo.insertItem(pos, item)
+        return item
+
+    def _lite_mark_combo(self, latest_tag):
+        """按当前真实版本给下拉打标注（当前前端 / 当前后端 / 最新）。
+
+        约定：调用前 combo 里必须是**裸版本号**、_lite_version_map 的 key 亦然
+        （_on_lite_check_done 刚重建完、或 _lite_remark_after_install 刚剥完标注）。
+        返回标注后的「最新」项文本，供选中/显示说明使用。
+        """
+        cur = _exe_file_version(self.app.get("exe", ""))
+        cur_be = _lite_backend_version(self.app)
+        marks = {}
+        if cur:
+            marks.setdefault(cur, []).append("当前前端")
+        if cur_be:
+            marks.setdefault(cur_be, []).append("当前后端")
+        latest_item = latest_tag
+        for ver, kinds in marks.items():
+            item = self._lite_mark_one(ver, "（%s）" % "·".join(kinds))
+            if ver == latest_tag:
+                latest_item = item
+        if latest_tag and latest_tag not in marks and self.ver_combo.findText(latest_tag) >= 0:
+            latest_item = self._lite_mark_one(latest_tag, "（最新）")
+        return latest_item
+
+    def _lite_remark_after_install(self):
+        """装完（前端/后端）立即重标下拉，别等下次检查更新。
+
+        步骤：剥掉所有旧标注（map 的 key 一并还原成裸版本号）→ 按当前版本重标 →
+        恢复到原来选中的那一项。
+        """
+        if not hasattr(self, "ver_combo") or self.ver_combo.count() == 0:
+            return
+        strip = lambda t: re.sub(r"（[^（）]*）\s*$", "", t or "").strip()
+        sel_raw = strip(self.ver_combo.currentText())
+        try:
+            self.ver_combo.currentTextChanged.disconnect()
+        except Exception:
+            pass
+        items = [self.ver_combo.itemText(i) for i in range(self.ver_combo.count())]
+        self.ver_combo.clear()
+        for it in items:
+            raw = strip(it)
+            if raw != it:
+                self._lite_version_map[raw] = self._lite_version_map.pop(it, "")
+            self.ver_combo.addItem(raw)
+        latest = (getattr(self, "_lite_remote", ("", ""))[0]
+                  if getattr(self, "_lite_remote", None) else "")
+        self._lite_mark_combo(latest)
+        self.ver_combo.currentTextChanged.connect(self._on_lite_version_changed)
+        # 恢复原来选中的项（按裸版本号找，选中它重标后的文本）
+        for i in range(self.ver_combo.count()):
+            if strip(self.ver_combo.itemText(i)) == sel_raw:
+                self.ver_combo.setCurrentIndex(i)
+                return
         self._lite_refresh_update_btn()
 
     def _lite_pick_frontend(self, sel):
@@ -3189,7 +3717,8 @@ class AppCard(CardWidget):
             return
         cur_fe = _exe_file_version(self.app.get("exe", ""))
         cur_be = _lite_backend_version(self.app)
-        sel = self.ver_combo.currentText().replace("（当前）", "").strip()
+        # 剥掉下拉里的一切标注后缀（（当前前端）/（当前后端）/（最新）/（当前）…）
+        sel = re.sub(r"（[^（）]*）\s*$", "", self.ver_combo.currentText()).strip()
         if not sel:
             return
 
@@ -3301,8 +3830,13 @@ class AppCard(CardWidget):
         ans = QMessageBox.question(
             self.window(), "更新「%s」：%s"
             % (self.app.get("display", ""), " · ".join(targets)),
-            "按官方手动更新流程：先安装前端（exe），再安装后端（whl）。\n\n"
-            "%s\n\n更新说明请见卡片内的「更新说明」。\n\n是否开始？" % "\n".join(steps),
+            "确认后将全自动一条龙完成（只需这一次确认）：\n"
+            "① 下载并静默安装前端到当前安装目录「%s」（跟随本机实际安装位置，"
+            "可能弹出一次系统授权）\n"
+            "② 自动下载并安装后端（whl）\n"
+            "全程只写入该安装目录，不会安装到系统盘。\n\n"
+            "%s\n\n更新说明请见卡片内的「更新说明」。\n\n是否开始？"
+            % (os.path.dirname(self.app.get("exe", "")), "\n".join(steps)),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes,
         )
@@ -3310,6 +3844,8 @@ class AppCard(CardWidget):
             return
         if fe_act:
             # 前端包的路径按实际来源版本 fe_tag 命名（如选 2.4.9 实际装 2.4.7 的 exe）
+            if be_act and whl_url:
+                self._lite_start_whl_prefetch(sel, whl_url)  # 前端装期间并行预下载后端
             self._lite_download(fe_tag or sel, exe_url, "exe")
         else:
             self._lite_download(sel, whl_url, "whl")
@@ -3386,27 +3922,41 @@ class AppCard(CardWidget):
             capture_output=True, text=True, encoding="gbk", errors="replace",
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
-        self.install_progress.setRange(0, 0)   # 不确定进度
-        self.install_progress.setVisible(True)
-        self.install_status.setText("正在安装后端（pip install whl）…")
-        self.install_status.setVisible(True)
+        # pip 阶段同样给心跳（不设超时上界：装到一半被杀会留下残缺后端）
+        self._lite_start_spin("正在安装后端（pip install whl）…（秒数停住不动=卡住了）")
 
         self._lite_pip_worker = LitePipWorker(py, whl_path, parent=self)
         self._lite_pip_worker.finished_ok.connect(self._on_lite_pip_done)
         self._lite_pip_worker.failed.connect(self._on_lite_pip_failed)
+        self._lite_pip_worker.progress_text.connect(self._on_lite_pip_progress)
+        self._lite_pip_worker.progress.connect(self._on_lite_pip_percent)
         self._lite_pip_worker.start()
 
+    def _on_lite_pip_progress(self, text):
+        """pip 的实时输出尾巴 → 下一秒的 spin 心跳里带出来（替代被隐藏的黑窗）。"""
+        self._lite_spin_detail = text
+
+    def _on_lite_pip_percent(self, pct):
+        """pip 的真实进度 → 把走马灯切成会涨的确定进度条（和终端里一样）。"""
+        self._lite_spin_pct = max(0, min(100, int(pct)))   # 状态行也跟着显示百分比
+        bar = self.install_progress
+        if bar.minimum() == 0 and bar.maximum() == 0:
+            bar.setRange(0, 100)          # 走马灯 → 0-100 确定进度
+        bar.setValue(self._lite_spin_pct)
+
     def _on_lite_pip_done(self, out):
+        self._lite_stop_spin()
         self._hide_install_progress_ui()
         _sel = getattr(self, "_lite_selected", ("", "", "", "")) or ("", "", "", "")
         tag = _sel[0]
         fe_tag = _sel[3] if len(_sel) > 3 else tag
         self.install_status.setText("后端更新完成")
         self.install_status.setVisible(True)
-        self._lite_has_update = False
-        self._lite_set_btn("已是最新", enabled=False,
-                           style="QPushButton { background-color:rgba(255,255,255,0.10); "
-                                 "color:#9aa0a6; border-radius:8px; font-weight:600; }")
+        # 后端刚装完：立即重算 ver_hint / 徽章 / 按钮，别让卡片停留在更新前的旧值
+        # （此前只弹完成框不刷新，「后端 X」一直显示装之前的版本，像没刷新一样）
+        self._lite_refresh_version_info()
+        self._lite_refresh_update_btn()
+        self._lite_remark_after_install()   # 下拉的「（当前后端）」标注挪到刚装的版本
         # 所选版本没发前端 exe 时，前端实际装的是更低的 fe_tag，提示里写清楚
         fe_note = "" if (fe_tag and fe_tag == tag) else "（前端实际为 %s）" % fe_tag
         QMessageBox.information(
@@ -3415,6 +3965,7 @@ class AppCard(CardWidget):
         )
 
     def _on_lite_pip_failed(self, err):
+        self._lite_stop_spin()
         self._hide_install_progress_ui()
         self.update_btn.setEnabled(True)
         self.install_status.setText("后端安装失败：%s" % err)
@@ -3435,50 +3986,209 @@ class AppCard(CardWidget):
         w = getattr(self, "_lite_dl_worker", None)
         if w and w.isRunning():
             w.cancel()
+        pw = getattr(self, "_lite_whl_prefetch_worker", None)
+        if pw and pw.isRunning():
+            pw.cancel()
+        fe = getattr(self, "_lite_fe_worker", None)
+        if fe and fe.isRunning():
+            fe.cancel()
         self._hide_install_progress_ui()
         self.update_btn.setEnabled(True)
 
+    # ---- 一条龙进度反馈：走马灯 + 每秒递减的倒计时（心跳） ----
+    # 倒计时是"有没有卡住"的最直观信号：数字每秒都在动=活着，
+    # 数字停住不动=UI 线程被阻塞/子进程卡死（用户原话：只要倒计时不动了我就知道是卡了）。
+    def _lite_start_spin(self, base_text, timeout=None):
+        """timeout=None（默认、绝大多数场景）：时长不可预测，只显示递增的「已等 Ns」心跳。
+
+        不编造"剩余时间"——安装包/pip 每次耗时都可能差好几倍，拿单次测量当通用预算
+        既没有意义，到点强杀还会把 --force-reinstall 的安装打断成半成品。
+        只有确实存在已知上界的操作才传 timeout，那时才显示倒计时。
+        """
+        self._lite_stop_spin()
+        self._lite_spin_base = base_text
+        self._lite_spin_detail = ""   # 子进程实时输出的一行（如 Successfully uninstalled …）
+        self._lite_spin_pct = -1      # 真实百分比（-1=还没拿到，此时秒数仍当心跳）
+        self._lite_spin_start = time.time()
+        self._lite_spin_deadline = (self._lite_spin_start + timeout) if timeout else None
+        self.install_progress.setRange(0, 0)   # 不确定进度走马灯
+        self.install_progress.setVisible(True)
+        self.install_status.setVisible(True)
+        self._lite_spin_timer = QTimer(self)
+        self._lite_spin_timer.timeout.connect(self._lite_spin_tick)
+        self._lite_spin_timer.start(1000)
+        self._lite_spin_tick()   # 立刻显示一次，不用等第一秒
+
+    def _lite_spin_tick(self):
+        now = time.time()
+        el = int(now - getattr(self, "_lite_spin_start", now))
+        detail = getattr(self, "_lite_spin_detail", "")
+        dl = getattr(self, "_lite_spin_deadline", None)
+        pct = getattr(self, "_lite_spin_pct", -1)
+        # 拿到真进度就显示百分比（不再当秒表）；拿不到的阶段（如 pip 收集依赖）
+        # 仍用递增秒数当心跳，好让人看得出没卡死
+        num = ("%d%%" % pct) if pct >= 0 else "已等 %ds" % el
+        parts = ([detail] if detail else []) + [num]
+        if dl is not None:
+            remain = int(dl - now)
+            parts.append("倒计时 %02d:%02d" % (remain // 60, remain % 60)
+                         if remain > 0 else "已超时（仍在等待）")
+        self.install_status.setText("%s【%s】"
+                                    % (getattr(self, "_lite_spin_base", ""),
+                                       " · ".join(parts)))
+
+    def _lite_stop_spin(self):
+        t = getattr(self, "_lite_spin_timer", None)
+        if t is not None:
+            try:
+                t.stop()
+            except Exception:
+                pass
+        self._lite_spin_timer = None
+
     def _lite_run_installer(self, setup_path):
-        ans = QMessageBox.question(
-            self.window(), "运行安装程序",
-            "更新包已就绪：\n%s\n\n"
-            "将先关闭正在运行的奇想盒，再启动官方安装程序，是否继续？" % setup_path,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.Yes,
-        )
-        if ans != QMessageBox.StandardButton.Yes:
-            self.status_label.setText("安装包已就绪，可稍后手动运行")
+        """一条龙第 2 步：静默装前端到当前安装目录（锁定，绝不装系统盘）。
+
+        不再弹"运行安装程序""继续更新后端"两次确认——这些已在 _on_lite_update 的
+        唯一确认弹窗里一并告知。本方法纯自动：关进程 → 静默安装 → 校验 → 装后端。
+        """
+        exe = self.app.get("exe", "")
+        target_dir = os.path.dirname(exe)
+        _sel = getattr(self, "_lite_selected", ("", "", "", "")) or ("", "", "", "")
+        fe_tag = _sel[3] if len(_sel) > 3 else ""
+
+        self.install_cancel_btn.setText("✕ 取消安装")
+        self.install_cancel_btn.setVisible(True)
+        try:
+            self.install_cancel_btn.clicked.disconnect()
+        except Exception:
+            pass
+        self.install_cancel_btn.clicked.connect(self._lite_cancel_install)
+        self.update_btn.setEnabled(False)
+
+        # 静默安装可能数十秒~数分钟：走马灯 + 每秒递减的倒计时做心跳
+        self._lite_start_spin(
+            "正在静默安装前端到 %s …（请勿关闭，可能弹出一次系统授权；"
+            "秒数停住不动=卡住了）" % target_dir)
+
+        self._lite_fe_worker = LiteInstallFrontendWorker(
+            setup_path, target_dir, exe, fe_tag, _exe_file_version(exe), parent=self)
+        self._lite_fe_worker.finished_ok.connect(self._lite_on_frontend_done)
+        self._lite_fe_worker.failed.connect(self._lite_on_frontend_failed)
+        self._lite_fe_worker.start()
+
+    def _lite_on_frontend_done(self, code):
+        self._lite_stop_spin()
+        _sel = getattr(self, "_lite_selected", ("", "", "", "")) or ("", "", "", "")
+        fe_tag = _sel[3] if len(_sel) > 3 else (_sel[0] if _sel else "")
+        if code.startswith("wrong_location:"):
+            loc = code[len("wrong_location:"):]
+            self._hide_install_progress_ui()
+            self.update_btn.setEnabled(True)
+            self.install_status.setText("前端装错位置：%s" % loc)
+            self.install_status.setVisible(True)
+            QMessageBox.warning(
+                self.window(), "前端安装位置异常",
+                "前端安装器未使用指定目录，装到了：\n%s\n\n"
+                "本启动器已强制用 /D=%s 指定安装位置，仍出现此情况说明该版本安装器"
+                "不支持 /D 参数。\n请手动卸载/删除该位置的奇想盒后重试，或改用官方更新。"
+                % (loc, os.path.dirname(self.app.get("exe", ""))))
             return
-        exe_name = os.path.basename(self.app.get("exe", "")) or ""
-        subprocess.run(
-            ["taskkill", "/IM", exe_name, "/F", "/T"],
-            capture_output=True, text=True, encoding="gbk", errors="replace",
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        if run_exe(self.window(), setup_path, cwd=os.path.dirname(setup_path),
-                   need_admin=False, show_errors=True):
-            self.status_label.setText("前端安装程序已启动，请按向导完成安装")
-            QTimer.singleShot(8000, lambda: self.status_label.setText(""))
-            # 前端装完再装后端（顺序原因见 _on_lite_update 的说明）
-            _s4 = getattr(self, "_lite_selected", ("", "", "", ""))
-            sel, _e, whl, _ft = (_s4 + ("", "", "", ""))[:4]
-            tag = sel
-            if whl and getattr(self, "_lite_need_whl", True):
-                ans = QMessageBox.question(
-                    self.window(), "继续更新后端",
-                    "前端安装向导已启动。\n\n请等前端装完（向导走完、奇想盒能正常打开）后，"
-                    "再点「是」开始更新后端。\n\n"
-                    "注意：必须等前端装完再更新后端——反过来会被前端安装覆盖刚装好的后端。",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.Yes,
-                )
-                if ans == QMessageBox.StandardButton.Yes:
-                    self._lite_download(tag, whl, "whl")
-                else:
-                    self.status_label.setText("前端已更新，后端可稍后更新")
-            elif whl:
-                # 该次更新无需重装后端（_lite_need_whl=False）：前端装完即收工
-                self.status_label.setText("前端已更新完成")
+        if code == "unchanged":
+            self._hide_install_progress_ui()
+            self.update_btn.setEnabled(True)
+            cur = _exe_file_version(self.app.get("exe", ""))
+            self.install_status.setText("前端未更新成功（仍为 %s）" % cur)
+            self.install_status.setVisible(True)
+            QMessageBox.warning(
+                self.window(), "前端更新失败",
+                "安装完成后前端版本号仍为 %s，未变成目标版本。\n\n"
+                "可能原因：安装器未成功覆盖文件，或被系统/杀软拦截。\n"
+                "可手动运行安装包重试，或改用官方更新。" % cur)
+            return
+        # ok / tolerant：继续后端（若需要）
+        if code.startswith("tolerant:"):
+            newv = code[len("tolerant:"):]
+            self.install_status.setText("前端已安装（实际版本 %s，与目标略有出入，已继续）" % newv)
+            self.install_status.setVisible(True)
+        self._lite_remark_after_install()   # 前端装完：「（当前前端）」标注立即跟上
+        if getattr(self, "_lite_need_whl", False):
+            # 第 3 步：自动装后端（whl 并行预下载的此时多半已就绪）
+            self._continue_backend()
+        else:
+            self._hide_install_progress_ui()
+            self.update_btn.setEnabled(True)
+            self.install_status.setText("前端已更新完成（无需更新后端）")
+            self.install_status.setVisible(True)
+            QMessageBox.information(
+                self.window(), "更新完成",
+                "奇想盒前端已更新到 %s，重新打开即可生效。" % fe_tag)
+
+    def _lite_on_frontend_failed(self, err):
+        self._lite_stop_spin()
+        self._hide_install_progress_ui()
+        self.update_btn.setEnabled(True)
+        self.install_status.setText("前端安装失败：%s" % err)
+        self.install_status.setVisible(True)
+        QMessageBox.warning(self.window(), "前端安装失败", err)
+
+    def _lite_cancel_install(self):
+        fe = getattr(self, "_lite_fe_worker", None)
+        if fe and fe.isRunning():
+            fe.cancel()
+
+    def _lite_start_whl_prefetch(self, tag, whl_url):
+        """一条龙优化：前端安装期间并行预下载后端 whl。"""
+        cache = os.path.join(LAUNCHER_CACHE_DIR, "whimbox-update")
+        fname = "whimbox-%s-py3-none-any.whl" % tag.lstrip("v")
+        save = os.path.join(cache, fname)
+        self._lite_whl_ready = ""
+        self._lite_whl_prefetch_failed = ""
+        self._lite_whl_connected = False
+        if os.path.isfile(save) and os.path.getsize(save) > 0:
+            self._lite_whl_ready = save
+            return
+        w = LiteDownloadWorker(whl_url, save, parent=self)
+        w.finished_ok.connect(lambda p: setattr(self, "_lite_whl_ready", p))
+        w.failed.connect(lambda e: setattr(self, "_lite_whl_prefetch_failed", e))
+        self._lite_whl_prefetch_worker = w
+        w.start()
+
+    def _continue_backend(self):
+        """一条龙第 3 步：装后端 whl（已并行预下载则直接装，否则等/报错）。"""
+        whl = getattr(self, "_lite_whl_ready", "")
+        if whl and os.path.isfile(whl):
+            self._lite_install_backend(whl)
+            return
+        if getattr(self, "_lite_whl_prefetch_failed", ""):
+            self._hide_install_progress_ui()
+            self.update_btn.setEnabled(True)
+            self.install_status.setText("后端包下载失败：%s" % self._lite_whl_prefetch_failed)
+            self.install_status.setVisible(True)
+            QMessageBox.warning(
+                self.window(), "后端更新失败",
+                "后端（whl）包下载失败：%s\n\n可改用官方方式手动更新后端。"
+                % self._lite_whl_prefetch_failed)
+            return
+        # 预下载还在跑：提示等待，等其 finished_ok 自动再次进入本方法
+        self._lite_start_spin(
+            "前端已装好，正在等待后端包下载完毕后自动安装…（秒数停住不动=卡住了）")
+        w = getattr(self, "_lite_whl_prefetch_worker", None)
+        if w and w.isRunning() and not getattr(self, "_lite_whl_connected", False):
+            w.finished_ok.connect(self._continue_backend)
+            w.failed.connect(self._lite_on_prefetch_failed)
+            self._lite_whl_connected = True
+
+    def _lite_on_prefetch_failed(self, err):
+        self._lite_whl_prefetch_failed = err
+        self._lite_stop_spin()
+        self._hide_install_progress_ui()
+        self.update_btn.setEnabled(True)
+        self.install_status.setText("后端包下载失败：%s" % err)
+        self.install_status.setVisible(True)
+        QMessageBox.warning(
+            self.window(), "后端更新失败",
+            "后端（whl）包下载失败：%s\n\n可改用官方方式手动更新后端。" % err)
 
     def _on_lite_version_changed(self, text):
         """下拉切换版本 → 更新说明与更新按钮目标都跟着切换。"""
@@ -3491,7 +4201,7 @@ class AppCard(CardWidget):
         body = (getattr(self, "_lite_version_map", {}) or {}).get(tag, "").strip()
         if not body:
             body = ("这是本机当前安装的版本，官方 release 列表里没有它的更新说明。"
-                    if "（当前）" in (tag or "") else "（该版本未提供更新说明）")
+                    if "（当前" in (tag or "") else "（该版本未提供更新说明）")
         self.changelog_text.setPlainText("【%s】\n%s" % (tag, body))
 
     def _lite_script_dir(self):
@@ -4607,6 +5317,10 @@ class AppCard(CardWidget):
 
     def _hide_install_progress_ui(self):
         """隐藏安装进度三件套 + 恢复原按钮可用态（无论 done/failed/cancel 都走它）。"""
+        try:
+            self._lite_stop_spin()
+        except Exception:
+            pass
         try:
             self.install_progress.setVisible(False)
             self.install_progress.setValue(0)
