@@ -152,8 +152,9 @@ with patch.object(launcher.QMessageBox, "information") as info, \
 # =====================================================================
 class FakeDL:
     instances = []
-    def __init__(self, url, save, parent=None):
+    def __init__(self, url, save, parent=None, key=""):
         self.save = save; self.finished_ok, self.failed = _Sig(), _Sig()
+        self.key = key
         FakeDL.instances.append(self); self._ran = False
     def start(self):
         self._ran = True

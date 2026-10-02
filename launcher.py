@@ -768,6 +768,85 @@ def _probe_url(url, timeout=4):
         return (False, 999.0, 0)
 
 
+# ===== Mirror酱（MirrorChyan）加速源 =====
+# 官方 API：GET https://mirrorchyan.com/api/resources/{rid}/latest
+#   ?os=win&arch=x64&channel=stable&cdk=<CDK>&user_agent=<来源标识>&current_version=<当前版本>
+# 成功返回 {code:0, data:{version_name, url, release_note}}，其中 url 是带时效的直链。
+#
+# 关键行为（对接时必须知道，否则会误判）：
+#   - 没填 CDK / CDK 无效 / 该 rid 不存在 / 无新版本 → code!=0 或 data.url 为空
+#     → 统一返回 None，让调用方回退万载云 / cnb / GitHub 直链，绝不因此报错
+#   - 官方文档明确：即使不填 CDK 也建议用它查版本（连通性比 GitHub 好），
+#     只是不返回加速直链。所以「查版本」和「拿直链」要分开用。
+MIRRORCHYAN_API = "https://mirrorchyan.com/api/resources/{rid}/latest"
+
+# 各项目在 Mirror酱 的资源 ID（rid），取自各项目官方 README 链接里带的 rid。
+# 用户可在 config.json 的 mirrorchyan_res_ids 里覆盖或补充（例如给启动器自己配一个）。
+# 注意：rid 不一定等于 launcher 的 key（如鸣潮 key=ok-ww 但 rid=okww）。
+MIRRORCHYAN_RIDS = {
+    "ok-nte": "ok-nte",
+    "ok-ww": "okww",
+    "ok-end-field": "ok-end-field",
+}
+
+
+def _load_cfg_safe():
+    """读 config.json，任何异常都返回 {}（供下载源这类「可有可无」的配置用）。"""
+    try:
+        with open(os.path.join(LAUNCHER_DIR, "config.json"), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def mirrorchyan_rid_for(key):
+    """取某项目在 Mirror酱 的 rid。
+
+    优先级：config.json 的 mirrorchyan_res_ids[key] > 内置 MIRRORCHYAN_RIDS > ""
+    返回 "" 表示未配置，调用方应跳过 Mirror酱 候选源。
+    """
+    try:
+        cfg = _load_cfg_safe()
+    except Exception:
+        cfg = {}
+    override = cfg.get("mirrorchyan_res_ids") or {}
+    if isinstance(override, dict):
+        rid = str(override.get(key) or "").strip()
+        if rid:
+            return rid
+    return MIRRORCHYAN_RIDS.get(key, "")
+
+
+def mirrorchyan_latest(rid, cdk, current_version="", user_agent="WorkBuddy-OKLauncher"):
+    """查 Mirror酱 拿加速直链。任何失败一律返回 None（调用方回退其它源）。
+
+    返回 (url, version_name, release_note)，或 None。
+    """
+    if not rid or not cdk:
+        return None
+    params = {
+        "os": "win", "arch": "x64", "channel": "stable",
+        "cdk": cdk, "user_agent": user_agent,
+    }
+    if current_version:
+        params["current_version"] = current_version
+    api = (MIRRORCHYAN_API.format(rid=urllib.parse.quote(rid, safe=""))
+           + "?" + urllib.parse.urlencode(params))
+    try:
+        req = urllib.request.Request(api, headers={"User-Agent": user_agent})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            info = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        return None
+    if not isinstance(info, dict) or info.get("code") != 0:
+        return None
+    data = info.get("data") or {}
+    url = data.get("url") or ""
+    if not url.startswith("http"):
+        return None
+    return url, str(data.get("version_name") or ""), str(data.get("release_note") or "")
+
+
 class InstallWorker(QThread):
     """后台从 GitHub release 下载 win32.zip 就地解压到目标安装目录（进度协议同 MirrorUpdater）。"""
 
@@ -984,23 +1063,12 @@ class InstallWorker(QThread):
         """
         if not self.cdk:
             return None
-        _, _, rid = self.REPOS[self.key]
-        api = (
-            f"https://mirrorchyan.com/api/resources/{rid}/latest"
-            f"?os=win&arch=x64&channel=stable"
-            f"&user_agent=WorkBuddy-OKLauncher&cdk={urllib.parse.quote(self.cdk)}"
-        )
-        req = urllib.request.Request(api, headers={"User-Agent": "WorkBuddy-OKLauncher"})
-        try:
-            with urllib.request.urlopen(req, timeout=30) as r:
-                info = json.loads(r.read())
-        except Exception:
+        # rid 允许 config.json 覆盖（内置值只对已知的 ok-script 系有效）
+        rid = mirrorchyan_rid_for(self.key) or (self.REPOS[self.key][2] if self.key in self.REPOS else "")
+        if not rid:
             return None
-        if not isinstance(info, dict) or info.get("code") != 0:
-            return None
-        data = info.get("data") or {}
-        url = data.get("url") or ""
-        return url if url.startswith("http") else None
+        got = mirrorchyan_latest(rid, self.cdk, user_agent="WorkBuddy-OKLauncher")
+        return got[0] if got else None
 
     # ===== 万载云多节点测速选源 =====
     def _probe(self, url, timeout=4):
@@ -2520,11 +2588,13 @@ class LiteDownloadWorker(QThread):
     finished_ok = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, url, save_path, parent=None):
+    def __init__(self, url, save_path, parent=None, key=""):
         super().__init__(parent)
         self._url = url
         self._save = save_path
         self._cancelled = False
+        # key 用于查 Mirror酱 的 rid；不传就跳过 Mirror酱 候选源（保持旧行为）
+        self._key = key
 
     def cancel(self):
         self._cancelled = True
@@ -2532,6 +2602,17 @@ class LiteDownloadWorker(QThread):
     def _candidates(self):
         """(label, url) 候选源列表，顺序无关（之后按实测延迟排序）。"""
         cands = [("GitHub 直链", self._url)]
+        # Mirror酱（有 CDK + 该 key 配了 rid 才进候选；拿不到直链就静默跳过）
+        rid = mirrorchyan_rid_for(getattr(self, "_key", "") or "")
+        cdk = ""
+        try:
+            cdk = (_load_cfg_safe().get("mirrorchyan_cdk") or "").strip()
+        except Exception:
+            cdk = ""
+        if rid and cdk:
+            got = mirrorchyan_latest(rid, cdk, user_agent="WorkBuddy-OKLauncher")
+            if got:
+                cands.append(("Mirror酱(CDK)", got[0]))
         if self._url.startswith("https://github.com/"):
             no_proto = self._url[len("https://"):]
             nodes = list(InstallWorker.WANZAIYUN_NODES)
@@ -4006,7 +4087,8 @@ class AppCard(CardWidget):
         self.install_cancel_btn.clicked.connect(self._lite_cancel_download)
         self.update_btn.setEnabled(False)
 
-        self._lite_dl_worker = LiteDownloadWorker(url, save, parent=self)
+        self._lite_dl_worker = LiteDownloadWorker(url, save, parent=self,
+                                                  key=self.app.get("key", ""))
         self._lite_dl_worker.progress.connect(self._on_lite_progress)
         self._lite_dl_worker.finished_ok.connect(self._on_lite_downloaded)
         self._lite_dl_worker.failed.connect(self._on_lite_dl_failed)
@@ -4278,7 +4360,8 @@ class AppCard(CardWidget):
         if os.path.isfile(save) and os.path.getsize(save) > 0:
             self._lite_whl_ready = save
             return
-        w = LiteDownloadWorker(whl_url, save, parent=self)
+        w = LiteDownloadWorker(whl_url, save, parent=self,
+                               key=self.app.get("key", ""))
         w.finished_ok.connect(lambda p: setattr(self, "_lite_whl_ready", p))
         w.failed.connect(lambda e: setattr(self, "_lite_whl_prefetch_failed", e))
         self._lite_whl_prefetch_worker = w
@@ -6308,7 +6391,9 @@ class SettingsPage(QWidget):
         self.self_dl_bar.setVisible(True)
         self.self_dl_bar.setRange(0, 0)  # 走马灯：LiteDownloadWorker 只给 done/total
 
-        worker = LiteDownloadWorker(url, save_path, parent=self)
+        # key 用固定值 "game-launcher-hub"：启动器自己在 Mirror酱 的 rid 由用户配置
+        worker = LiteDownloadWorker(url, save_path, parent=self,
+                                    key="game-launcher-hub")
         worker.progress.connect(self._on_self_dl_progress)
         worker.finished_ok.connect(lambda p: self._on_self_dl_done(p, tag))
         worker.failed.connect(self._on_self_dl_failed)

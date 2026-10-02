@@ -2,6 +2,10 @@
   "_comment": "示例配置。使用方式：复制本文件为 config.json，然后把 install_root 改成你本机的实际安装根目录（需全英文路径），各 app 的相对路径一般不用动。",
   "install_root": "D:/OKApps",
   "mirrorchyan_cdk": "",
+  "_comment_mirrorchyan_res_ids": "可选。各项目在 Mirror酱(mirrorchyan.com) 的资源 ID(rid)。填了且 CDK 有效，下载时会自动把 Mirror酱 加速直链加入候选源并参与测速；没填就只用万载云/GitHub。rid 需向 Mirror酱 官方获取，注意它未必等于 key（如鸣潮 key=ok-ww 但 rid=okww）。ok-script 系三个已有内置默认值，此处填写可覆盖。",
+  "mirrorchyan_res_ids": {
+    "game-launcher-hub": ""
+  },
   "wanzaiyun_proxy": "",
   "apps": [
     {
