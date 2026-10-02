@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 """SelfUpdateWorker 真实联网冒烟：直接打 GitHub API（不跑 UI）。
 
-当前仓库真实状态：v0.2.0 是 prerelease、APP_VERSION=0.2.0。
-预期：
-  - include_pre=False（默认）→ 挑到的最高正式版是 v0.1.0 < 0.2.0 → has_new=False
-  - include_pre=True → 挑到 v0.2.0 == 当前 → has_new=False，但 prerelease 标记为 True
+不写死具体 tag（仓库一直在发版，写死必然过时）。校验的是「语义」：
+  - 默认只认正式版，不选预发布
+  - include_pre=True 才纳入预发布，且会被标记 prerelease
+  - 选出的版本确实是候选里的最高，且确实存在于远端
+  - has_new 与 compare_version 的结论自洽
+  - exe 资产能被正确识别
 """
 import os
 import sys
@@ -47,19 +49,51 @@ print("含测试版      →", {k: p2[k] for k in ("latest", "has_new", "prerele
 print("   exe url =", (p2.get("url") or "")[:80])
 
 ok = True
-# v0.1.0 是唯一的正式版，0.1.0 < 0.2.0 → 无更新
-if p1["latest"] != "v0.1.0" or p1["has_new"] is not False:
-    print("FAIL 默认应挑 v0.1.0 且 has_new=False")
+CUR = launcher.APP_VERSION
+
+# 断言不写死具体 tag（仓库天天在发版，写死必然过时）。
+# 只校验「语义」：默认只认正式版、include_pre 才纳入预发布、
+# 挑出的版本必须真的是候选里的最高、且 has_new 与版本比较结果自洽。
+
+# 1) 默认（include_pre=False）挑出的不能是预发布
+if p1["latest"] and p1["prerelease"] is not False:
+    print("FAIL 默认模式下不应选中预发布")
     ok = False
-# 含测试版时应挑 v0.2.0（最高），== 当前版本 → 无更新
-if p2["latest"] != "v0.2.0" or p2["has_new"] is not False:
-    print("FAIL include_pre 应挑 v0.2.0 且 has_new=False")
+
+# 2) include_pre=True 时若选中预发布，必须被标记 prerelease
+if p2["latest"] and p2["latest"] != p1["latest"] and p2["prerelease"] is not True:
+    print("FAIL include_pre 选中的非正式版未标记 prerelease")
     ok = False
-if p2["prerelease"] is not True:
-    print("FAIL v0.2.0 应标记 prerelease")
-    ok = False
-# exe 资产应能被认出来
-if not p2.get("url", "").endswith(".exe"):
+
+# 3) include_pre 的候选集 ≥ 默认的候选集；且 include_pre 选出的版本不低于默认选出的
+if p1["latest"] and p2["latest"]:
+    if launcher.compare_version(p2["latest"], p1["latest"]) < 0:
+        print("FAIL include_pre 选出的版本低于默认模式")
+        ok = False
+
+# 4) has_new 必须与 compare_version 的结论一致（自洽性）
+for name, p in (("默认", p1), ("含测试版", p2)):
+    if p["latest"]:
+        expect = launcher.compare_version(p["latest"], CUR) > 0
+        if p["has_new"] is not expect:
+            print("FAIL %s 模式 has_new=%s 与 compare_version 结论(%s)不符"
+                  % (name, p["has_new"], expect))
+            ok = False
+
+# 5) 挑出的版本必须真的是 releases 里存在的最高候选（防止 _pick 挑错）
+pool = [r["tag_name"] for r in rels
+        if not r["draft"] and r["tag_name"].lstrip("v")[:1].isdigit()]
+if p2["latest"] and pool:
+    if p2["latest"] not in pool:
+        print("FAIL 选出的 %s 不在远端 releases 里" % p2["latest"])
+        ok = False
+    highest = max(pool, key=launcher.ver_key)
+    if launcher.compare_version(p2["latest"], highest) < 0:
+        print("FAIL 选出的 %s 不是最高候选 %s" % (p2["latest"], highest))
+        ok = False
+
+# 6) exe 资产应能被认出来
+if p2["latest"] and not p2.get("url", "").endswith(".exe"):
     print("FAIL 未取到 exe 资产 URL")
     ok = False
 
