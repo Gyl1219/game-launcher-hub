@@ -38,6 +38,9 @@ rebuild_lnk.py
 # 本机一键脚本（含中文路径，跨平台不可用）
 *.cmd
 *.bat
+# 例外：view_stats.bat 是给不熟悉命令行的用户双击看增长数据的，内容纯 ASCII，
+# 跨平台无害，需要随仓库分发
+!view_stats.bat
 
 # 本机实际配置（含个人安装路径与 MirrorChyan CDK），不进版本控制。
 # 新用户请复制 config.example.json 为 config.json 后自行修改。
