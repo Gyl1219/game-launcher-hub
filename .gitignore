@@ -47,3 +47,4 @@ config.json
 build/
 dist/
 *.spec
+build_log.txt
