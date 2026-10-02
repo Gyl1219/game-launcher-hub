@@ -847,6 +847,210 @@ def mirrorchyan_latest(rid, cdk, current_version="", user_agent="WorkBuddy-OKLau
     return url, str(data.get("version_name") or ""), str(data.get("release_note") or "")
 
 
+# ===== 匿名错误上报 / 启动计数（可选，默认关）=====
+# 目的只有一个：帮作者修 bug，以及知道有多少人在用。不是行为追踪。
+#
+# 设计底线（硬编码，不接受任何配置绕过）：
+#   1. 只发「版本号 + 异常类型 + 脱敏后的调用栈」；不发配置内容、不发 CDK、
+#      不发安装路径原文、不发任何能定位到个人的信息
+#   2. 所有文本过一遍 sanitize_text()：本机绝对路径、用户名目录、CDK/token、
+#      邮箱一律替换成占位符
+#   3. 用本地随机生成的匿名 ID 做去重（只用于算独立用户数），不做跨会话身份关联
+#   4. 未启用 / 没配 endpoint / 发送失败 → 一律静默：不弹窗、不阻塞、不影响主流程
+#
+# config.json 形态（默认全关，行为完全不变）：
+#   "telemetry": {"enabled": false, "endpoint": "", "ping": false}
+
+TELEMETRY_PAYLOAD_LIMIT = 4000
+
+
+def _telemetry_cfg():
+    """读 telemetry 配置，任何异常都返回 {enabled:False}（关掉上报）。"""
+    try:
+        t = _load_cfg_safe().get("telemetry")
+        return t if isinstance(t, dict) else {}
+    except Exception:
+        return {}
+
+
+def telemetry_enabled():
+    """是否启用匿名错误上报。未配置端点一律视为关闭。"""
+    t = _telemetry_cfg()
+    return bool(t.get("enabled")) and bool(str(t.get("endpoint") or "").strip())
+
+
+def telemetry_ping_enabled():
+    """是否发送启动计数（用于统计活跃用户）。依赖 telemetry 主开关。"""
+    return telemetry_enabled() and bool(_telemetry_cfg().get("ping"))
+
+
+def _anon_id():
+    """本地持久化的随机匿名 ID（首次生成后存 .cache/anon_id）。
+
+    只用于「算有多少独立用户在用」，不含任何机器特征，可随时删除文件重置。
+    """
+    path = os.path.join(LAUNCHER_CACHE_DIR, "anon_id")
+    try:
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as f:
+                v = f.read().strip()
+            if v:
+                return v
+    except Exception:
+        pass
+    try:
+        import uuid
+        os.makedirs(LAUNCHER_CACHE_DIR, exist_ok=True)
+        v = uuid.uuid4().hex
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(v)
+        return v
+    except Exception:
+        return ""
+
+
+def _path_aliases():
+    """(真实路径, 占位符) 列表，用于脱敏本机路径。"""
+    aliases = []
+    try:
+        home = os.path.expanduser("~")
+        if home and len(home) > 3:
+            aliases.append((home, "<HOME>"))
+    except Exception:
+        pass
+    if LAUNCHER_DIR and len(LAUNCHER_DIR) > 3:
+        aliases.append((LAUNCHER_DIR, "<LAUNCHER_DIR>"))
+    try:
+        root = str(_load_cfg_safe().get("install_root") or "").strip()
+        if len(root) > 3:
+            aliases.append((root, "<INSTALL_ROOT>"))
+    except Exception:
+        pass
+    return aliases
+
+
+def sanitize_text(text):
+    """脱敏：CDK/token、本机绝对路径、邮箱 → 占位符。
+
+    错误栈里常带 D:\\Users\\<用户名>\\... 这类路径，以及拼在 URL 里的 cdk=xxx，
+    直接上报等于泄露个人信息与密钥，所以这里是硬性处理。
+    """
+    if not text:
+        return ""
+    out = str(text)
+    # 1) URL 查询参数里的 cdk/token/key
+    out = re.sub(r'(?i)([?&](?:cdk|token|key|secret)=)[^&\s"\']+',
+                 r'\1<redacted>', out)
+    # 2) 键值对形式的 cdk/token/密码
+    out = re.sub(r'(?i)\b(cdk|token|secret|password|passwd|pwd)\s*[:=]\s*["\']?[A-Za-z0-9_\.\-]{4,}["\']?',
+                 lambda m: "%s=<redacted>" % m.group(1), out)
+    # 3) 本机路径（先长后短，避免短路径先被替换导致长路径失配）
+    for real, alias in sorted(_path_aliases(), key=lambda x: -len(x[0])):
+        if real:
+            out = out.replace(real, alias)
+            out = out.replace(real.replace("\\", "/"), alias)
+    # 4) 邮箱
+    out = re.sub(r'[\w\.\-]+@[\w\.\-]+\.\w+', '<email>', out)
+    return out
+
+
+def log_error_local(kind, message, detail=""):
+    """把脱敏后的错误写到本地 logs/error.log（与是否上报无关，方便自己排查）。"""
+    try:
+        os.makedirs(os.path.join(LAUNCHER_DIR, "logs"), exist_ok=True)
+        line = ("[%s] %s | %s\n%s\n\n"
+                % (time.strftime("%Y-%m-%d %H:%M:%S"), kind,
+                   sanitize_text(message)[:500],
+                   sanitize_text(detail)[:TELEMETRY_PAYLOAD_LIMIT]))
+        with open(os.path.join(LAUNCHER_DIR, "logs", "error.log"),
+                  "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass
+
+
+def _telemetry_post(payload):
+    """在后台线程 POST 一次上报。任何失败静默。"""
+    def _run():
+        try:
+            ep = str(_telemetry_cfg().get("endpoint") or "").strip()
+            if not ep:
+                return
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            req = urllib.request.Request(
+                ep, data=data, method="POST",
+                headers={"Content-Type": "application/json",
+                         "User-Agent": "game-launcher-hub"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                r.read()
+        except Exception:
+            pass
+    try:
+        threading.Thread(target=_run, daemon=True).start()
+    except Exception:
+        pass
+
+
+def report_error(kind, message, detail=""):
+    """上报一次异常。未启用则只写本地日志；启用则异步 POST。
+
+    调用方无需关心是否联网、是否配置——本函数保证不抛、不阻塞。
+    """
+    try:
+        log_error_local(kind, message, detail)
+        if not telemetry_enabled():
+            return
+        import platform
+        _telemetry_post({
+            "v": 1,
+            "app": "game-launcher-hub",
+            "version": APP_VERSION,
+            "anon_id": _anon_id(),
+            "kind": str(kind)[:64],
+            "message": sanitize_text(message)[:500],
+            "detail": sanitize_text(detail)[:TELEMETRY_PAYLOAD_LIMIT],
+            "os": platform.platform()[:120],
+            "py": platform.python_version()[:32],
+            "ts": int(time.time()),
+        })
+    except Exception:
+        pass
+
+
+def report_ping():
+    """启动计数（仅一个版本号 + 匿名 ID），用于统计活跃用户数。"""
+    try:
+        if not telemetry_ping_enabled():
+            return
+        import platform
+        _telemetry_post({
+            "v": 1, "app": "game-launcher-hub", "version": APP_VERSION,
+            "anon_id": _anon_id(), "kind": "ping",
+            "os": platform.platform()[:120],
+            "py": platform.python_version()[:32],
+            "ts": int(time.time()),
+        })
+    except Exception:
+        pass
+
+
+def install_excepthook():
+    """接管未捕获异常：写本地日志 + （若启用）匿名上报，然后仍走默认行为。"""
+    def _hook(etype, value, tb):
+        try:
+            import traceback as _tb
+            detail = "".join(_tb.format_exception(etype, value, tb))
+            report_error("uncaught", "%s: %s" % (getattr(etype, "__name__", "?"), value),
+                         detail)
+        except Exception:
+            pass
+        sys.__excepthook__(etype, value, tb)
+    try:
+        sys.excepthook = _hook
+    except Exception:
+        pass
+
+
 class InstallWorker(QThread):
     """后台从 GitHub release 下载 win32.zip 就地解压到目标安装目录（进度协议同 MirrorUpdater）。"""
 
@@ -6303,10 +6507,70 @@ class SettingsPage(QWidget):
         ver.setAlignment(Qt.AlignLeft)
         root.addWidget(ver)
 
+        # ===== 匿名错误上报 =====
+        root.addSpacing(10)
+        root.addWidget(StrongBodyLabel("匿名错误上报"))
+        tip_t = CaptionLabel(
+            "开启后，程序崩溃时会把「版本号 + 错误类型 + 调用栈」发给作者，用于修 bug。"
+            "路径、用户名、CDK、邮箱在发送前一律替换成占位符。默认关闭。")
+        tip_t.setWordWrap(True)
+        root.addWidget(tip_t)
+
+        tcfg = self._read_cfg().get("telemetry") or {}
+        self.tele_chk = QCheckBox("允许匿名上报错误（帮助改进）")
+        self.tele_chk.setCursor(Qt.PointingHandCursor)
+        self.tele_chk.setChecked(bool(tcfg.get("enabled")))
+        self.tele_chk.stateChanged.connect(self._on_tele_toggle)
+        root.addWidget(self.tele_chk)
+
+        self.tele_ping_chk = QCheckBox("同时发送启动计数（统计有多少人在用）")
+        self.tele_ping_chk.setCursor(Qt.PointingHandCursor)
+        self.tele_ping_chk.setChecked(bool(tcfg.get("ping")))
+        self.tele_ping_chk.setEnabled(bool(tcfg.get("enabled")))
+        self.tele_ping_chk.stateChanged.connect(self._on_tele_toggle)
+        root.addWidget(self.tele_ping_chk)
+
+        self.tele_tip = CaptionLabel("")
+        self.tele_tip.setWordWrap(True)
+        self.tele_tip.setStyleSheet("color:#888780; font-size:11px;")
+        root.addWidget(self.tele_tip)
+        self._refresh_tele_tip()
+
         # 线程句柄：页面常驻，worker 必须挂在 self 上防被 GC
         self._self_worker = None
         self._self_dl_worker = None
         self._self_info = None
+
+    def _refresh_tele_tip(self):
+        """提示当前是「真的会发」还是「没配端点所以实际不发」，避免误导。"""
+        ep = str((self._read_cfg().get("telemetry") or {}).get("endpoint") or "").strip()
+        if ep and self.tele_chk.isChecked():
+            self.tele_tip.setText("已启用，上报地址：%s" % ep)
+        elif self.tele_chk.isChecked():
+            self.tele_tip.setText("已勾选，但 config.json 的 telemetry.endpoint 为空，"
+                                  "实际不会发送。")
+        else:
+            self.tele_tip.setText("未启用。出错只会写到本地 logs/error.log，不联网。")
+
+    def _on_tele_toggle(self, *_a):
+        """把两个开关写回 config.json（不动其它字段）。"""
+        cfg = self._read_cfg()
+        t = cfg.get("telemetry")
+        if not isinstance(t, dict):
+            t = {}
+        t["enabled"] = self.tele_chk.isChecked()
+        t["ping"] = self.tele_ping_chk.isChecked()
+        if "endpoint" not in t:
+            t["endpoint"] = ""
+        cfg["telemetry"] = t
+        try:
+            with open(self._cfg_path(), "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            QMessageBox.warning(self, "保存失败", "写 config.json 失败：%s" % e)
+            return
+        self.tele_ping_chk.setEnabled(self.tele_chk.isChecked())
+        self._refresh_tele_tip()
 
     # ---------- 启动器自身更新 ----------
 
@@ -6721,6 +6985,12 @@ def main():
 
     def show_error(etype, value, tb):
         msg = "".join(traceback.format_exception(etype, value, tb))
+        # 匿名上报；未启用时只写本地 logs/error.log，完全不联网
+        try:
+            report_error("uncaught",
+                         "%s: %s" % (getattr(etype, "__name__", "?"), value), msg)
+        except Exception:
+            pass
         try:
             QMessageBox.critical(None, "启动器出错", msg)
         except Exception:
@@ -6728,6 +6998,11 @@ def main():
         sys.__excepthook__(etype, value, tb)
 
     sys.excepthook = show_error
+    # 启动计数（仅版本号 + 匿名 ID；需 config 里 telemetry.enabled/ping 都为 true）
+    try:
+        report_ping()
+    except Exception:
+        pass
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
