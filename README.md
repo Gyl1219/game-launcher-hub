@@ -41,7 +41,7 @@ ok-script 生态目前是「一个框架 (ok-script) + 一堆独立游戏仓库�
 | **版本 / changelog 查看** | ❌ | ✅ 读本地 git 仓库，与原启动器同源 |
 | **一键更新助手** | ❌ | ✅ 窗口内更新并应用到 working |
 | 卸载（含清理残留） | ❌ | ✅ 三档：保留缓存 / 彻底清除 / 取消 |
-| 体积 | **GB 级**（Electron，主程序 196 MB） | 单个 `.py` + PySide6（源码 KB 级） |
+| 体积 | **GB 级**（Electron，主程序 196 MB） | 源码 312 KB；打包单文件 exe **约 111 MB** |
 | 技术栈 | Electron + Python 后端 | 纯 Python（PySide6 + qfluentwidgets） |
 | 协议 | AGPL-3.0 | GPL-3.0 |
 | 遥测 | 收集版本号 + 运行时错误 | 无 |
