@@ -61,7 +61,7 @@ from qfluentwidgets import (
 
 # 启动器自身版本（打包版 / 源码版共用）。发新版时只改这一处，
 # 显示在「设置」页页脚，便于报 bug 时说清自己在跑哪个版本。
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.2.1"
 
 # ===== 应用配置（从 config.json 加载，避免硬编码路径） =====
 # 打包后（PyInstaller）两个目录必须分开算，否则图标全找不到：
