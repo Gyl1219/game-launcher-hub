@@ -44,7 +44,7 @@ from PySide6.QtGui import QIcon, QPixmap, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QWidget, QDialog, QHBoxLayout, QVBoxLayout, QGridLayout,
     QMessageBox, QLabel, QScrollArea, QTextEdit, QProgressBar, QProgressDialog,
-    QStackedWidget,
+    QStackedWidget, QCheckBox,
 )
 from qfluentwidgets import (
     setTheme, Theme, CardWidget, IconWidget, StrongBodyLabel,
@@ -2323,6 +2323,136 @@ def _lite_backend_version(app):
     if v:
         return v
     return _site_pkg_version(os.path.join(emb, "Lib", "site-packages"), "whimbox")
+
+
+class SelfUpdateWorker(QThread):
+    """启动器自身更新检查：查本项目 GitHub releases → 与 APP_VERSION 比较。
+
+    与 LiteReleaseCheckWorker 的区别：
+      - 查的是启动器自己的仓库（不是被管理的游戏）
+      - 关心「有没有比 APP_VERSION 新的正式版」，预发布（prerelease）默认不提示，
+        除非用户显式要求（include_pre=True）
+      - 资产认 game-launcher-hub-*.exe（单文件 exe），下载复用 LiteDownloadWorker
+        （万载云多节点测速），所以国内直连 GitHub 被掐也能下
+
+    同样带本地缓存（TTL=RELEASE_CACHE_TTL）：api.github.com 未登录限 60 次/小时，
+    启动就查一次的话必须缓存，否则一天开几十次就 403 了。
+    """
+
+    done = Signal(object)   # dict: {current, latest, has_new, prerelease, body, url, size, from_cache}
+    failed = Signal(str)
+
+    def __init__(self, repo, include_pre=False, parent=None):
+        super().__init__(parent)
+        self._repo = repo
+        self._include_pre = include_pre
+
+    def run(self):
+        try:
+            owner, name = self._repo.split("/")
+            cache_file = os.path.join(LAUNCHER_CACHE_DIR,
+                                      f"selfrelease_{owner}_{name}.json")
+            os.makedirs(LAUNCHER_CACHE_DIR, exist_ok=True)
+
+            data = None
+            from_cache = False
+            # 1) 缓存命中且未过期 → 直接用，零 API 请求
+            if os.path.isfile(cache_file):
+                try:
+                    with open(cache_file, encoding="utf-8") as f:
+                        cached = json.load(f)
+                    if (time.time() - cached.get("_fetched_at", 0)) < RELEASE_CACHE_TTL:
+                        data, from_cache = cached.get("data"), True
+                except Exception:
+                    pass
+
+            # 2) 打 API（用 releases 而非 /latest：要自己过滤 draft/prerelease）
+            if data is None:
+                url = (f"https://api.github.com/repos/{owner}/{name}"
+                       f"/releases?per_page=20")
+                req = urllib.request.Request(url, headers={
+                    "User-Agent": "game-launcher-hub",
+                    "Accept": "application/vnd.github+json",
+                })
+                try:
+                    with urllib.request.urlopen(req, timeout=30) as resp:
+                        rels = json.loads(resp.read().decode())
+                except urllib.error.HTTPError as e:
+                    if e.code == 403:
+                        # 限流：有缓存就拿过期缓存兜底，没有才报错
+                        if os.path.isfile(cache_file):
+                            try:
+                                with open(cache_file, encoding="utf-8") as f:
+                                    data = json.load(f).get("data")
+                                if data:
+                                    from_cache = True
+                            except Exception:
+                                pass
+                        if not data:
+                            raise RuntimeError(
+                                "GitHub API 触发限流（HTTP 403: rate limit exceeded）。\n"
+                                "未登录调用 api.github.com 限 60 次/小时。\n"
+                                "请稍等约 1 小时再试。")
+                    else:
+                        raise
+
+                if data is None:
+                    data = self._pick(rels or [])
+                    try:
+                        with open(cache_file, "w", encoding="utf-8") as f:
+                            json.dump({"_fetched_at": time.time(), "data": data},
+                                      f, ensure_ascii=False)
+                    except Exception:
+                        pass
+
+            data = dict(data or {})
+            data["current"] = APP_VERSION
+            data["from_cache"] = from_cache
+            self.done.emit(data)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+    def _pick(self, rels):
+        """从 releases 列表里挑「应该提示的那个版本」。
+
+        规则：draft 一律忽略；预发布只在 include_pre 时才参与；其余按版本号取最大。
+        """
+        cur = APP_VERSION
+        best = None
+        for r in rels:
+            if r.get("draft"):
+                continue
+            tag = (r.get("tag_name") or "").strip()
+            if not tag:
+                continue
+            pre = bool(r.get("prerelease")) or is_prerelease(tag)
+            if pre and not self._include_pre:
+                continue
+            if not re.match(r"^v?\d", tag):
+                continue
+            if best is None or compare_version(tag, best["latest"]) > 0:
+                best = self._to_dict(r, tag, pre)
+        if best is None:
+            return {"latest": "", "has_new": False, "prerelease": False,
+                    "body": "", "url": "", "size": 0}
+        best["has_new"] = compare_version(best["latest"], cur) > 0
+        return best
+
+    @staticmethod
+    def _to_dict(r, tag, pre):
+        """取出下载所需的 exe 资产信息（认 .exe，跳过 .blockmap 等附属文件）。"""
+        url, size = "", 0
+        for a in r.get("assets") or []:
+            name = (a.get("name") or "").lower()
+            if name.endswith(".exe"):
+                url = a.get("browser_download_url") or ""
+                try:
+                    size = int(a.get("size") or 0)
+                except Exception:
+                    size = 0
+                break
+        return {"latest": tag, "prerelease": pre,
+                "body": r.get("body") or "", "url": url, "size": size}
 
 
 class LiteReleaseCheckWorker(QThread):
@@ -6048,11 +6178,181 @@ class SettingsPage(QWidget):
         self.save_btn.clicked.connect(self._on_save)
         root.addWidget(self.save_btn)
         root.addStretch(1)
+
+        # ===== 启动器自身更新 =====
+        root.addSpacing(10)
+        root.addWidget(StrongBodyLabel("检查更新"))
+        self.self_ver_label = CaptionLabel("当前版本 v%s" % APP_VERSION)
+        self.self_ver_label.setWordWrap(True)
+        root.addWidget(self.self_ver_label)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        self.self_check_btn = PushButton("检查更新")
+        self.self_check_btn.setFixedSize(110, 34)
+        self.self_check_btn.setCursor(Qt.PointingHandCursor)
+        self.self_check_btn.clicked.connect(self._on_self_check)
+        btn_row.addWidget(self.self_check_btn)
+        # 预发布（测试版）默认不提示，勾上才把 beta/预发布算进来
+        self.self_pre_chk = QCheckBox("包含测试版")
+        self.self_pre_chk.setCursor(Qt.PointingHandCursor)
+        self.self_pre_chk.setToolTip(
+            "默认只提示正式版。勾上后，预发布（测试版）也会被视为可更新版本。")
+        btn_row.addWidget(self.self_pre_chk)
+        btn_row.addStretch(1)
+        root.addLayout(btn_row)
+
+        self.self_dl_btn = PushButton("下载新版")
+        self.self_dl_btn.setFixedSize(110, 34)
+        self.self_dl_btn.setCursor(Qt.PointingHandCursor)
+        self.self_dl_btn.setEnabled(False)
+        self.self_dl_btn.clicked.connect(self._on_self_download)
+        root.addWidget(self.self_dl_btn, 0, Qt.AlignLeft)
+
+        self.self_dl_bar = IndeterminateProgressBar()
+        self.self_dl_bar.setFixedHeight(4)
+        self.self_dl_bar.setVisible(False)
+        root.addWidget(self.self_dl_bar)
+
         # 版本号固定钉在页脚：报 bug 时能说清自己在跑哪个版本（不占标题栏）
         ver = CaptionLabel("版本 v%s" % APP_VERSION)
         ver.setStyleSheet("color:#888780; font-size:11px;")
         ver.setAlignment(Qt.AlignLeft)
         root.addWidget(ver)
+
+        # 线程句柄：页面常驻，worker 必须挂在 self 上防被 GC
+        self._self_worker = None
+        self._self_dl_worker = None
+        self._self_info = None
+
+    # ---------- 启动器自身更新 ----------
+
+    SELF_REPO = "Gyl1219/game-launcher-hub"
+
+    def _on_self_check(self, force=False):
+        """点「检查更新」或启动后自动查一次。worker 已在跑就忽略，防重复点。"""
+        if getattr(self, "_self_worker", None) is not None and \
+                self._self_worker.isRunning():
+            return
+        self.self_check_btn.setEnabled(False)
+        self.self_check_btn.setText("检查中…")
+        self.self_ver_label.setText("正在查询 GitHub Releases…")
+
+        worker = SelfUpdateWorker(self.SELF_REPO,
+                                  include_pre=self.self_pre_chk.isChecked(),
+                                  parent=self)
+        worker.done.connect(self._on_self_check_done)
+        worker.failed.connect(self._on_self_check_failed)
+        self._self_worker = worker
+        worker.start()
+
+    def _on_self_check_done(self, info):
+        self._self_worker = None
+        self.self_check_btn.setEnabled(True)
+        self.self_check_btn.setText("检查更新")
+        self._self_info = info
+
+        cur = info.get("current") or APP_VERSION
+        latest = info.get("latest") or ""
+        if not latest:
+            self.self_ver_label.setText("当前版本 v%s（未找到可用 Release）" % cur)
+            self.self_dl_btn.setEnabled(False)
+            return
+
+        suffix = "（测试版）" if info.get("prerelease") else ""
+        if not info.get("has_new"):
+            text = "当前版本 v%s 已是最新%s" % (cur, suffix)
+            if info.get("from_cache"):
+                text += "（30 分钟内缓存结果）"
+            self.self_ver_label.setText(text)
+            self.self_dl_btn.setEnabled(False)
+            return
+
+        # 有新版：把更新说明原文给用户看，别只丢一个版本号
+        body = (info.get("body") or "").strip()
+        if len(body) > 600:
+            body = body[:600] + "\n…（完整说明见 Release 页面）"
+        text = ("发现新版本 %s%s（当前 v%s）" % (latest, suffix, cur))
+        if info.get("from_cache"):
+            text += "（30 分钟内缓存结果）"
+        if body:
+            text += "\n\n" + body
+        self.self_ver_label.setText(text)
+        # 没拿到 exe 资产就别给下载按钮（点下去必然失败）
+        self.self_dl_btn.setEnabled(bool(info.get("url")))
+
+    def _on_self_check_failed(self, msg):
+        self._self_worker = None
+        self.self_check_btn.setEnabled(True)
+        self.self_check_btn.setText("检查更新")
+        self.self_ver_label.setText("检查失败：%s" % msg)
+        self.self_dl_btn.setEnabled(False)
+
+    def _on_self_download(self):
+        """下载新版 exe 到 .cache/selfupdate/（不自动替换，替换要用户自己决定）。"""
+        info = getattr(self, "_self_info", None) or {}
+        url = info.get("url") or ""
+        tag = (info.get("latest") or "new").lstrip("v")
+        if not url:
+            return
+        if getattr(self, "_self_dl_worker", None) is not None and \
+                self._self_dl_worker.isRunning():
+            return
+
+        save_dir = os.path.join(LAUNCHER_CACHE_DIR, "selfupdate")
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, "game-launcher-hub-v%s-win64.exe" % tag)
+
+        self.self_dl_btn.setEnabled(False)
+        self.self_dl_btn.setText("下载中…")
+        self.self_dl_bar.setVisible(True)
+        self.self_dl_bar.setRange(0, 0)  # 走马灯：LiteDownloadWorker 只给 done/total
+
+        worker = LiteDownloadWorker(url, save_path, parent=self)
+        worker.progress.connect(self._on_self_dl_progress)
+        worker.finished_ok.connect(lambda p: self._on_self_dl_done(p, tag))
+        worker.failed.connect(self._on_self_dl_failed)
+        self._self_dl_worker = worker
+        worker.start()
+
+    def _on_self_dl_progress(self, done, total):
+        if total > 0:
+            self.self_dl_bar.setRange(0, 100)
+            self.self_dl_bar.setValue(int(done * 100 / total))
+
+    def _on_self_dl_done(self, path, tag):
+        self._self_dl_worker = None
+        self.self_dl_bar.setVisible(False)
+        self.self_dl_btn.setEnabled(True)
+        self.self_dl_btn.setText("下载新版")
+        mb = 1.0
+        try:
+            mb = os.path.getsize(path) / (1024 * 1024)
+        except Exception:
+            pass
+        box = QMessageBox(self)
+        box.setWindowTitle("下载完成")
+        box.setIcon(QMessageBox.Information)
+        box.setText("已下载 v%s（%.1f MB）：\n%s" % (tag, mb, path))
+        box.setInformativeText(
+            "当前启动器仍在运行，替换前请先关闭它。\n"
+            "关闭后用上面这个新 exe 覆盖/替换即可完成升级。")
+        open_btn = box.addButton("打开所在文件夹", QMessageBox.ActionRole)
+        box.addButton("好", QMessageBox.AcceptRole)
+        box.exec()
+        if box.clickedButton() is open_btn:
+            try:
+                os.startfile(os.path.dirname(path))
+            except Exception:
+                QDesktopServices.openUrl(
+                    QUrl.fromLocalFile(os.path.dirname(path)))
+
+    def _on_self_dl_failed(self, msg):
+        self._self_dl_worker = None
+        self.self_dl_bar.setVisible(False)
+        self.self_dl_btn.setEnabled(True)
+        self.self_dl_btn.setText("下载新版")
+        QMessageBox.warning(self, "下载失败", msg)
 
     def _cfg_path(self):
         return os.path.join(LAUNCHER_DIR, "config.json")
@@ -6176,6 +6476,21 @@ class Launcher(QWidget):
         self._scan_worker = None
         self._scan_prompted = False
         QTimer.singleShot(1200, self.run_game_scan)
+
+        # 启动器自身更新检查：延后到 2.5s，避开启动高峰（扫描/建页都在前 1.2s 内）。
+        # 只在设置页静默查（更新说明写在设置页，不弹窗打扰）；真有新版时把设置页
+        # 的下载按钮点亮即可，用户自己决定要不要升。
+        QTimer.singleShot(2500, self._self_update_silent_check)
+
+    def _self_update_silent_check(self):
+        """启动后静默查一次自身更新。失败静默（没网/限流都不该在启动时打扰用户）。"""
+        page = getattr(self, "settings_page", None)
+        if page is None:
+            return
+        try:
+            page._on_self_check()
+        except Exception:
+            pass
 
     def _add_page(self, key, page):
         """登记页面并加入 QStackedWidget（页面一经创建便常驻，切页不销毁）。"""
