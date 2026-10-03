@@ -3909,7 +3909,7 @@ class AppCard(CardWidget):
                 btn.setFixedHeight(36)
                 btn.setCursor(Qt.PointingHandCursor)
                 btn.clicked.connect(
-                    lambda url=site: QDesktopServices.openUrl(QUrl(url)))
+                    lambda *a, url=site: QDesktopServices.openUrl(QUrl(url)))
                 self.body_box.addWidget(btn)
 
     def _rebuild_generic_body(self):
@@ -4013,7 +4013,7 @@ class AppCard(CardWidget):
                 site_btn.setFixedHeight(36)
                 site_btn.setCursor(Qt.PointingHandCursor)
                 site_btn.clicked.connect(
-                    lambda url=site: QDesktopServices.openUrl(QUrl(url)))
+                    lambda *a, url=site: QDesktopServices.openUrl(QUrl(url)))
                 self.body_box.addWidget(site_btn)
         else:
             self.status_label.setText(
@@ -4024,7 +4024,7 @@ class AppCard(CardWidget):
                 btn.setFixedHeight(36)
                 btn.setCursor(Qt.PointingHandCursor)
                 btn.clicked.connect(
-                    lambda url=site: QDesktopServices.openUrl(QUrl(url)))
+                    lambda *a, url=site: QDesktopServices.openUrl(QUrl(url)))
                 self.body_box.addWidget(btn)
 
     # ===== lite 更新：exe 版本资源 + GitHub Releases latest =====
