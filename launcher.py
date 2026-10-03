@@ -2277,6 +2277,36 @@ def load_app_json(path):
         return {}
 
 
+def _git_tag_version(app):
+    """通用程序（generic）版本：从安装目录的本地 git 仓库读最新 tag。
+
+    适用场景：既不是 ok-script 系（无 app.json），也不是奇想盒那种 exe+whl
+    形态的独立程序。典型如绝区零一条龙——它自带 git 仓库并自行增量更新，
+    exe 又是 PyInstaller 打包（**没有 Windows 版本资源**，_exe_file_version
+    读出来是空），所以唯一可靠的版本来源就是本地 git tag。
+
+    返回干净版本号（如 'v2.5.1'）；读不到返回 ""（调用方回退占位文案）。
+    全程只读本地仓库、不联网、不启动任何 exe。
+    """
+    exe = app.get("exe", "") or ""
+    repo_dir = os.path.dirname(exe) or ""
+    if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
+        return ""
+    git = GitVersionFetcher._find_git()
+    if not git:
+        return ""
+    try:
+        import subprocess as _sp
+        r = _sp.run([git, "describe", "--tags", "--abbrev=0"], cwd=repo_dir,
+                    capture_output=True, text=True, encoding="utf-8",
+                    errors="replace",
+                    creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0))
+        v = (r.stdout or "").strip()
+        return v if v else ""
+    except Exception:
+        return ""
+
+
 def _pyapp_title_key(app):
     """返回用于匹配 PyAppify 窗口标题的内部名（运行态判定 / 强制关闭共用）。
 
@@ -3659,6 +3689,8 @@ class AppCard(CardWidget):
         # 不参与版本与更新体系，只保留「启动 / 强制关闭 / 运行状态 / 卸载」四件套。
         if self.app.get("lite"):
             return self._rebuild_lite_body()
+        if self.app.get("generic"):
+            return self._rebuild_generic_body()
 
         self.data = load_app_json(self.app["app_json"])
         self.profile = get_current_profile(self.data)
@@ -3871,6 +3903,121 @@ class AppCard(CardWidget):
         else:
             self.status_label.setText(
                 "未检测到本地安装。lite 助手不支持一键安装，请从官方渠道获取。")
+            site = self.app.get("website", "")
+            if site:
+                btn = PushButton("打开官网")
+                btn.setFixedHeight(36)
+                btn.setCursor(Qt.PointingHandCursor)
+                btn.clicked.connect(
+                    lambda url=site: QDesktopServices.openUrl(QUrl(url)))
+                self.body_box.addWidget(btn)
+
+    def _rebuild_generic_body(self):
+        """generic 模式重建：独立 exe 程序（非 ok-script、非奇想盒形态）。
+
+        与 lite 的区别：
+          - 版本来自本地 git tag（_git_tag_version），不是 exe 版本资源/后端包
+          - **不做 GitHub 更新检查**：这类程序自带更新机制（如一条龙自行 git
+            增量更新），我们再去拉 release 并静默安装，容易和它自己的更新打架
+          - 不做「更新到任意版本 / 跑图路线」这类只有奇想盒才有的按钮
+        保留四件套：运行状态 / 启动 / 强制关闭 / 卸载。
+        """
+        cfg_exe = self.app.get("exe", "") or ""
+        self._lite = False
+        self._generic = True
+        self._installed = bool(cfg_exe) and os.path.isfile(cfg_exe)
+        self._host_ready = False
+        self._host_actual = ""
+        self._install_dir = os.path.dirname(cfg_exe) or ""
+        self.data = {}
+        self.profile = {}
+
+        self.cover.setPixmap(make_icon(self.app["icon"]).pixmap(96, 96))
+        self.profile_tag.clear()
+        self.profile_tag.setVisible(False)
+
+        if self._installed:
+            ver = _git_tag_version(self.app)
+            self.ver_tag.setText(ver or "已安装")
+            self.ver_tag.setStyleSheet(
+                "background-color:#455a64; color:#ffffff; border-radius:6px; "
+                "padding:2px 8px; font-size:11px;"
+            )
+            self.status_label.setText("")
+            self.badge.setText("已安装")
+            self.badge.setStyleSheet(
+                "background-color:#2e7d32; color:#ffffff; border-radius:9px; "
+                "padding:3px 12px; font-size:12px; font-weight:600;"
+            )
+        else:
+            self.ver_tag.setText("未安装")
+            self.ver_tag.setStyleSheet(
+                "background-color:#616161; color:#ffffff; border-radius:6px; "
+                "padding:2px 8px; font-size:11px;"
+            )
+            self.status_label.setText("未检测到本地安装")
+            self.badge.setText("未安装")
+            self.badge.setStyleSheet(
+                "background-color:rgba(255,255,255,0.15); color:#cfcfcf; "
+                "border-radius:9px; padding:3px 12px; font-size:12px; font-weight:600;"
+            )
+
+        self.clear_body()
+        self.build_generic_body()
+
+        self._hide_install_progress_ui()
+        self.update_progress_ui()
+        # 立即刷一次运行态（否则按钮要等下一轮 5s 轮询才有槽，点了没反应）
+        self.refresh_badge()
+
+    def build_generic_body(self):
+        """generic 模式动态区：已安装 = 启动/强关 + 卸载；未安装 = 提示 + 官网。
+
+        刻意不放更新相关控件：这类程序自带更新机制，本启动器只负责
+        「装没装、能不能起来、是不是在跑」。
+        """
+        if self._installed:
+            self.start_btn = PushButton("▶  启动应用")
+            ver = _git_tag_version(self.app)
+            note = ("版本来自本地 git 仓库最新 tag" if ver
+                    else "未能读取版本（安装目录不是 git 仓库）")
+            self.ver_hint = CaptionLabel("本地版本 %s　·　%s" % (ver or "未知", note))
+            self.ver_hint.setWordWrap(True)
+            self.body_box.addWidget(self.ver_hint)
+
+            self.start_btn.setFixedHeight(42)
+            self.start_btn.setStyleSheet(
+                "QPushButton { background-color:#2e7d32; color:white; border-radius:8px; "
+                "font-weight:600; } QPushButton:hover { background-color:#1b5e20; }"
+            )
+            self.body_box.addWidget(self.start_btn)
+
+            self.uninstall_btn = PushButton("卸载此程序")
+            self.uninstall_btn.setFixedHeight(38)
+            self.uninstall_btn.setStyleSheet(
+                "QPushButton { background-color:rgba(255,82,82,0.10); "
+                "color:#ff6b6b; border:1px solid #ff5252; border-radius:8px; "
+                "font-weight:600; } "
+                "QPushButton:hover { background-color:rgba(255,82,82,0.22); "
+                "color:#ff8585; } "
+                "QPushButton:pressed { background-color:rgba(255,82,82,0.35); }"
+            )
+            self.uninstall_btn.setCursor(Qt.PointingHandCursor)
+            self.uninstall_btn.clicked.connect(self.uninstall_app)
+            self.body_box.addWidget(self.uninstall_btn)
+
+            # 官方站点（一条龙这类自带更新，指回它自己的更新入口最省事）
+            site = self.app.get("website", "")
+            if site:
+                site_btn = PushButton("打开官方站点（更新请走它自己的启动器）")
+                site_btn.setFixedHeight(36)
+                site_btn.setCursor(Qt.PointingHandCursor)
+                site_btn.clicked.connect(
+                    lambda url=site: QDesktopServices.openUrl(QUrl(url)))
+                self.body_box.addWidget(site_btn)
+        else:
+            self.status_label.setText(
+                "未检测到本地安装。此类程序不支持一键安装，请从官方渠道获取。")
             site = self.app.get("website", "")
             if site:
                 btn = PushButton("打开官网")
@@ -4909,7 +5056,7 @@ class AppCard(CardWidget):
 
     def refresh_data(self):
         # lite 模式：无 app_json 可读，只维护「安装态 + 运行态」
-        if self.app.get("lite"):
+        if self.app.get("lite") or self.app.get("generic"):
             exe = self.app.get("exe", "") or ""
             now_installed = bool(exe) and os.path.isfile(exe)
             if now_installed != self._installed:
@@ -5141,7 +5288,7 @@ class AppCard(CardWidget):
         )
         if ans != QMessageBox.StandardButton.Yes:
             return
-        if self.app.get("lite"):
+        if self.app.get("lite") or self.app.get("generic"):
             # Electron 等普通 exe：按镜像名整棵进程树终止。
             # _kill_app_by_title 只匹配 pythonw.exe（PyAppify 形态），对 whimbox_app.exe 无效。
             exe_name = os.path.basename(self.app.get("exe", "")) or ""
@@ -5508,7 +5655,7 @@ class AppCard(CardWidget):
     def launch_app(self):
         app = self.app
         # lite 模式：没有 working/pythonw，直接启动 exe 本体
-        if app.get("lite"):
+        if app.get("lite") or app.get("generic"):
             exe = app.get("exe", "") or ""
             if not exe or not os.path.isfile(exe):
                 QMessageBox.critical(

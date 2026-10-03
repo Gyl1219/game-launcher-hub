@@ -54,6 +54,18 @@
       "pythonw": "",
       "icon": "whimbox.png",
       "website": "https://github.com/nikkigallery/Whimbox"
+    },
+    {
+      "_comment": "generic = 独立 exe 程序：既不是 ok-script 系（无 app.json），也不是奇想盒那种 exe+whl 形态。不做 GitHub 更新检查（它自带 git 增量更新），只管装没装/启停/卸载。版本从安装目录的本地 git tag 读取。",
+      "key": "onedragon-zzz",
+      "display": "绝区零 一条龙",
+      "generic": true,
+      "exe": "D:/DZZZ-OD/OneDragon-RuntimeLauncher.exe",
+      "app_json": "",
+      "working": "",
+      "pythonw": "",
+      "icon": "onedragon-zzz.png",
+      "website": "https://one-dragon.com/zzz/zh/home.html"
     }
   ]
 }
