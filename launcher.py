@@ -1051,6 +1051,136 @@ def install_excepthook():
         pass
 
 
+class GenericUpdateCheckWorker(QThread):
+    """generic 应用（本地 git 仓库）更新检查。
+
+    流程：git fetch（只下载对象，不碰工作区）→ 比较 HEAD 与远端落后几个提交 →
+    顺带取远端最新 tag 用于展示。全程不修改任何文件，失败也不影响用户。
+    """
+
+    done = Signal(object)   # {has_new, behind, local_tag, remote_tag, reason}
+    failed = Signal(str)
+
+    def __init__(self, app, parent=None):
+        super().__init__(parent)
+        self.app = app
+
+    def run(self):
+        repo = _git_repo_dir(self.app)
+        git = GitVersionFetcher._find_git()
+        if not repo or not git:
+            self.done.emit({"has_new": False, "behind": 0,
+                            "local_tag": _git_tag_version(self.app),
+                            "remote_tag": "", "reason": "nogit"})
+            return
+        try:
+            # 当前分支
+            rc, branch, _ = _git_run(git, ["rev-parse", "--abbrev-ref", "HEAD"],
+                                     repo, timeout=30)
+            if rc != 0 or not branch:
+                branch = "main"
+
+            # fetch：只拉对象，工作区零改动。
+            # 必须带 --tags：实测不带的话新 tag 不会同步过来，
+            # git describe 会永远停在旧版本号（表现为「更新了但版本没变」）。
+            rc, _, err = _git_run(git, ["fetch", "--tags", "origin", branch],
+                                  repo, timeout=180)
+            if rc != 0:
+                self.failed.emit(err or "git fetch 失败")
+                return
+
+            # 落后多少个提交（远端有而本地没有的）
+            rc, behind_s, _ = _git_run(
+                git, ["rev-list", "--count", "HEAD..FETCH_HEAD"], repo, timeout=60)
+            behind = int(behind_s) if rc == 0 and behind_s.isdigit() else 0
+
+            # 本地 / 远端最新 tag
+            local_tag = _git_tag_version(self.app)
+            rc, rt, _ = _git_run(git, ["describe", "--tags", "--abbrev=0", "FETCH_HEAD"],
+                                 repo, timeout=30)
+            remote_tag = rt if rc == 0 else ""
+
+            self.done.emit({
+                "has_new": behind > 0,
+                "behind": behind,
+                "local_tag": local_tag,
+                "remote_tag": remote_tag or local_tag,
+                "reason": "" if behind > 0 else "uptodate",
+            })
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class GenericUpdateWorker(QThread):
+    """generic 应用更新：git pull --ff-only。
+
+    为什么只用 --ff-only：绝不产生 merge/rebase，本地一旦有分叉就直接失败并报错，
+    而不是悄悄改写用户的提交历史。这正是“能直接更新”与“安全”的平衡点。
+    """
+
+    progress = Signal(str)
+    done = Signal(str)      # 更新后的最新 tag
+    failed = Signal(str)
+
+    def __init__(self, app, parent=None):
+        super().__init__(parent)
+        self.app = app
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        repo = _git_repo_dir(self.app)
+        git = GitVersionFetcher._find_git()
+        if not repo or not git:
+            self.failed.emit("安装目录不是 git 仓库，或找不到 git")
+            return
+        try:
+            # 前置检查：受控文件有改动就拒绝，避免覆盖用户修改
+            self.progress.emit("检查本地改动…")
+            if _git_has_tracked_changes(repo):
+                self.failed.emit(
+                    "本地有未提交的改动，已中止更新。\n"
+                    "请先处理这些改动（提交或还原），再点更新。\n"
+                    "这样设计是为了不覆盖你修改过的文件。")
+                return
+
+            rc, branch, _ = _git_run(git, ["rev-parse", "--abbrev-ref", "HEAD"],
+                                     repo, timeout=30)
+            if rc != 0 or not branch:
+                branch = "main"
+
+            if self._cancelled:
+                self.failed.emit("已取消")
+                return
+
+            self.progress.emit("正在拉取最新代码…")
+            # 同样带 --tags，否则更新后版本号不刷新（与检查阶段同理）
+            rc, out, err = _git_run(
+                git, ["pull", "--ff-only", "--tags", "origin", branch],
+                repo, timeout=300)
+            if rc != 0:
+                # 常见原因：本地分叉（--ff-only 拒绝）
+                if "not possible to fast-forward" in (err + out).lower() \
+                        or "diverging" in (err + out).lower():
+                    self.failed.emit(
+                        "本地与远端已分叉（无法快进），已中止更新。\n"
+                        "请打开该程序的官方启动器完成更新，或手动处理本地提交。")
+                else:
+                    self.failed.emit(err or out or "git pull 失败")
+                return
+
+            if self._cancelled:
+                self.failed.emit("已取消")
+                return
+
+            new_tag = _git_tag_version(self.app)
+            self.done.emit(new_tag)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
 class InstallWorker(QThread):
     """后台从 GitHub release 下载 win32.zip 就地解压到目标安装目录（进度协议同 MirrorUpdater）。"""
 
@@ -2275,6 +2405,51 @@ def load_app_json(path):
             return json.load(f)
     except Exception:
         return {}
+
+
+def _git_run(git, args, repo_dir, timeout=120):
+    """跑一条 git 命令，返回 (returncode, stdout, stderr)。
+
+    统一：CREATE_NO_WINDOW（不弹黑窗）、UTF-8 解码 + errors=replace
+    （路径可能含中文，GBK/UTF-8 混排也不能崩）。
+    """
+    import subprocess as _sp
+    r = _sp.run([git] + list(args), cwd=repo_dir,
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=timeout,
+                creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0))
+    return r.returncode, (r.stdout or "").strip(), (r.stderr or "").strip()
+
+
+def _git_repo_dir(app):
+    """generic 应用的 git 仓库目录（就是 exe 所在目录）。目录不是 git 仓库返回 ""。"""
+    exe = app.get("exe", "") or ""
+    d = os.path.dirname(exe) or ""
+    if d and os.path.isdir(os.path.join(d, ".git")):
+        return d
+    return ""
+
+
+def _git_has_tracked_changes(repo_dir):
+    """是否有**受控文件**被改动/暂存。
+
+    注意只看非 '??' 行：未跟踪文件（如用户自己的 .bak、临时脚本）不影响 pull，
+    但受控文件被改过就不能自动更新，否则 git 会拒绝甚至覆盖用户改动。
+    """
+    git = GitVersionFetcher._find_git()
+    if not git or not repo_dir:
+        return True  # 判不出来按“有改动”处理，宁可不更新
+    try:
+        rc, out, _ = _git_run(git, ["status", "--porcelain"], repo_dir, timeout=30)
+        if rc != 0:
+            return True
+        for line in out.splitlines():
+            # porcelain 前两字符是状态；'??' = 未跟踪，'!!' = 已忽略
+            if line[:2].strip() and not line.startswith("??") and not line.startswith("!!"):
+                return True
+        return False
+    except Exception:
+        return True
 
 
 def _git_tag_version(app):
@@ -3969,6 +4144,9 @@ class AppCard(CardWidget):
         self.update_progress_ui()
         # 立即刷一次运行态（否则按钮要等下一轮 5s 轮询才有槽，点了没反应）
         self.refresh_badge()
+        # 更新检查（内部有一次性守卫，5s 轮询不会重复 fetch）
+        if self._installed:
+            self._generic_start_check()
 
     def build_generic_body(self):
         """generic 模式动态区：已安装 = 启动/强关 + 卸载；未安装 = 提示 + 官网。
@@ -3979,11 +4157,23 @@ class AppCard(CardWidget):
         if self._installed:
             self.start_btn = PushButton("▶  启动应用")
             ver = _git_tag_version(self.app)
-            note = ("版本来自本地 git 仓库最新 tag" if ver
-                    else "未能读取版本（安装目录不是 git 仓库）")
-            self.ver_hint = CaptionLabel("本地版本 %s　·　%s" % (ver or "未知", note))
+            self.ver_hint = CaptionLabel("本地版本 %s" % (ver or "未知"))
             self.ver_hint.setWordWrap(True)
             self.body_box.addWidget(self.ver_hint)
+
+            # 更新区（仅当安装目录是 git 仓库才给——否则没法就地更新）
+            if _git_repo_dir(self.app):
+                self.gen_update_btn = PushButton("检查更新中…")
+                self.gen_update_btn.setFixedHeight(38)
+                self.gen_update_btn.setEnabled(False)
+                self.gen_update_btn.setCursor(Qt.PointingHandCursor)
+                self.gen_update_btn.clicked.connect(self._on_generic_update)
+                self.body_box.addWidget(self.gen_update_btn)
+
+                self.gen_update_bar = IndeterminateProgressBar()
+                self.gen_update_bar.setFixedHeight(4)
+                self.gen_update_bar.setVisible(False)
+                self.body_box.addWidget(self.gen_update_bar)
 
             self.start_btn.setFixedHeight(42)
             self.start_btn.setStyleSheet(
@@ -4026,6 +4216,128 @@ class AppCard(CardWidget):
                 btn.clicked.connect(
                     lambda *a, url=site: QDesktopServices.openUrl(QUrl(url)))
                 self.body_box.addWidget(btn)
+
+    # ===== generic 更新：本地 git 仓库 fetch + pull --ff-only =====
+    def _generic_start_check(self):
+        """启动更新检查。每次 rebuild 只触发一次，避免 5s 轮询反复 fetch。"""
+        if getattr(self, "_gen_check_started", False):
+            return
+        self._gen_check_started = True
+        if not hasattr(self, "gen_update_btn"):
+            return
+        if not _git_repo_dir(self.app) or not GitVersionFetcher._find_git():
+            self.gen_update_btn.setText("目录非 git 仓库，无法更新")
+            self.gen_update_btn.setEnabled(False)
+            return
+        self._gen_check_worker = GenericUpdateCheckWorker(self.app, parent=self)
+        self._gen_check_worker.done.connect(self._on_generic_check_done)
+        self._gen_check_worker.failed.connect(self._on_generic_check_failed)
+        self._gen_check_worker.start()
+
+    def _on_generic_check_done(self, info):
+        self._gen_check_worker = None
+        if not hasattr(self, "gen_update_btn"):
+            return
+        behind = info.get("behind", 0)
+        rt = info.get("remote_tag") or ""
+        lt = info.get("local_tag") or ""
+        if behind > 0:
+            self.gen_update_btn.setText("有新版本，点此更新（落后 %d 个提交）" % behind)
+            self.gen_update_btn.setEnabled(True)
+            self.ver_hint.setText("本地版本 %s　·　最新 %s（落后 %d 个提交）"
+                                  % (lt or "未知", rt, behind))
+        else:
+            self.gen_update_btn.setText("已是最新")
+            self.gen_update_btn.setEnabled(False)
+            self.ver_hint.setText("本地版本 %s　·　已是最新" % (lt or "未知"))
+        self._gen_has_update = behind > 0
+
+    def _on_generic_check_failed(self, msg):
+        self._gen_check_worker = None
+        if not hasattr(self, "gen_update_btn"):
+            return
+        self.gen_update_btn.setText("检查更新失败（点击重试）")
+        self.gen_update_btn.setEnabled(True)
+        self._gen_retry = True
+
+    def _on_generic_update(self):
+        """点更新按钮：失败态 → 重试检查；有新版 → 关进程后拉取。"""
+        # 失败态的按钮点了是「重新检查」
+        if getattr(self, "_gen_retry", False):
+            self._gen_retry = False
+            self._gen_check_started = False
+            self.gen_update_btn.setText("检查更新中…")
+            self.gen_update_btn.setEnabled(False)
+            self._generic_start_check()
+            return
+
+        if not getattr(self, "_gen_has_update", False):
+            return
+
+        # 更新前必须关掉程序：它运行中是 git 仓库被占用 + 代码正在被使用
+        if self._is_process_running():
+            ans = QMessageBox.question(
+                self, "需要先关闭程序",
+                "该程序正在运行，更新会修改它的代码，必须先关闭。\n\n"
+                "是否关闭它并继续更新？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+            exe_name = os.path.basename(self.app.get("exe", "")) or ""
+            if exe_name:
+                subprocess.run(["taskkill", "/IM", exe_name, "/F", "/T"],
+                               capture_output=True, text=True, encoding="gbk",
+                               errors="replace",
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                time.sleep(2)
+
+        if getattr(self, "_gen_update_worker", None) is not None and \
+                self._gen_update_worker.isRunning():
+            return
+
+        self.gen_update_btn.setEnabled(False)
+        self.gen_update_btn.setText("更新中…")
+        if hasattr(self, "gen_update_bar"):
+            self.gen_update_bar.setVisible(True)
+
+        w = GenericUpdateWorker(self.app, parent=self)
+        w.progress.connect(self._on_generic_update_progress)
+        w.done.connect(self._on_generic_update_done)
+        w.failed.connect(self._on_generic_update_failed)
+        self._gen_update_worker = w
+        w.start()
+
+    def _on_generic_update_progress(self, text):
+        if hasattr(self, "gen_update_bar") and text:
+            self.gen_update_btn.setText(text)
+
+    def _on_generic_update_done(self, new_tag):
+        self._gen_update_worker = None
+        if hasattr(self, "gen_update_bar"):
+            self.gen_update_bar.setVisible(False)
+        # 重新读版本并刷新整张卡（检查状态也要重置，否则按钮停在“有新版本”）
+        self._gen_check_started = False
+        self._gen_has_update = False
+        self._gen_retry = False
+        self.rebuild_body()
+        try:
+            InfoBar.success("更新完成", "已更新到 %s" % (new_tag or "最新版本"),
+                            duration=3000, parent=self,
+                            position=InfoBarPosition.TOP_RIGHT)
+        except Exception:
+            QMessageBox.information(self, "更新完成",
+                                    "已更新到 %s" % (new_tag or "最新版本"))
+
+    def _on_generic_update_failed(self, msg):
+        self._gen_update_worker = None
+        if hasattr(self, "gen_update_bar"):
+            self.gen_update_bar.setVisible(False)
+        self.gen_update_btn.setEnabled(True)
+        self.gen_update_btn.setText("更新失败，点击重试")
+        self._gen_retry = True
+        QMessageBox.warning(self, "更新失败", msg)
 
     # ===== lite 更新：exe 版本资源 + GitHub Releases latest =====
     def _lite_start_check(self):
