@@ -200,21 +200,23 @@ th{background:#f5f5f5;text-align:right}th:first-child,td:first-child{text-align:
 
 
 def html_mode():
-    """生成 stats/growth.html 并尝试用默认浏览器打开。"""
+    """生成 stats/growth.html。
+
+    两个刻意的设计：
+    1. **不在这里开浏览器**。Python 的 webbrowser.open() 在部分 Windows 环境
+       会返回 True 但其实没弹出窗口（"假成功"），用户会以为报告没生成。
+       打开交给 view_stats.bat 里的 Windows 原生 `start`，那个最可靠。
+    2. **只打印 ASCII 信息**。本脚本常被 bat 调用，cmd.exe 用 GBK 显示，
+       中文会变成乱码（不影响功能但很难看），所以这里输出英文。
+    """
     _, rows = read_rows()
     if not rows:
-        print("还没有数据，先采集一次再来看")
+        print("No data yet. Run collection first.")
         return 1
     out = os.path.join(os.path.dirname(OUT), "growth.html")
     with open(out, "w", encoding="utf-8") as f:
         f.write(build_html(rows))
-    print("已生成 %s" % out)
-    try:
-        import webbrowser
-        webbrowser.open("file:///" + out.replace("\\", "/"))
-        print("已在浏览器打开")
-    except Exception:
-        pass
+    print("Report written: %s" % out)
     return 0
 
 

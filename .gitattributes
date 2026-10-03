@@ -1,0 +1,13 @@
+# 关键：Windows 批处理文件必须是 CRLF。
+# 用 LF 保存时 cmd.exe 会把行拆乱，表现为 "'tching' 不是内部或外部命令"
+# 这种被截断的报错——排查过一次，别再踩。
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 其余文本文件统一 LF，避免跨平台 diff 噪音
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.js text eol=lf
+*.html text eol=lf
