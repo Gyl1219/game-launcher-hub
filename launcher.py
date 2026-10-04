@@ -31,6 +31,7 @@ import json
 import fnmatch
 import struct
 import base64
+import stat as _stat
 import ctypes
 import subprocess
 import traceback
@@ -1013,6 +1014,88 @@ def _desktop_dir():
     except Exception:
         pass
     return ""
+
+
+def _norm_path_text(s):
+    """路径文本归一化：分隔符统一成 / 再小写。
+
+    用于 .lnk 二进制内容匹配——不走文件系统 API，必须自己把 \\ 和 / 归一，
+    否则 lnk 里存的 \\ 路径和调用方给的路径格式稍有差异就漏匹配。
+    """
+    return str(s).replace("\\", "/").lower().rstrip("/")
+
+
+def _scan_related_shortcuts(install_dir):
+    """扫描 桌面 + 开始菜单 里指向 install_dir 内程序的 .lnk。
+
+    卸载后这些快捷方式全是死链，应一并清理。匹配：读 lnk 原始字节，
+    按 utf-16-le / latin-1 两种编码解码、\\ 归一成 / 后找安装目录文本。
+    返回 [lnk 绝对路径]；异常返回 []。
+    """
+    t = _norm_path_text(install_dir or "")
+    if not t:
+        return []
+    roots = []
+    for env in ("APPDATA", "ProgramData"):
+        d = os.path.join(os.environ.get(env, ""),
+                         "Microsoft", "Windows", "Start Menu", "Programs")
+        if os.path.isdir(d):
+            roots.append(d)
+    try:
+        dd = _desktop_dir()
+        if dd and os.path.isdir(dd):
+            roots.append(dd)
+    except Exception:
+        pass
+    hits = []
+    for root in roots:
+        try:
+            walker = os.walk(root)
+            for dirpath, _dirs, files in walker:
+                for f in files:
+                    if not f.lower().endswith(".lnk"):
+                        continue
+                    p = os.path.join(dirpath, f)
+                    try:
+                        raw = open(p, "rb").read()
+                    except OSError:
+                        continue
+                    for enc in ("utf-16-le", "latin-1"):
+                        try:
+                            blob = raw.decode(enc, "ignore").replace("\\", "/").lower()
+                        except Exception:
+                            continue
+                        if t in blob:
+                            hits.append(p)
+                            break
+        except Exception:
+            continue
+    return hits
+
+
+def _hard_delete(path):
+    """直接删除（不进回收站）：目录 rmtree（顺手解只读属性），文件 os.remove。
+
+    返回 (是否成功, 失败原因)。失败的常见原因是文件被占用。
+    """
+    def _onerr(func, p, _exc):
+        try:
+            os.chmod(p, _stat.S_IWRITE)
+            func(p)
+        except Exception:
+            pass
+
+    try:
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path, onerror=_onerr)
+        else:
+            os.chmod(path, _stat.S_IWRITE)
+            os.remove(path)
+        if os.path.exists(path):
+            return (False, "删除失败（可能被其它程序占用）")
+        return (True, "")
+    except Exception as e:
+        return (False, str(e) or "删除失败")
 
 
 def _write_lnk_struct(lnk_path, target, workdir, args="", icon=""):
@@ -6816,15 +6899,30 @@ class AppCard(CardWidget):
             if os.path.isdir(dl_dir):
                 optional_items.append((dl_dir, "下载缓存（已下好的安装包）", _sum_size(dl_dir)))
 
-        # === 构造确认对话框：体积透明 + 三档按钮 ===
-        lines = [f"将把「{self.app['display']}」以下内容移入回收站：", ""]
+        # 5) 桌面/开始菜单里指向本安装目录的快捷方式 —— 卸载后全是死链，一并清
+        # （一条龙这类自己会建桌面快捷方式的程序，不扫的话卸完留一堆打不开的图标）
+        related_lnk = _scan_related_shortcuts(app_dir)
+        for p in related_lnk:
+            try:
+                sz = os.path.getsize(p)
+            except OSError:
+                sz = 0
+            recycle_items.append((p, "相关快捷方式（桌面/开始菜单）", sz))
+
+        total_size = sum(sz for _p, _l, sz in recycle_items)
+
+        # === 构造确认对话框：体积透明 + 两档清理方式 ===
+        # 之前所有档位都走回收站，对 GB 级卸载是伪需求：东西只是挪进
+        # $RECYCLE.BIN，D 盘一点空间没回来。现在给「直接删除」真释放空间；
+        # 默认按钮仍是取消，回收站档保留作为后悔药。
+        lines = [f"将清理「{self.app['display']}」以下内容（共 {_human_size(total_size)}）：", ""]
         for p, label, sz in recycle_items:
             lines.append(f"  · {label}（{_human_size(sz)}）")
             lines.append(f"      {p}")
         if optional_items:
             lines.append("")
-            lines.append("以下是下载缓存，默认保留（重装时自动复用）；")
-            lines.append("想连它一起清掉就点「彻底清除（含下载缓存）」：")
+            lines.append("以下是下载缓存：移入回收站档会保留（重装时自动复用）；")
+            lines.append("直接删除档会连它一起带走。")
             for p, label, sz in optional_items:
                 lines.append(f"  · {label}（{_human_size(sz)}）")
                 lines.append(f"      {p}")
@@ -6833,13 +6931,9 @@ class AppCard(CardWidget):
         box.setWindowTitle("确认卸载")
         box.setText("\n".join(lines))
         box.setIcon(QMessageBox.Warning)
-        if optional_items:
-            btn_soft = box.addButton("移入回收站（保留缓存）", QMessageBox.AcceptRole)
-            btn_hard = box.addButton("彻底清除（含下载缓存）", QMessageBox.DestructiveRole)
-        else:
-            # 没有下载缓存可清，就只给一档
-            btn_soft = box.addButton("移入回收站", QMessageBox.AcceptRole)
-            btn_hard = None
+        btn_soft = box.addButton("移入回收站（可还原）", QMessageBox.AcceptRole)
+        btn_hard = box.addButton("直接删除（立即释放空间，不可恢复）",
+                                 QMessageBox.DestructiveRole)
         btn_cancel = box.addButton("取消", QMessageBox.RejectRole)
         box.setDefaultButton(btn_cancel)
         box.exec()
@@ -6847,37 +6941,44 @@ class AppCard(CardWidget):
         clicked = box.clickedButton()
         if clicked is None or clicked is btn_cancel:
             return
+        hard = (clicked is btn_hard)
 
-        # 选了「彻底清除」→ 把下载缓存并进清理清单
-        thorough = (btn_hard is not None and clicked is btn_hard)
-        if thorough:
+        # 直接删除档：连下载缓存一起带走（都要真释放空间了，留缓存没意义）
+        if hard:
             recycle_items = recycle_items + optional_items
-            optional_items = []   # 已被清掉，汇总里不再显示"保留"
+            optional_items = []   # 已清掉，汇总里不再显示"保留"
 
         # === 执行清理（逐项独立判断，失败的列出来让用户处理）===
-        ok_list = []   # 移入回收站成功的
+        ok_list = []   # [(path, label)]
         fail_list = [] # 失败的 [(path, label, msg)]
         for p, label, _sz in recycle_items:
-            ok, msg = send_to_trash(p)
+            if hard:
+                ok, msg = _hard_delete(p)
+            else:
+                ok, msg = send_to_trash(p)
             if ok:
                 ok_list.append((p, label))
             else:
                 fail_list.append((p, label, msg))
 
         if not fail_list:
-            summary = f"已把「{self.app['display']}」以下内容移入回收站：\n\n"
+            if hard:
+                summary = (f"已直接删除「{self.app['display']}」以下内容"
+                           f"（共 {_human_size(total_size)}，空间已释放，未进回收站）：\n\n")
+            else:
+                summary = f"已把「{self.app['display']}」以下内容移入回收站：\n\n"
             for p, label in ok_list:
                 summary += f"  · {label}\n        {p}\n"
             if optional_items:
                 summary += "\n保留（未清除，重装时自动复用）：\n"
                 for p, label, _sz in optional_items:
                     summary += f"  · {label}\n        {p}\n"
-            summary += "\n回收站里可还原。"
+            summary += ("\n如需找回，可还原（回收站）。"
+                        if not hard else "\n此操作不可恢复。")
             QMessageBox.information(self.window(),
-                                    "彻底清除完成" if thorough else "卸载完成",
-                                    summary)
+                                    "卸载完成", summary)
         else:
-            summary = (f"部分完成：{len(ok_list)}/{len(recycle_items)} 项已移入回收站，"
+            summary = (f"部分完成：{len(ok_list)}/{len(recycle_items)} 项已清理，"
                        f"{len(fail_list)} 项失败。\n\n")
             if ok_list:
                 summary += "已清理：\n"
