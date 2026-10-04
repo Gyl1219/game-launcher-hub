@@ -6,7 +6,11 @@
 > 左侧总览 / 各游戏 / 设置导航，右侧堆叠内容区，一个窗口看遍所有助手的运行状态、版本、更新日志，
 > 一键启动 / 强制关闭 / 窗口内更新。
 >
-> 当前支持 ok-script 系（ok-nte / ok-ww / ok-end-field）+ 非该系的奇想盒（Whimbox，lite 接入），架构上不绑定单一框架，后续可接入其它生态。
+> 当前支持 ok-script 系（ok-nte / ok-ww / ok-end-field）+ 非该系的奇想盒（Whimbox，lite 接入）与终末地小助手（MaaEnd，zip 发布接入），架构上不绑定单一框架，后续可接入其它生态。
+
+## 下载
+
+到 [Releases](https://github.com/Gyl1219/game-launcher-hub/releases) 下载打包好的 `game-launcher-hub.exe`（单文件、免安装，自带 Python 运行时）；或克隆仓库后直接 `pythonw launcher.py` 跑源码（依赖 PySide6 / qfluentwidgets / dulwich）。
 
 ---
 
@@ -189,7 +193,8 @@ runas /user:Administrator "python launcher.py"
   - ok-script 框架：https://ok-script.com/
   - ok-wuthering-waves（鸣潮，社区最活跃）：https://github.com/ok-oldking/ok-wuthering-waves
   - ok-nte（异环）：https://github.com/BnanZ0/ok-nte
-  - ok-end-field（终末地）：https://github.com/AliceJump/ok-end-field
+  - ok-end-field（终末地，ok-script 系）：https://github.com/AliceJump/ok-end-field
+  - MaaEnd（终末地小助手，MaaFramework 系，zip 发布接入）：https://github.com/MaaEnd/MaaEnd
   - Whimbox（奇想盒，非 ok-script 系 lite 接入）：https://github.com/nikkigallery/Whimbox
   - 开发者交流：ok-script 官方 QQ 群 938132715
 
