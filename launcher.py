@@ -845,13 +845,10 @@ def _cfg_path():
     return os.path.join(LAUNCHER_DIR, "config.json")
 
 
-def _save_app_exe(key, exe_path):
-    """把某个 app 的 exe 路径写回 config.json。
+def _save_app_field(key, field, value):
+    """把某个 app 的字段写回 config.json（exe / installed_version / …）。
 
-    为什么必须写回：config 里的 exe 是**预置**路径，而官方安装包装到哪由用户决定
-    （一条龙可能装 D:\\DZZZ-OD，也可能装别的盘）。不落盘的话，这次能认出来，
-    下次启动卡片又变回「未安装」——等于白装一次。
-    成功返回 True，任何异常都返回 False（不抛，避免打断 UI）。
+    注意：exe 这类路径统一存正斜杠；版本号原样存。
     """
     try:
         with open(_cfg_path(), "r", encoding="utf-8") as f:
@@ -859,7 +856,7 @@ def _save_app_exe(key, exe_path):
         hit = False
         for a in cfg.get("apps", []):
             if a.get("key") == key:
-                a["exe"] = str(exe_path).replace("\\", "/")
+                a[field] = str(value).replace("\\", "/")
                 hit = True
                 break
         if not hit:
@@ -869,6 +866,16 @@ def _save_app_exe(key, exe_path):
         return True
     except Exception:
         return False
+
+
+def _save_app_exe(key, exe_path):
+    """写回 exe 路径。
+
+    为什么必须写回：config 里的 exe 是**预置**路径，而安装包装到哪由用户决定
+    （一条龙可能装 D:\\DZZZ-OD，也可能装别的盘）。不落盘的话，这次能认出来，
+    下次启动卡片又变回「未安装」——等于白装一次。
+    """
+    return _save_app_field(key, "exe", exe_path)
 
 
 def _pick_installer(rels, pattern):
@@ -937,6 +944,143 @@ def _resolve_installer_asset(repo_tuple):
     except Exception:
         return ("", "")
     return _pick_installer(rels, pattern)
+
+
+# ===== zip 分发型应用（如 MaaEnd 终末地小助手）=====
+# 这类程序发布的是 **zip 压缩包**（无安装器、解压后也不是 git 仓库），
+# 所以一条龙那套 git fetch/pull 的更新路线在它身上用不了，
+# 必须走「release 拉资产 → 下载 zip → 解压到安装目录」这条路。
+
+def _resolve_release_asset(repo, glob, cnb_first=True):
+    """取最新**正式版** release 里匹配 glob 的资产 → (url, name, tag)。
+
+    repo 形如 "MaaEnd/MaaEnd"。CNB 镜像优先（国内快），无镜像回退 GitHub。
+    找不到返回 ("", "", "")。
+    """
+    owner, name = (repo.split("/", 1) + [""])[:2]
+    if not (owner and name):
+        return ("", "", "")
+    if cnb_first:
+        try:
+            cnb = _cnb_releases(owner, name)
+        except Exception:
+            cnb = []
+        for rel in cnb:
+            if rel.get("prerelease") or rel.get("draft"):
+                continue
+            for a in (rel.get("assets") or []):
+                if fnmatch.fnmatch(a.get("name", ""), glob):
+                    u = (a.get("browser_download_url")
+                         or a.get("brower_download_url") or "")
+                    if u:
+                        return (u, a.get("name", ""), rel.get("tag_name", ""))
+    try:
+        req = urllib.request.Request(
+            "https://api.github.com/repos/%s/%s/releases?per_page=10"
+            % (owner, name),
+            headers={"User-Agent": "OKLauncher/%s" % APP_VERSION,
+                     "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            rels = json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return ("", "", "")
+    for rel in rels:
+        if rel.get("prerelease") or rel.get("draft"):
+            continue
+        for a in (rel.get("assets") or []):
+            if fnmatch.fnmatch(a.get("name", ""), glob):
+                u = a.get("browser_download_url") or ""
+                if u:
+                    return (u, a.get("name", ""), rel.get("tag_name", ""))
+    return ("", "", "")
+
+
+def _zipapp_version(app):
+    """zip 分发型应用的**已安装版本**。
+
+    优先级：config 里我们写回的 installed_version > exe 的版本资源 > ""。
+    刚解压完还没跑过检查时，installed_version 就是安装时写入的那个 tag。
+    """
+    v = str(app.get("installed_version") or "").strip()
+    if v:
+        return v
+    exe = app.get("exe", "") or ""
+    if exe and os.path.isfile(exe):
+        try:
+            v = _exe_file_version(exe) or ""
+        except Exception:
+            v = ""
+    return v or ""
+
+
+def _pick_main_exe(dirpath, key=""):
+    """在安装目录里挑主程序 exe。
+
+    发布包里的 exe 名字我们不该猜（MaaEnd 到底是 MaaEnd.exe 还是 MaaPiCli.exe
+    取决于上游打包），所以装完后**实际扫一遍**：优先名字带 key/应用名的，
+    否则根目录只有一个 exe 就用它，再否则按名字排序取第一个。
+    """
+    try:
+        exes = [f for f in sorted(os.listdir(dirpath))
+                if f.lower().endswith(".exe") and
+                os.path.isfile(os.path.join(dirpath, f))]
+    except OSError:
+        return ""
+    if not exes:
+        return ""
+    k = (key or "").lower().replace("-", "")
+    for f in exes:
+        if k and k in f.lower().replace("-", "").replace(" ", ""):
+            return os.path.join(dirpath, f)
+    if len(exes) == 1:
+        return os.path.join(dirpath, exes[0])
+    return os.path.join(dirpath, exes[0])
+
+
+def _extract_zip_flat(zip_path, dest, preserve_dirs=None):
+    """把 zip 解压到 dest，若包内只有一层顶层目录则**摊平**（不嵌套一层）。
+
+    安全：过滤掉 ../ 这类穿越路径的成员。
+    preserve_dirs：这些目录名解压时**保留原有内容**（用户的配置/缓存），
+    默认只保 "config"——发布包覆盖写会把用户设置冲掉，这是 zip 更新最大的坑。
+    """
+    preserve = set(preserve_dirs or ["config"])
+    try:
+        os.makedirs(dest, exist_ok=True)
+    except OSError:
+        return False
+
+    tmp = dest + "_unpack_tmp"
+    try:
+        shutil.rmtree(tmp, ignore_errors=True)
+        os.makedirs(tmp)
+        with zipfile.ZipFile(zip_path) as zf:
+            for m in zf.infolist():
+                n = m.filename.replace("\\", "/")
+                if n.startswith("/") or ".." in n.split("/"):
+                    continue        # 路径穿越防护
+                zf.extract(m, tmp)
+        # 顶层若只有一个目录且里面才是内容 → 摊平
+        entries = os.listdir(tmp)
+        src = tmp
+        if len(entries) == 1 and os.path.isdir(os.path.join(tmp, entries[0])):
+            src = os.path.join(tmp, entries[0])
+        for item in os.listdir(src):
+            s = os.path.join(src, item)
+            d = os.path.join(dest, item)
+            if os.path.isdir(s):
+                if item.lower() in {p.lower() for p in preserve} and os.path.isdir(d):
+                    continue        # 保留用户配置目录
+                if os.path.isdir(d):
+                    shutil.rmtree(d, ignore_errors=True)
+                shutil.copytree(s, d)
+            else:
+                shutil.copy2(s, d)
+        return True
+    except Exception:
+        return False
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def _search_installed_exe(app, extra_dirs=None):
@@ -1489,6 +1633,120 @@ def _cnb_git_mirror(repo, git):
         return "https://cnb.cool/%s/%s" % (m.group(1), m.group(2))
     except Exception:
         return ""
+
+
+class ZipAppCheckWorker(QThread):
+    """zip 分发型应用的更新检查：拉 release 资产，跟已安装版本比。
+
+    与 git 路线（GenericUpdateCheckWorker）的差异：zip 发布**没有提交数**，
+    "落后几个提交"无从谈起，改用版本号比较；这也更贴近用户认知。
+    """
+
+    done = Signal(object)   # {has_new, behind, local_tag, remote_tag, reason}
+    failed = Signal(str)
+
+    def __init__(self, app, parent=None):
+        super().__init__(parent)
+        self.app = app
+
+    def run(self):
+        repo = (self.app.get("release_repo") or "").strip()
+        glob = (self.app.get("asset_glob") or "").strip()
+        if not repo or not glob:
+            self.done.emit({"has_new": False, "behind": 0,
+                            "local_tag": _zipapp_version(self.app),
+                            "remote_tag": "", "reason": "norepo"})
+            return
+        try:
+            url, _name, tag = _resolve_release_asset(repo, glob)
+            if not url:
+                self.failed.emit("未能从发布页找到匹配的安装包。")
+                return
+            local = _zipapp_version(self.app)
+            has_new = bool(tag) and (not local or compare_version(tag, local) > 0)
+            self.done.emit({
+                "has_new": has_new,
+                "behind": 1 if has_new else 0,   # zip 发布无提交数，1 表示"有新版本"
+                "local_tag": local,
+                "remote_tag": tag,
+                "reason": "" if has_new else "uptodate",
+            })
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class ZipAppWorker(QThread):
+    """zip 分发型应用的安装 / 更新：下载 zip → 解压到安装目录 → 写回版本与 exe。
+
+    安装和更新是同一套动作（覆盖式解压，保留用户配置目录），
+    区别只在于目标目录此前存不存在。
+
+    刻意**不猜主程序文件名**：解压完用 _pick_main_exe 实际扫一遍再写回 config，
+    免得上游哪天改了 exe 名字就整张卡失效。
+    """
+
+    progress = Signal(str)
+    done = Signal(str)      # 装/更到的版本 tag
+    failed = Signal(str)
+
+    def __init__(self, app, parent=None):
+        super().__init__(parent)
+        self.app = app
+
+    def run(self):
+        repo = (self.app.get("release_repo") or "").strip()
+        glob = (self.app.get("asset_glob") or "").strip()
+        exe = self.app.get("exe", "") or ""
+        dest = os.path.dirname(exe) if exe else ""
+        if not repo or not glob or not dest:
+            self.failed.emit("配置缺少 release_repo / asset_glob / exe，无法安装。")
+            return
+
+        self.progress.emit("正在查找安装包…")
+        url, name, tag = _resolve_release_asset(repo, glob)
+        if not url:
+            self.failed.emit("未能从发布页找到匹配的安装包。")
+            return
+
+        try:
+            os.makedirs(dest, exist_ok=True)
+        except OSError as e:
+            self.failed.emit("无法创建安装目录 %s：%s" % (dest, e))
+            return
+
+        zpath = os.path.join(dest, "_update_tmp.zip")
+        self.progress.emit("正在下载 %s…" % (name or "安装包"))
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "OKLauncher/%s" % APP_VERSION})
+            with urllib.request.urlopen(req, timeout=1800) as r:
+                with open(zpath, "wb") as f:
+                    shutil.copyfileobj(r, f)
+        except Exception as e:
+            self.failed.emit("下载失败：%s" % e)
+            return
+
+        self.progress.emit("正在解压到 %s…" % dest)
+        ok = _extract_zip_flat(zpath, dest, self.app.get("preserve_dirs"))
+        try:
+            os.remove(zpath)
+        except OSError:
+            pass
+        if not ok:
+            self.failed.emit("解压失败（安装包可能损坏）。")
+            return
+
+        key = self.app.get("key", "")
+        found = _pick_main_exe(dest, key)
+        if found:
+            self.app["exe"] = found
+            _save_app_field(key, "exe", found)
+        if tag:
+            self.app["installed_version"] = tag
+            _save_app_field(key, "installed_version", tag)
+
+        self.progress.emit("完成")
+        self.done.emit(tag or _zipapp_version(self.app) or "")
 
 
 class GenericUpdateCheckWorker(QThread):
@@ -4483,7 +4741,9 @@ class AppCard(CardWidget):
         """
         key = self.app.get("key", "")
 
-        if key in INSTALLER_REPO:
+        # 装法有两种：官方安装包（Installer.exe）走 AppInstallerWorker；
+        # zip 发布的（如 MaaEnd）走 ZipAppWorker 下载解压。都没配就只给官网。
+        if key in INSTALLER_REPO or self.app.get("release_repo"):
             self.install_btn = PushButton("安装")
             self.install_btn.setFixedHeight(42)
             self.install_btn.setStyleSheet(
@@ -4530,11 +4790,17 @@ class AppCard(CardWidget):
         self.install_btn.setEnabled(False)
         self.install_bar.setVisible(True)
         self.install_btn.setText("正在准备…")
-        w = AppInstallerWorker(
-            self.app, os.path.join(LAUNCHER_DIR, "_install_tmp"), parent=self)
-        w.progress.connect(self._on_installer_progress)
-        w.done.connect(self._on_installer_done)
-        w.failed.connect(self._on_installer_failed)
+        if self.app.get("release_repo") and not _git_repo_dir(self.app):
+            w = ZipAppWorker(self.app, parent=self)
+            w.progress.connect(self._on_installer_progress)
+            w.done.connect(self._on_zip_done)
+            w.failed.connect(self._on_installer_failed)
+        else:
+            w = AppInstallerWorker(
+                self.app, os.path.join(LAUNCHER_DIR, "_install_tmp"), parent=self)
+            w.progress.connect(self._on_installer_progress)
+            w.done.connect(self._on_installer_done)
+            w.failed.connect(self._on_installer_failed)
         self._installer_worker = w
         w.start()
 
@@ -4552,6 +4818,19 @@ class AppCard(CardWidget):
         self.rebuild_body()
         try:
             InfoBar.success("安装完成", "已定位到 %s" % exe_path,
+                            duration=4000, parent=self,
+                            position=InfoBarPosition.TOP_RIGHT)
+        except Exception:
+            pass
+
+    def _on_zip_done(self, tag):
+        """zip 安装/更新完成：exe 与版本号已由 worker 写回 config，这里只重建卡片。"""
+        self._installer_worker = None
+        if hasattr(self, "install_bar"):
+            self.install_bar.setVisible(False)
+        self.rebuild_body()
+        try:
+            InfoBar.success("安装完成", "已安装 %s" % (tag or "最新版本"),
                             duration=4000, parent=self,
                             position=InfoBarPosition.TOP_RIGHT)
         except Exception:
@@ -4770,8 +5049,9 @@ class AppCard(CardWidget):
             self.ver_hint.setWordWrap(True)
             self.body_box.addWidget(self.ver_hint)
 
-            # 更新区（仅当安装目录是 git 仓库才给——否则没法就地更新）
-            if _git_repo_dir(self.app):
+            # 更新区：git 仓库（就地 pull）或 release zip（下载解压）二选一，
+            # 两种都不是就无法在启动器内更新，不给按钮。
+            if _git_repo_dir(self.app) or self.app.get("release_repo"):
                 self.gen_update_btn = PushButton("检查更新中…")
                 self.gen_update_btn.setFixedHeight(38)
                 self.gen_update_btn.setEnabled(False)
@@ -4814,11 +5094,21 @@ class AppCard(CardWidget):
         self._gen_check_started = True
         if not hasattr(self, "gen_update_btn"):
             return
-        if not _git_repo_dir(self.app) or not GitVersionFetcher._find_git():
-            self.gen_update_btn.setText("目录非 git 仓库，无法更新")
+        # 两条更新路线：本地 git 仓库 → pull；release zip 发布 → 下载解压。
+        # 一条龙走前者，MaaEnd 这类走后者。都不是就明说无法更新，别给假按钮。
+        if _git_repo_dir(self.app):
+            if not GitVersionFetcher._find_git():
+                self.gen_update_btn.setText("未找到 git，无法更新")
+                self.gen_update_btn.setEnabled(False)
+                return
+            w = GenericUpdateCheckWorker(self.app, parent=self)
+        elif self.app.get("release_repo"):
+            w = ZipAppCheckWorker(self.app, parent=self)
+        else:
+            self.gen_update_btn.setText("非 git 仓库且未配置发布源，无法更新")
             self.gen_update_btn.setEnabled(False)
             return
-        self._gen_check_worker = GenericUpdateCheckWorker(self.app, parent=self)
+        self._gen_check_worker = w
         self._gen_check_worker.done.connect(self._on_generic_check_done)
         self._gen_check_worker.failed.connect(self._on_generic_check_failed)
         self._gen_check_worker.start()
@@ -4891,10 +5181,17 @@ class AppCard(CardWidget):
         if hasattr(self, "gen_update_bar"):
             self.gen_update_bar.setVisible(True)
 
-        w = GenericUpdateWorker(self.app, parent=self)
-        w.progress.connect(self._on_generic_update_progress)
-        w.done.connect(self._on_generic_update_done)
-        w.failed.connect(self._on_generic_update_failed)
+        # 更新路线与检查路线必须一致：git 仓库走 pull，zip 发布走下载解压
+        if _git_repo_dir(self.app):
+            w = GenericUpdateWorker(self.app, parent=self)
+            w.progress.connect(self._on_generic_update_progress)
+            w.done.connect(self._on_generic_update_done)
+            w.failed.connect(self._on_generic_update_failed)
+        else:
+            w = ZipAppWorker(self.app, parent=self)
+            w.progress.connect(self._on_generic_update_progress)
+            w.done.connect(self._on_zip_done)
+            w.failed.connect(self._on_generic_update_failed)
         self._gen_update_worker = w
         w.start()
 

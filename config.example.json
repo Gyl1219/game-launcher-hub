@@ -66,6 +66,19 @@
       "pythonw": "",
       "icon": "onedragon-zzz.png",
       "website": "https://one-dragon.com/zzz/zh/home.html"
+    },
+    {
+      "key": "maa-end",
+      "display": "MaaEnd 终末地小助手",
+      "generic": true,
+      "exe": "D:/OKApps/maa-end/MaaEnd.exe",
+      "release_repo": "MaaEnd/MaaEnd",
+      "asset_glob": "MaaEnd-win-x86_64-*.zip",
+      "app_json": "",
+      "working": "",
+      "pythonw": "",
+      "icon": "maa-end.png",
+      "website": "https://maaend.com/"
     }
   ]
 }
