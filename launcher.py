@@ -1386,6 +1386,28 @@ def install_excepthook():
         pass
 
 
+def _cnb_git_mirror(repo, git):
+    """从仓库 origin URL 推导 CNB 镜像地址（仅 GitHub origin 可推）。
+
+    背景：一条龙 origin 是 github.com，但同一 owner/repo 在 CNB 上有官方镜像，
+    实测 git fetch / 安装包都与 GitHub 字节一致，而国内连 GitHub 很不稳——
+    用户机器上「检查更新失败」的根因就是 fetch origin 超时/握手失败。
+    返回 CNB URL 字符串；origin 不是 GitHub（file://、gitee 等）或出错返回 ""。
+    """
+    try:
+        rc, url, _ = _git_run(git, ["remote", "get-url", "origin"],
+                              repo, timeout=15)
+        if rc != 0:
+            return ""
+        m = re.match(r"https?://(?:www\.)?github\.com/([^/\s]+)/([^/\s]+?)(?:\.git)?/?$",
+                     (url or "").strip())
+        if not m:
+            return ""
+        return "https://cnb.cool/%s/%s" % (m.group(1), m.group(2))
+    except Exception:
+        return ""
+
+
 class GenericUpdateCheckWorker(QThread):
     """generic 应用（本地 git 仓库）更新检查。
 
@@ -1418,8 +1440,17 @@ class GenericUpdateCheckWorker(QThread):
             # fetch：只拉对象，工作区零改动。
             # 必须带 --tags：实测不带的话新 tag 不会同步过来，
             # git describe 会永远停在旧版本号（表现为「更新了但版本没变」）。
-            rc, _, err = _git_run(git, ["fetch", "--tags", "origin", branch],
-                                  repo, timeout=180)
+            #
+            # 源选择：CNB 镜像优先（国内连 GitHub 常握手失败/超时，用户机器实测），
+            # CNB 没镜像或 fetch 失败再回退 origin，绝不让镜像故障连累兜底。
+            rc, _, err = 1, "", "尚未尝试"
+            cnb_url = _cnb_git_mirror(repo, git)
+            if cnb_url:
+                rc, _, err = _git_run(git, ["fetch", "--tags", cnb_url, branch],
+                                      repo, timeout=120)
+            if rc != 0:
+                rc, _, err = _git_run(git, ["fetch", "--tags", "origin", branch],
+                                      repo, timeout=180)
             if rc != 0:
                 self.failed.emit(err or "git fetch 失败")
                 return
@@ -1491,10 +1522,20 @@ class GenericUpdateWorker(QThread):
                 return
 
             self.progress.emit("正在拉取最新代码…")
-            # 同样带 --tags，否则更新后版本号不刷新（与检查阶段同理）
-            rc, out, err = _git_run(
-                git, ["pull", "--ff-only", "--tags", "origin", branch],
-                repo, timeout=300)
+            # 同样带 --tags，否则更新后版本号不刷新（与检查阶段同理）。
+            # 源选择与检查阶段一致：CNB 镜像优先，失败回退 origin。
+            rc, out, err = 1, "", "尚未尝试"
+            cnb_url = _cnb_git_mirror(repo, git)
+            if cnb_url:
+                rc, out, err = _git_run(
+                    git, ["pull", "--ff-only", "--tags", cnb_url, branch],
+                    repo, timeout=300)
+            if rc != 0:
+                if cnb_url:
+                    self.progress.emit("CNB 镜像不可用，改走 GitHub…")
+                rc, out, err = _git_run(
+                    git, ["pull", "--ff-only", "--tags", "origin", branch],
+                    repo, timeout=300)
             if rc != 0:
                 # 常见原因：本地分叉（--ff-only 拒绝）
                 if "not possible to fast-forward" in (err + out).lower() \
