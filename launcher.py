@@ -29,6 +29,8 @@ import os
 import re
 import json
 import fnmatch
+import struct
+import base64
 import ctypes
 import subprocess
 import traceback
@@ -40,7 +42,7 @@ import zipfile
 import shutil
 import time
 
-from PySide6.QtCore import Qt, QTimer, QThread, Signal, QUrl
+from PySide6.QtCore import Qt, QTimer, QThread, Signal, QUrl, QPoint
 from PySide6.QtGui import QIcon, QPixmap, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QWidget, QDialog, QHBoxLayout, QVBoxLayout, QGridLayout,
@@ -50,7 +52,8 @@ from PySide6.QtWidgets import (
 from qfluentwidgets import (
     setTheme, Theme, CardWidget, IconWidget, StrongBodyLabel,
     CaptionLabel, PushButton, ComboBox, FluentIcon, IndeterminateProgressBar,
-    LineEdit, InfoBar, InfoBarPosition,
+    LineEdit, InfoBar, InfoBarPosition, RoundMenu, Action,
+    TransparentToolButton,
 )
 
 
@@ -994,6 +997,93 @@ def _search_installed_exe(app, extra_dirs=None):
             except Exception:
                 continue
     return ""
+
+
+# ===== 桌面快捷方式：.lnk 写入（齿轮菜单用） =====
+
+def _desktop_dir():
+    """桌面真实路径。必须走 SHGetFolderPathW(CSIDL_DESKTOP)：
+    本机桌面被系统重定向到 D:\\桌面，拿 USERPROFILE 拼 Desktop 会指错地方。"""
+    try:
+        buf = ctypes.create_unicode_buffer(260)
+        if ctypes.windll.shell32.SHGetFolderPathW(None, 0x0000, None, 0, buf) == 0:
+            d = buf.value
+            if d and os.path.isdir(d):
+                return d
+    except Exception:
+        pass
+    return ""
+
+
+def _write_lnk_struct(lnk_path, target, workdir, args="", icon=""):
+    """纯 struct 写 .lnk（与 rebuild_lnk.py 同一实现，零依赖零子进程，本机已验证可用）。
+
+    限制：ANSI LocalBasePath，四个路径参数必须**全 ASCII**——
+    含中文路径会 UnicodeEncodeError，这正是存在 PowerShell 回退的原因。
+    """
+    def ustr(s):
+        b = s.encode("utf-16-le") + b"\x00\x00"
+        return struct.pack("<H", len(b)) + b
+
+    localbase = target.encode("ascii") + b"\x00"
+    volume_id = struct.pack("<IIII", 16, 3, 0, 16)
+    linkinfo_body = volume_id + localbase
+    linkinfo = struct.pack("<IIIIIII",
+                           28 + len(linkinfo_body), 28, 0x1, 28,
+                           28 + len(volume_id), 0, 0) + linkinfo_body
+
+    LinkFlags = 0x2 | 0x8 | 0x10 | 0x20 | 0x40 | 0x80   # LinkInfo|RelPath|WorkDir|Args|Icon|Unicode
+    clsid = bytes.fromhex("0002140100000000c000000000000046")
+    header = struct.pack("<I", 76) + clsid
+    header += struct.pack("<I", LinkFlags)
+    header += struct.pack("<I", 0x20)                 # FileAttributes NORMAL
+    header += b"\x00" * 24
+    header += struct.pack("<I", 0)                    # FileSize
+    header += struct.pack("<I", 0)                    # IconIndex
+    header += struct.pack("<I", 0x1)                  # SW_SHOWNORMAL
+    header += struct.pack("<H", 0) + struct.pack("<H", 0)
+    header += struct.pack("<I", 0) + struct.pack("<I", 0)
+
+    stringdata = (ustr(os.path.basename(lnk_path)[:-4] or "App")
+                  + ustr(workdir) + ustr(args) + ustr(icon))
+    with open(lnk_path, "wb") as f:
+        f.write(header + linkinfo + stringdata)
+    return os.path.isfile(lnk_path)
+
+
+def _write_lnk_powershell(lnk_path, target, workdir, args="", icon=""):
+    """非 ASCII 路径的回退：PowerShell WScript.Shell COM。
+
+    用 -EncodedCommand（UTF-16LE base64）传整段脚本，绕开一切引号转义问题；
+    -WindowStyle Hidden + CREATE_NO_WINDOW 防黑窗闪烁。
+    """
+    def q(s):
+        return str(s).replace("'", "''")
+
+    ps = ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{lnk}');"
+          "$s.TargetPath='{t}';$s.Arguments='{a}';$s.WorkingDirectory='{w}';"
+          "$s.IconLocation='{i},0';$s.Save()").format(
+        lnk=q(lnk_path), t=q(target), a=q(args), w=q(workdir), i=q(icon))
+    enc = base64.b64encode(ps.encode("utf-16-le")).decode("ascii")
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive",
+             "-WindowStyle", "Hidden", "-EncodedCommand", enc],
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            capture_output=True, timeout=60)
+        return os.path.isfile(lnk_path)
+    except Exception:
+        return False
+
+
+def _write_lnk(lnk_path, target, workdir, args="", icon=""):
+    """写 .lnk：路径全 ASCII 走纯 struct 快路径；含非 ASCII 回退 PowerShell。"""
+    icon = icon or target
+    try:
+        (target + workdir + args + icon).encode("ascii")
+        return _write_lnk_struct(lnk_path, target, workdir, args, icon)
+    except UnicodeEncodeError:
+        return _write_lnk_powershell(lnk_path, target, workdir, args, icon)
 
 
 class AppInstallerWorker(QThread):
@@ -3967,6 +4057,14 @@ class AppCard(CardWidget):
         )
         self.run_tag.setVisible(False)
         head.addWidget(self.run_tag)
+        # 右上角齿轮：更多操作（快捷方式/浏览安装位置/卸载），见 _build_card_menu
+        self.gear_btn = TransparentToolButton(FluentIcon.SETTING)
+        self.gear_btn.setFixedSize(30, 30)
+        self.gear_btn.setIconSize(self.gear_btn.size() * 0.55)
+        self.gear_btn.setToolTip("更多操作")
+        self.gear_btn.setCursor(Qt.PointingHandCursor)
+        self.gear_btn.clicked.connect(self._show_card_menu)
+        head.addWidget(self.gear_btn)
         root.addLayout(head)
 
         # 信息行：版本 / 配置
@@ -4354,6 +4452,66 @@ class AppCard(CardWidget):
         self.app["exe"] = path
         _save_app_exe(self.app.get("key", ""), path)
         self.rebuild_body()
+
+    # ===== 右上角齿轮：添加快捷方式 / 浏览安装位置 / 卸载 =====
+    def _build_card_menu(self):
+        """齿轮下拉菜单。测试友好：只构建不 exec（exec 是模态，会阻塞无人值守测试）。"""
+        menu = RoundMenu(parent=self)
+        inst = bool(getattr(self, "_installed", False))
+        exe = self.app.get("exe", "") or ""
+
+        a_add = Action(FluentIcon.LINK, "添加桌面快捷方式")
+        a_add.triggered.connect(self._create_desktop_shortcut)
+        a_add.setEnabled(bool(exe) and os.path.isfile(exe))
+        menu.addAction(a_add)
+
+        a_open = Action(FluentIcon.FOLDER, "浏览安装位置")
+        a_open.triggered.connect(self._open_install_dir)
+        a_open.setEnabled(inst)
+        menu.addAction(a_open)
+
+        menu.addSeparator()
+
+        a_un = Action(FluentIcon.DELETE, "卸载")
+        a_un.triggered.connect(self.uninstall_app)
+        a_un.setEnabled(inst)
+        menu.addAction(a_un)
+        return menu
+
+    def _show_card_menu(self):
+        self._build_card_menu().exec(
+            self.gear_btn.mapToGlobal(QPoint(0, self.gear_btn.height() + 4)))
+
+    def _open_install_dir(self):
+        d = (getattr(self, "_install_dir", "")
+             or os.path.dirname(self.app.get("exe", "") or ""))
+        if d and os.path.isdir(d):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(d))
+        else:
+            QMessageBox.information(self, "浏览安装位置",
+                                    "未找到安装目录（可能尚未安装）。")
+
+    def _create_desktop_shortcut(self):
+        exe = self.app.get("exe", "") or ""
+        if not exe or not os.path.isfile(exe):
+            QMessageBox.information(self, "添加快捷方式",
+                                    "未找到程序（可能尚未安装）。")
+            return
+        desktop = _desktop_dir()
+        if not desktop:
+            QMessageBox.warning(self, "添加快捷方式", "未能定位桌面目录。")
+            return
+        name = self.app.get("display") or self.app.get("key") or "App"
+        lnk = os.path.join(desktop, name + ".lnk")
+        if _write_lnk(lnk, exe, os.path.dirname(exe)):
+            try:
+                InfoBar.success("已创建快捷方式", lnk, duration=3000,
+                                parent=self,
+                                position=InfoBarPosition.TOP_RIGHT)
+            except Exception:
+                pass
+        else:
+            QMessageBox.warning(self, "添加快捷方式", "创建失败：" + lnk)
 
     def build_lite_body(self):
         """lite 模式动态区：已安装 = 启动/强关 + 卸载；未安装 = 通用操作区。"""
