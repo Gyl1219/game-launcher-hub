@@ -28,6 +28,7 @@ import sys
 import os
 import re
 import json
+import fnmatch
 import ctypes
 import subprocess
 import traceback
@@ -44,7 +45,7 @@ from PySide6.QtGui import QIcon, QPixmap, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QWidget, QDialog, QHBoxLayout, QVBoxLayout, QGridLayout,
     QMessageBox, QLabel, QScrollArea, QTextEdit, QProgressBar, QProgressDialog,
-    QStackedWidget, QCheckBox,
+    QStackedWidget, QCheckBox, QFileDialog,
 )
 from qfluentwidgets import (
     setTheme, Theme, CardWidget, IconWidget, StrongBodyLabel,
@@ -61,7 +62,7 @@ from qfluentwidgets import (
 
 # 启动器自身版本（打包版 / 源码版共用）。发新版时只改这一处，
 # 显示在「设置」页页脚，便于报 bug 时说清自己在跑哪个版本。
-APP_VERSION = "0.2.2"
+APP_VERSION = "0.2.3"
 
 # ===== 应用配置（从 config.json 加载，避免硬编码路径） =====
 # 打包后（PyInstaller）两个目录必须分开算，否则图标全找不到：
@@ -93,6 +94,23 @@ GITHUB_RELEASE_REPO = {
     # lite 助手同样走 GitHub Releases 检测更新：奇想盒的 App 安装包（whimbox_app-setup-
     # <ver>.exe）自 3.1.0 起随主仓库 Whimbox 一起发布，版本号与 Python 后端统一为 3.x
     "whimbox":     ("nikkigallery", "Whimbox"),
+}
+
+# 支持「启动器内首次安装」的应用：key -> (owner, repo, 安装包文件名 glob)
+#
+# 与上面的 GITHUB_RELEASE_REPO（**更新检测**用）是两回事：那边找的是更新包，
+# 这里找的是**从零安装**用的官方安装程序。lite / generic 两张卡的未安装态靠这个
+# 才能真装起来，否则只能给个「打开官网」把人打发走。
+#
+# 两个 glob 都是**实测核对过**的（不是猜的仓库/文件名）：
+#   whimbox   -> whimbox_app-setup-3.1.0.exe                      （约 119 MB）
+#   onedragon -> ZenlessZoneZero-OneDragon-v2.5.2-Installer.exe   （约 102 MB）
+# 刻意只取**正式版** release：测试版安装包可能不完整，首次安装不该拿它。
+INSTALLER_REPO = {
+    "whimbox":       ("nikkigallery", "Whimbox",
+                      "whimbox_app-setup-*.exe"),
+    "onedragon-zzz": ("OneDragon-Anything", "ZenlessZoneZero-OneDragon",
+                      "*-Installer.exe"),
 }
 # 7-Zip 便携版持久化目录（与 install_root/_dl_<key>/ 解耦）。
 # 旧 bug：7z 装到 tmp/7zportable/，run() 成功后 shutil.rmtree(tmp) 把它一起删了，
@@ -815,6 +833,233 @@ def mirrorchyan_rid_for(key):
         if rid:
             return rid
     return MIRRORCHYAN_RIDS.get(key, "")
+
+
+# ===== 首次安装：官方安装包定位 / 下载 / 装后搜索 =====
+
+def _cfg_path():
+    return os.path.join(LAUNCHER_DIR, "config.json")
+
+
+def _save_app_exe(key, exe_path):
+    """把某个 app 的 exe 路径写回 config.json。
+
+    为什么必须写回：config 里的 exe 是**预置**路径，而官方安装包装到哪由用户决定
+    （一条龙可能装 D:\\DZZZ-OD，也可能装别的盘）。不落盘的话，这次能认出来，
+    下次启动卡片又变回「未安装」——等于白装一次。
+    成功返回 True，任何异常都返回 False（不抛，避免打断 UI）。
+    """
+    try:
+        with open(_cfg_path(), "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        hit = False
+        for a in cfg.get("apps", []):
+            if a.get("key") == key:
+                a["exe"] = str(exe_path).replace("\\", "/")
+                hit = True
+                break
+        if not hit:
+            return False
+        with open(_cfg_path(), "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def _pick_installer(rels, pattern):
+    """在 releases 列表里找最新**正式版**中匹配 glob 的安装包 → (url, name)。"""
+    for rel in rels:
+        if rel.get("prerelease") or rel.get("draft"):
+            continue
+        for a in (rel.get("assets") or []):
+            name = a.get("name", "")
+            if not fnmatch.fnmatch(name, pattern):
+                continue
+            # CNB 同时存在拼错的 brower_download_url 与正确的 browser_download_url；
+            # 另有 url 字段指向 api.cnb.cool（未授权会 401），不能用。
+            url = (a.get("browser_download_url")
+                   or a.get("brower_download_url") or "")
+            if url:
+                return (url, name)
+    return ("", "")
+
+
+def _cnb_releases(owner, repo):
+    """从 CNB 镜像拉 releases 列表。没有镜像 / 网络异常都返回 []（不抛）。
+
+    CNB 是 Gitea 兼容的国内镜像，实测一条龙在 CNB 上的安装包与 GitHub **字节一致**
+    （v2.5.2 Installer.exe = 102027760 字节），国内下载快得多，所以优先用它。
+    注意：不是每个仓库都有 CNB 镜像（奇想盒就没有），所以必须能优雅回退。
+    """
+    try:
+        req = urllib.request.Request(
+            "https://cnb.cool/%s/%s/-/releases" % (owner, repo),
+            headers={"User-Agent": "OKLauncher/%s" % APP_VERSION,
+                     "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=25) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _resolve_installer_asset(repo_tuple):
+    """取安装包下载地址：CNB 镜像优先（国内快），没有则回退 GitHub。
+
+    返回 (下载URL, 文件名)；都找不到返回 ("", "")。
+    """
+    owner, repo, pattern = repo_tuple
+
+    # CNB 优先。这里再包一层 try 是刻意的：镜像源挂了绝不能连累 GitHub 兜底，
+    # 不能只靠 _cnb_releases 内部自己吞异常（那是它的事，这里是调用方该守的边界）。
+    try:
+        cnb = _cnb_releases(owner, repo)
+    except Exception:
+        cnb = []
+    if cnb:
+        url, name = _pick_installer(cnb, pattern)
+        if url:
+            return (url, name)
+
+    try:
+        req = urllib.request.Request(
+            "https://api.github.com/repos/%s/%s/releases?per_page=10"
+            % (owner, repo),
+            headers={"User-Agent": "OKLauncher/%s" % APP_VERSION,
+                     "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            rels = json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return ("", "")
+    return _pick_installer(rels, pattern)
+
+
+def _search_installed_exe(app, extra_dirs=None):
+    """在常见位置按 exe 基名搜索已安装的程序。
+
+    装完必须**实际搜索**：官方安装包把程序放哪我们说了不算，
+    只信 config 预置路径的话，装到别处就会漏判成「未安装」。
+    只扫根目录一层 + 每种子目录一层，不做全盘遍历（避免卡死）。
+    """
+    base = os.path.basename(app.get("exe", "") or "")
+    if not base:
+        return ""
+
+    roots = []
+    cfg_exe = app.get("exe", "") or ""
+    if cfg_exe:
+        roots.append(os.path.dirname(cfg_exe))              # 预置路径优先
+    try:
+        root = str(_load_cfg_safe().get("install_root") or "").strip()
+        if root:
+            roots.append(root.replace("/", os.sep))
+    except Exception:
+        pass
+    for env in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+        d = os.environ.get(env)
+        if d:
+            roots.append(os.path.join(d, "Programs")
+                         if env == "LOCALAPPDATA" else d)
+    for drv in ("D:\\", "C:\\"):
+        roots.append(drv)
+    roots.extend(extra_dirs or [])
+
+    seen = set()
+    for rt in roots:
+        try:
+            if not rt or not os.path.isdir(rt):
+                continue
+            key = os.path.normcase(os.path.abspath(rt))
+            if key in seen:
+                continue
+            seen.add(key)
+            entries = sorted(os.listdir(rt))
+        except Exception:
+            continue
+        # 根目录下直接命中
+        for e in entries:
+            p = os.path.join(rt, e)
+            try:
+                if os.path.isfile(p) and os.path.normcase(e) == os.path.normcase(base):
+                    return p
+            except Exception:
+                continue
+        # 再往各子目录找一层
+        for e in entries:
+            sub = os.path.join(rt, e)
+            try:
+                if os.path.isdir(sub) and os.path.isfile(os.path.join(sub, base)):
+                    return os.path.join(sub, base)
+            except Exception:
+                continue
+    return ""
+
+
+class AppInstallerWorker(QThread):
+    """首次安装：下载官方安装包 → 运行安装程序 → 装完定位 exe。
+
+    与 InstallWorker（ok-script 系的 NSIS 整包直解）路线不同：
+    这里走**官方自己的安装程序**（GUI，用户点下一步），装完我们再去找它落在哪。
+    这样不用复制各家的安装逻辑，也不会和他们后续的自更新打架——
+    我们只负责「把安装程序送到用户面前 + 装完认出它」。
+    """
+
+    progress = Signal(str)
+    done = Signal(str)     # 已安装 exe 的绝对路径
+    failed = Signal(str)   # 失败原因（人类可读）
+
+    def __init__(self, app, tmp_dir, parent=None):
+        super().__init__(parent)
+        self.app = app
+        self.tmp_dir = tmp_dir
+
+    def run(self):
+        repo = INSTALLER_REPO.get(self.app.get("key", ""))
+        if not repo:
+            self.failed.emit("该应用没有配置官方安装包，无法一键安装。")
+            return
+
+        self.progress.emit("正在查找官方安装包…")
+        url, name = _resolve_installer_asset(repo)
+        if not url:
+            self.failed.emit(
+                "未能从官方仓库找到安装包（网络不通，或该仓库暂未发布安装包）。")
+            return
+
+        try:
+            os.makedirs(self.tmp_dir, exist_ok=True)
+        except Exception:
+            pass
+        save = os.path.join(self.tmp_dir, name or "installer.exe")
+
+        self.progress.emit("正在下载安装包…")
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "OKLauncher/%s" % APP_VERSION})
+            with urllib.request.urlopen(req, timeout=900) as r:
+                with open(save, "wb") as f:
+                    shutil.copyfileobj(r, f)
+        except Exception as e:
+            self.failed.emit("下载安装包失败：%s" % e)
+            return
+
+        self.progress.emit("正在启动安装程序，请在弹出窗口里完成安装…")
+        try:
+            subprocess.Popen([save]).wait()
+        except Exception as e:
+            self.failed.emit("启动安装程序失败：%s" % e)
+            return
+
+        self.progress.emit("安装程序已结束，正在定位…")
+        found = _search_installed_exe(self.app)
+        if not found:
+            self.failed.emit(
+                "安装程序已运行，但没在常见位置找到 %s。\n"
+                "如果装到了其它目录，请点「选择已安装程序…」手动指定。"
+                % os.path.basename(self.app.get("exe", "") or "程序"))
+            return
+        self.done.emit(found)
 
 
 def mirrorchyan_latest(rid, cdk, current_version="", user_agent="WorkBuddy-OKLauncher"):
@@ -4008,8 +4253,110 @@ class AppCard(CardWidget):
         if self._installed:
             self._lite_start_check()
 
+    # ===== 未安装态通用操作区（lite / generic 共用） =====
+    def _build_uninstalled_actions(self):
+        """未安装时给三条出路：一键装 / 手动指定已有安装 / 打开官网。
+
+        ok-script 卡不走这里——它有自己的 InstallWorker（NSIS 整包直解）路线。
+        """
+        key = self.app.get("key", "")
+
+        if key in INSTALLER_REPO:
+            self.install_btn = PushButton("安装")
+            self.install_btn.setFixedHeight(42)
+            self.install_btn.setStyleSheet(
+                "QPushButton { background-color:#1976d2; color:white; "
+                "border-radius:8px; font-weight:600; } "
+                "QPushButton:hover { background-color:#1565c0; }"
+            )
+            self.install_btn.setCursor(Qt.PointingHandCursor)
+            self.install_btn.clicked.connect(self._on_install_from_official)
+            self.body_box.addWidget(self.install_btn)
+
+            self.install_bar = IndeterminateProgressBar()
+            self.install_bar.setFixedHeight(4)
+            self.install_bar.setVisible(False)
+            self.body_box.addWidget(self.install_bar)
+
+            hint = CaptionLabel(
+                "点「安装」会下载官方安装包并启动它，按提示装完即可。"
+                "装好后本卡片会自动定位到程序。")
+            hint.setWordWrap(True)
+            self.body_box.addWidget(hint)
+
+        self.locate_btn = PushButton("选择已安装程序…")
+        self.locate_btn.setFixedHeight(36)
+        self.locate_btn.setCursor(Qt.PointingHandCursor)
+        self.locate_btn.setToolTip(
+            "如果你已经装好了、只是路径和预置的不同，用这个手动指定")
+        self.locate_btn.clicked.connect(self._on_locate_exe)
+        self.body_box.addWidget(self.locate_btn)
+
+        site = self.app.get("website", "")
+        if site:
+            btn = PushButton("打开官网")
+            btn.setFixedHeight(36)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.clicked.connect(
+                lambda *a, url=site: QDesktopServices.openUrl(QUrl(url)))
+            self.body_box.addWidget(btn)
+
+    def _on_install_from_official(self):
+        if getattr(self, "_installer_worker", None) is not None and \
+                self._installer_worker.isRunning():
+            return
+        self.install_btn.setEnabled(False)
+        self.install_bar.setVisible(True)
+        self.install_btn.setText("正在准备…")
+        w = AppInstallerWorker(
+            self.app, os.path.join(LAUNCHER_DIR, "_install_tmp"), parent=self)
+        w.progress.connect(self._on_installer_progress)
+        w.done.connect(self._on_installer_done)
+        w.failed.connect(self._on_installer_failed)
+        self._installer_worker = w
+        w.start()
+
+    def _on_installer_progress(self, text):
+        if hasattr(self, "install_btn") and text:
+            self.install_btn.setText(text)
+
+    def _on_installer_done(self, exe_path):
+        self._installer_worker = None
+        if hasattr(self, "install_bar"):
+            self.install_bar.setVisible(False)
+        # 装到的位置未必等于 config 预置路径 → 写回，否则下次启动又变「未安装」
+        self.app["exe"] = exe_path
+        _save_app_exe(self.app.get("key", ""), exe_path)
+        self.rebuild_body()
+        try:
+            InfoBar.success("安装完成", "已定位到 %s" % exe_path,
+                            duration=4000, parent=self,
+                            position=InfoBarPosition.TOP_RIGHT)
+        except Exception:
+            pass
+
+    def _on_installer_failed(self, msg):
+        self._installer_worker = None
+        if hasattr(self, "install_bar"):
+            self.install_bar.setVisible(False)
+        if hasattr(self, "install_btn"):
+            self.install_btn.setEnabled(True)
+            self.install_btn.setText("安装")
+        QMessageBox.warning(self, "安装未完成", msg)
+
+    def _on_locate_exe(self):
+        start = os.path.dirname(self.app.get("exe", "") or "") or ""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择程序主程序", start,
+            "应用程序 (*.exe);;所有文件 (*.*)")
+        if not path:
+            return
+        self.app["exe"] = path
+        _save_app_exe(self.app.get("key", ""), path)
+        self.rebuild_body()
+
     def build_lite_body(self):
-        """lite 模式动态区：已安装 = 启动/强关 + 卸载；未安装 = 提示 + 官网按钮。"""
+        """lite 模式动态区：已安装 = 启动/强关 + 卸载；未安装 = 通用操作区。"""
         if self._installed:
             self.start_btn = PushButton("▶  启动应用")
             # 当前 / 最新版本提示：ok-script 卡的版本信息由 app.json 提供，
@@ -4076,16 +4423,8 @@ class AppCard(CardWidget):
             self.changelog_text.setPlainText("正在获取更新说明…")
             self.body_box.addWidget(self.changelog_text)
         else:
-            self.status_label.setText(
-                "未检测到本地安装。lite 助手不支持一键安装，请从官方渠道获取。")
-            site = self.app.get("website", "")
-            if site:
-                btn = PushButton("打开官网")
-                btn.setFixedHeight(36)
-                btn.setCursor(Qt.PointingHandCursor)
-                btn.clicked.connect(
-                    lambda *a, url=site: QDesktopServices.openUrl(QUrl(url)))
-                self.body_box.addWidget(btn)
+            self.status_label.setText("未检测到本地安装")
+            self._build_uninstalled_actions()
 
     def _rebuild_generic_body(self):
         """generic 模式重建：独立 exe 程序（非 ok-script、非奇想盒形态）。
@@ -4206,16 +4545,8 @@ class AppCard(CardWidget):
                     lambda *a, url=site: QDesktopServices.openUrl(QUrl(url)))
                 self.body_box.addWidget(site_btn)
         else:
-            self.status_label.setText(
-                "未检测到本地安装。此类程序不支持一键安装，请从官方渠道获取。")
-            site = self.app.get("website", "")
-            if site:
-                btn = PushButton("打开官网")
-                btn.setFixedHeight(36)
-                btn.setCursor(Qt.PointingHandCursor)
-                btn.clicked.connect(
-                    lambda *a, url=site: QDesktopServices.openUrl(QUrl(url)))
-                self.body_box.addWidget(btn)
+            self.status_label.setText("未检测到本地安装")
+            self._build_uninstalled_actions()
 
     # ===== generic 更新：本地 git 仓库 fetch + pull --ff-only =====
     def _generic_start_check(self):
