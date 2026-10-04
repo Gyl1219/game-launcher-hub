@@ -6,7 +6,7 @@
 > 左侧总览 / 各游戏 / 设置导航，右侧堆叠内容区，一个窗口看遍所有助手的运行状态、版本、更新日志，
 > 一键启动 / 强制关闭 / 窗口内更新。
 >
-> 当前支持 ok-script 系（ok-nte / ok-ww / ok-end-field）+ 非该系的奇想盒（Whimbox，lite 接入）与终末地小助手（MaaEnd，zip 发布接入），架构上不绑定单一框架，后续可接入其它生态。
+> 当前支持 ok-script 系（ok-nte / ok-ww / ok-end-field）+ 非该系的奇想盒（Whimbox，lite 接入）、绝区零一条龙（generic 接入）与 MaaEnd 终末地小助手（zip 发布接入），架构上不绑定单一框架，后续可接入其它生态。
 
 ## 下载
 
@@ -196,6 +196,7 @@ runas /user:Administrator "python launcher.py"
   - ok-end-field（终末地，ok-script 系）：https://github.com/AliceJump/ok-end-field
   - MaaEnd（终末地小助手，MaaFramework 系，zip 发布接入）：https://github.com/MaaEnd/MaaEnd
   - Whimbox（奇想盒，非 ok-script 系 lite 接入）：https://github.com/nikkigallery/Whimbox
+  - 绝区零一条龙（绝区零，非 ok-script 系 generic 接入）：https://github.com/OneDragon-Anything/ZenlessZoneZero-OneDragon
   - 开发者交流：ok-script 官方 QQ 群 938132715
 
 ---
