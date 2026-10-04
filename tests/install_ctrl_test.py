@@ -295,6 +295,61 @@ card._hide_install_progress_ui()
 chk("隐藏后暂停按钮被隐藏", card.install_pause_btn.isHidden())
 chk("隐藏后文案复位", card.install_pause_btn.text() == "⏸ 暂停")
 
+# ---------- 1b) 416 Range Not Satisfiable 处理 ----------
+print("--- 416 处理（残留 ≥ 服务器文件）---")
+import urllib.error  # noqa: E402
+
+
+def _416(url):
+    return urllib.error.HTTPError(url, 416, "Range Not Satisfiable", None, None)
+
+
+# 场景 A：本地残留 == 服务器大小（上次下到 100% 被杀）→ 直接当下载完成
+dest_a = os.path.join(TMP, "done.bin")
+open(dest_a, "wb").write(DATA)
+calls_a = {"head": 0, "get": 0}
+
+
+def urlopen_a(req, *a, **k):
+    if req.get_method() == "HEAD":
+        calls_a["head"] += 1
+        r = FakeResp(b"", status=200)
+        r.headers = {"Content-Length": str(len(DATA))}   # HEAD 必须报真实大小
+        return r
+    calls_a["get"] += 1
+    raise _416("https://x/a")
+
+
+cA = Ctl()
+with mock.patch.object(launcher.urllib.request, "urlopen", side_effect=urlopen_a):
+    stA, _ = launcher._download_chunked("https://x/a", dest_a, cA)
+chk("残留==远端大小 → 直接视为下载完成", stA == "done")
+chk("残留文件保留（没白白重下）", os.path.getsize(dest_a) == len(DATA))
+
+# 场景 B：本地残留大小不对（半截/别的版本）→ 删掉重下成功
+dest_b = os.path.join(TMP, "bad.bin")
+open(dest_b, "wb").write(DATA[:5000])       # 只有 5000 字节
+calls_b = {"get": 0}
+
+
+def urlopen_b(req, *a, **k):
+    if req.get_method() == "HEAD":
+        r = FakeResp(b"", status=200)
+        r.headers = {"Content-Length": str(len(DATA))}
+        return r
+    calls_b["get"] += 1
+    if calls_b["get"] == 1:
+        raise _416("https://x/a")
+    return FakeResp(DATA, status=200)
+
+
+cB = Ctl()
+with mock.patch.object(launcher.urllib.request, "urlopen", side_effect=urlopen_b):
+    stB, _ = launcher._download_chunked("https://x/a", dest_b, cB)
+chk("残留大小不符 → 删掉重下成功", stB == "done")
+chk("重下后文件完整", os.path.getsize(dest_b) == len(DATA))
+chk("确实重试了一次", calls_b["get"] == 2)
+
 shutil.rmtree(TMP, ignore_errors=True)
 print()
 print("=" * 46)

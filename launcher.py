@@ -1037,7 +1037,46 @@ def _pick_main_exe(dirpath, key=""):
     return os.path.join(dirpath, exes[0])
 
 
+def _remote_content_length(url, timeout=30):
+    """HEAD 拿远端文件大小；失败返回 None（不能因为探测失败就中断下载）。"""
+    try:
+        req = urllib.request.Request(
+            url, method="HEAD",
+            headers={"User-Agent": "OKLauncher/%s" % APP_VERSION})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            n = int(r.headers.get("Content-Length") or 0)
+            return n or None
+    except Exception:
+        return None
+
+
 def _download_chunked(url, dest, ctl, timeout=1800, chunk=65536):
+    """（外层）处理 416 Range Not Satisfiable。
+
+    典型场景：上次下载到 ~100% 时程序被关掉，临时 zip 留在盘上；
+    再点安装带着它的尺寸去续传 → Range 起点不小于服务端文件大小 → 416。
+    处理：本地大小 == 远端大小 → 其实已经下完整了，直接当下载完成
+    （省得重下几百 MB）；否则删掉残留从头下（只重试一次，防死循环）。
+    """
+    last = ("error", "")
+    for attempt in range(2):
+        st, msg = _download_chunked_once(url, dest, ctl, timeout, chunk)
+        if st != "error" or "416" not in str(msg):
+            return (st, msg)
+        last = (st, msg)
+        local = os.path.getsize(dest) if os.path.isfile(dest) else -1
+        remote = _remote_content_length(url)
+        if remote and local == remote:
+            return ("done", "")
+        try:
+            if os.path.isfile(dest):
+                os.remove(dest)
+        except OSError:
+            pass
+    return last
+
+
+def _download_chunked_once(url, dest, ctl, timeout=1800, chunk=65536):
     """分块下载，支持**暂停续传**与**取消**。
 
     ctl 是控制器（一般是 worker），需提供：
