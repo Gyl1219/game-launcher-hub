@@ -4575,19 +4575,7 @@ class AppCard(CardWidget):
             # 槽随运行态切换（见 _refresh_start_btn），与 ok-script 卡一致
             self.body_box.addWidget(self.start_btn)
 
-            self.uninstall_btn = PushButton("卸载此助手")
-            self.uninstall_btn.setFixedHeight(38)
-            self.uninstall_btn.setStyleSheet(
-                "QPushButton { background-color:rgba(255,82,82,0.10); "
-                "color:#ff6b6b; border:1px solid #ff5252; border-radius:8px; "
-                "font-weight:600; } "
-                "QPushButton:hover { background-color:rgba(255,82,82,0.22); "
-                "color:#ff8585; } "
-                "QPushButton:pressed { background-color:rgba(255,82,82,0.35); }"
-            )
-            self.uninstall_btn.setCursor(Qt.PointingHandCursor)
-            self.uninstall_btn.clicked.connect(self.uninstall_app)
-            self.body_box.addWidget(self.uninstall_btn)
+            # 卸载已收进右上角齿轮菜单（_build_card_menu），卡身不再放重复按钮
 
             # 更新按钮：lite 助手走 GitHub Releases 检测（奇想盒 App 安装包随主仓库发布）
             self.update_btn = PushButton("检查更新中…")
@@ -4720,19 +4708,7 @@ class AppCard(CardWidget):
             )
             self.body_box.addWidget(self.start_btn)
 
-            self.uninstall_btn = PushButton("卸载此程序")
-            self.uninstall_btn.setFixedHeight(38)
-            self.uninstall_btn.setStyleSheet(
-                "QPushButton { background-color:rgba(255,82,82,0.10); "
-                "color:#ff6b6b; border:1px solid #ff5252; border-radius:8px; "
-                "font-weight:600; } "
-                "QPushButton:hover { background-color:rgba(255,82,82,0.22); "
-                "color:#ff8585; } "
-                "QPushButton:pressed { background-color:rgba(255,82,82,0.35); }"
-            )
-            self.uninstall_btn.setCursor(Qt.PointingHandCursor)
-            self.uninstall_btn.clicked.connect(self.uninstall_app)
-            self.body_box.addWidget(self.uninstall_btn)
+            # 卸载已收进右上角齿轮菜单（_build_card_menu），卡身不再放重复按钮
 
             # 官方站点（一条龙这类自带更新，指回它自己的更新入口最省事）
             site = self.app.get("website", "")
@@ -5697,20 +5673,7 @@ class AppCard(CardWidget):
         btn_row.addWidget(self.start_btn, stretch=1)
         self.body_box.addLayout(btn_row)
 
-        # 卸载：独立整行、红色描边实体按钮，醒目但不刺眼
-        self.uninstall_btn = PushButton("卸载此助手")
-        self.uninstall_btn.setFixedHeight(38)
-        self.uninstall_btn.setStyleSheet(
-            "QPushButton { background-color:rgba(255,82,82,0.10); "
-            "color:#ff6b6b; border:1px solid #ff5252; border-radius:8px; "
-            "font-weight:600; } "
-            "QPushButton:hover { background-color:rgba(255,82,82,0.22); "
-            "color:#ff8585; } "
-            "QPushButton:pressed { background-color:rgba(255,82,82,0.35); }"
-        )
-        self.uninstall_btn.setCursor(Qt.PointingHandCursor)
-        self.uninstall_btn.clicked.connect(self.uninstall_app)
-        self.body_box.addWidget(self.uninstall_btn)
+        # 卸载已收进右上角齿轮菜单（_build_card_menu），卡身不再放重复按钮
 
         # 更新按钮：已安装卡片总是显示，根据真实完整版本列表判断"是否有可更新版本"
         self.update_btn = PushButton("检查更新中…")
@@ -6923,7 +6886,7 @@ class AppCard(CardWidget):
             summary += "\n失败（文件可能被占用）：\n"
             for p, label, msg in fail_list:
                 summary += f"  · {label}: {msg}\n        {p}\n"
-            summary += "\n请关闭相关程序后，对失败项可再点一次「卸载此助手」重试。"
+            summary += "\n请关闭相关程序后，对失败项可再点右上角 ⚙ 菜单里的「卸载」重试。"
             QMessageBox.warning(self.window(), "部分完成", summary)
 
         self.rebuild_body()

@@ -89,7 +89,8 @@ if card is not None:
     has_start = hasattr(card, "start_btn")
     has_uninst = hasattr(card, "uninstall_btn")
     chk("有启动按钮", has_start)
-    chk("有卸载按钮", has_uninst)
+    # 卸载已收进右上角齿轮菜单，卡身不再放重复按钮
+    chk("卡身无卸载按钮（收进齿轮菜单）", not has_uninst)
     # 关键：不应出现 whimbox 专用的更新按钮/跑图路线按钮
     chk("没有 whimbox 专用更新按钮", not hasattr(card, "update_btn"))
     chk("没有跑图路线按钮", not hasattr(card, "script_btn"))

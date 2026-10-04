@@ -64,6 +64,13 @@ chk("齿轮 tooltip 是「更多操作」",
 # 2) 菜单构建：3 项 + 启停状态
 # =========================================================
 print("--- 菜单构建 ---")
+
+
+def body_btn_texts(card):
+    """卡身上的普通按钮文本（不含齿轮 TransparentToolButton）。"""
+    return [b.text() for b in card.findChildren(launcher.PushButton)]
+
+
 menu = c._build_card_menu()
 texts = [a.text() for a in menu.actions() if a.text()]
 chk("菜单含「添加桌面快捷方式」", "添加桌面快捷方式" in texts)
@@ -74,6 +81,8 @@ chk("菜单**只有**这三项(不含截图里的其它项)",
 amap = {a.text(): a for a in menu.actions() if a.text()}
 chk("已安装态三项全部可用",
     all(amap[t].isEnabled() for t in amap))
+chk("已安装卡身无重复卸载按钮",
+    "卸载此程序" not in body_btn_texts(c) and "卸载此助手" not in body_btn_texts(c))
 
 c_uninst = card("D:/NOPE/None.exe")   # 必须持有引用：菜单 parent 是卡片，
 menu2 = c_uninst._build_card_menu()   # 卡片被 GC 会连带删掉 C++ 侧菜单对象
