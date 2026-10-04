@@ -1037,6 +1037,71 @@ def _pick_main_exe(dirpath, key=""):
     return os.path.join(dirpath, exes[0])
 
 
+def _download_chunked(url, dest, ctl, timeout=1800, chunk=65536):
+    """分块下载，支持**暂停续传**与**取消**。
+
+    ctl 是控制器（一般是 worker），需提供：
+        is_cancelled() / is_paused() / wait_resume() / on_bytes(done, total)
+
+    续传靠 Range 头：暂停时保留已下部分，继续时带 `Range: bytes=<已下>-` 请求；
+    服务端返回 206 就接着写，返回 200 说明不支持续传（或首次下载）则从头写。
+
+    返回 (status, msg)：
+        done      下载完成
+        paused    被暂停（已下部分保留在 dest，可续传）
+        cancelled 被取消（dest 已删除）
+        error     失败，msg 为原因
+    """
+    try:
+        done = os.path.getsize(dest) if os.path.isfile(dest) else 0
+        headers = {"User-Agent": "OKLauncher/%s" % APP_VERSION}
+        mode = "wb"
+        if done > 0:
+            headers["Range"] = "bytes=%d-" % done
+            mode = "ab"
+
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            # 状态码：某些响应包装/测试替身没有 status/getcode，取不到就按 200 处理
+            # （不能因此抛异常中断下载——这只是"无法判断是否续传"，不是下载失败）
+            try:
+                code = getattr(r, "status", None)
+                if code is None:
+                    code = r.getcode() if hasattr(r, "getcode") else 200
+            except Exception:
+                code = 200
+            try:
+                total = int(r.headers.get("Content-Length") or 0)
+            except Exception:
+                total = 0
+
+            if code == 206:
+                pass                    # 续传，保留已下部分
+            elif code == 200:
+                done = 0                # 不支持 Range 或首次：从头写
+                mode = "wb"
+            else:
+                return ("error", "HTTP %s" % code)
+
+            with open(dest, mode) as f:
+                while True:
+                    if ctl.is_cancelled():
+                        return ("cancelled", "")
+                    if ctl.is_paused():
+                        return ("paused", "")
+                    buf = r.read(chunk)
+                    if not buf:
+                        return ("done", "")
+                    f.write(buf)
+                    done += len(buf)
+                    try:
+                        ctl.on_bytes(done, total)
+                    except Exception:
+                        pass
+    except Exception as e:
+        return ("error", str(e) or "下载失败")
+
+
 def _extract_zip_flat(zip_path, dest, preserve_dirs=None):
     """把 zip 解压到 dest，若包内只有一层顶层目录则**摊平**（不嵌套一层）。
 
@@ -1323,6 +1388,7 @@ class AppInstallerWorker(QThread):
     """
 
     progress = Signal(str)
+    percent = Signal(int)
     done = Signal(str)     # 已安装 exe 的绝对路径
     failed = Signal(str)   # 失败原因（人类可读）
 
@@ -1330,6 +1396,49 @@ class AppInstallerWorker(QThread):
         super().__init__(parent)
         self.app = app
         self.tmp_dir = tmp_dir
+        self._cancelled = False
+        self._paused = False
+        self._last_pct = -1
+
+    def cancel(self):
+        self._cancelled = True
+        self._paused = False
+
+    def pause(self):
+        self._paused = True
+
+    def resume(self):
+        self._paused = False
+
+    def is_cancelled(self):
+        return self._cancelled
+
+    def is_paused(self):
+        return self._paused
+
+    def wait_resume(self):
+        while self._paused and not self._cancelled:
+            time.sleep(0.2)
+
+    def on_bytes(self, done, total):
+        if total:
+            pct = int(done * 100 / total)
+            if pct != self._last_pct:
+                self._last_pct = pct
+                self.percent.emit(pct)
+                self.progress.emit(
+                    "%d%%（%s / %s）" % (pct, _human_size(done), _human_size(total)))
+        else:
+            self.percent.emit(-1)
+            self.progress.emit("已下载 %s" % _human_size(done))
+
+    def _cleanup(self, path):
+        """取消/失败时清掉半截安装包，不留垃圾。"""
+        try:
+            if path and os.path.isfile(path):
+                os.remove(path)
+        except OSError:
+            pass
 
     def run(self):
         repo = INSTALLER_REPO.get(self.app.get("key", ""))
@@ -1351,16 +1460,35 @@ class AppInstallerWorker(QThread):
         save = os.path.join(self.tmp_dir, name or "installer.exe")
 
         self.progress.emit("正在下载安装包…")
-        try:
-            req = urllib.request.Request(
-                url, headers={"User-Agent": "OKLauncher/%s" % APP_VERSION})
-            with urllib.request.urlopen(req, timeout=900) as r:
-                with open(save, "wb") as f:
-                    shutil.copyfileobj(r, f)
-        except Exception as e:
-            self.failed.emit("下载安装包失败：%s" % e)
+        # 下载循环：暂停 → 等 resume 后续传；取消 → 删半截文件并退出
+        while True:
+            st, msg = _download_chunked(url, save, self)
+            if st == "done":
+                break
+            if st == "cancelled":
+                self._cleanup(save)
+                self.failed.emit("已取消")
+                return
+            if st == "paused":
+                self.progress.emit("已暂停（可点「继续」接着下）")
+                self.wait_resume()
+                if self._cancelled:
+                    self._cleanup(save)
+                    self.failed.emit("已取消")
+                    return
+                self.progress.emit("继续下载…")
+                continue
+            self._cleanup(save)
+            self.failed.emit("下载安装包失败：%s" % msg)
             return
 
+        if self._cancelled:
+            self._cleanup(save)
+            self.failed.emit("已取消")
+            return
+
+        # 以下进入官方安装程序（GUI，用户自己点）：暂停/取消不再适用，
+        # 这一步由用户决定，我们只等它结束。
         self.progress.emit("正在启动安装程序，请在弹出窗口里完成安装…")
         try:
             subprocess.Popen([save]).wait()
@@ -1685,13 +1813,58 @@ class ZipAppWorker(QThread):
     免得上游哪天改了 exe 名字就整张卡失效。
     """
 
-    progress = Signal(str)
-    done = Signal(str)      # 装/更到的版本 tag
+    progress = Signal(str)   # 阶段文案
+    percent = Signal(int)    # 下载百分比（没有总长度时发 -1）
+    done = Signal(str)       # 装/更到的版本 tag
     failed = Signal(str)
 
     def __init__(self, app, parent=None):
         super().__init__(parent)
         self.app = app
+        self._cancelled = False
+        self._paused = False
+        self._last_pct = -1
+
+    # ---- 暂停 / 继续 / 取消（供卡片按钮调用）----
+    def cancel(self):
+        self._cancelled = True
+        self._paused = False      # 取消时解除暂停等待，别让线程卡在 sleep 里
+
+    def pause(self):
+        self._paused = True
+
+    def resume(self):
+        self._paused = False
+
+    def is_cancelled(self):
+        return self._cancelled
+
+    def is_paused(self):
+        return self._paused
+
+    def wait_resume(self):
+        while self._paused and not self._cancelled:
+            time.sleep(0.2)
+
+    def on_bytes(self, done, total):
+        if total:
+            pct = int(done * 100 / total)
+            if pct != self._last_pct:
+                self._last_pct = pct
+                self.percent.emit(pct)
+                self.progress.emit(
+                    "%d%%（%s / %s）" % (pct, _human_size(done), _human_size(total)))
+        else:
+            self.percent.emit(-1)
+            self.progress.emit("已下载 %s" % _human_size(done))
+
+    def _cleanup(self, zpath):
+        """取消/失败时清掉半截临时 zip，不留垃圾、不占盘。"""
+        try:
+            if zpath and os.path.isfile(zpath):
+                os.remove(zpath)
+        except OSError:
+            pass
 
     def run(self):
         repo = (self.app.get("release_repo") or "").strip()
@@ -1716,14 +1889,31 @@ class ZipAppWorker(QThread):
 
         zpath = os.path.join(dest, "_update_tmp.zip")
         self.progress.emit("正在下载 %s…" % (name or "安装包"))
-        try:
-            req = urllib.request.Request(
-                url, headers={"User-Agent": "OKLauncher/%s" % APP_VERSION})
-            with urllib.request.urlopen(req, timeout=1800) as r:
-                with open(zpath, "wb") as f:
-                    shutil.copyfileobj(r, f)
-        except Exception as e:
-            self.failed.emit("下载失败：%s" % e)
+        # 下载循环：暂停 → 等 resume 后续传；取消 → 删临时文件并退出
+        while True:
+            st, msg = _download_chunked(url, zpath, self)
+            if st == "done":
+                break
+            if st == "cancelled":
+                self._cleanup(zpath)
+                self.failed.emit("已取消")
+                return
+            if st == "paused":
+                self.progress.emit("已暂停（可点「继续」接着下）")
+                self.wait_resume()
+                if self._cancelled:
+                    self._cleanup(zpath)
+                    self.failed.emit("已取消")
+                    return
+                self.progress.emit("继续下载…")
+                continue
+            self._cleanup(zpath)
+            self.failed.emit("下载失败：%s" % msg)
+            return
+
+        if self._cancelled:
+            self._cleanup(zpath)
+            self.failed.emit("已取消")
             return
 
         self.progress.emit("正在解压到 %s…" % dest)
@@ -4507,6 +4697,17 @@ class AppCard(CardWidget):
         self.install_cancel_btn.clicked.connect(self._on_install_cancel_clicked)
         root.addWidget(self.install_cancel_btn)
 
+        # 暂停/继续：zip 安装包动辄几百 MB，不给暂停用户就只能干等或强杀
+        self.install_pause_btn = PushButton("⏸ 暂停")
+        self.install_pause_btn.setFixedHeight(32)
+        self.install_pause_btn.setStyleSheet(
+            "QPushButton { background-color:#5d4037; color:white; border-radius:6px; "
+            "font-weight:600; } QPushButton:hover { background-color:#4e342e; }"
+        )
+        self.install_pause_btn.setVisible(False)
+        self.install_pause_btn.clicked.connect(self._on_install_pause_clicked)
+        root.addWidget(self.install_pause_btn)
+
         root.addStretch(1)
 
         self._timer = QTimer(self)
@@ -4788,30 +4989,37 @@ class AppCard(CardWidget):
                 self._installer_worker.isRunning():
             return
         self.install_btn.setEnabled(False)
-        self.install_bar.setVisible(True)
+        self._show_install_progress_ui("正在准备…")
+        if hasattr(self, "install_bar"):
+            self.install_bar.setVisible(False)
         self.install_btn.setText("正在准备…")
         if self.app.get("release_repo") and not _git_repo_dir(self.app):
             w = ZipAppWorker(self.app, parent=self)
             w.progress.connect(self._on_installer_progress)
+            w.percent.connect(self._on_installer_percent)
             w.done.connect(self._on_zip_done)
             w.failed.connect(self._on_installer_failed)
         else:
             w = AppInstallerWorker(
                 self.app, os.path.join(LAUNCHER_DIR, "_install_tmp"), parent=self)
             w.progress.connect(self._on_installer_progress)
+            w.percent.connect(self._on_installer_percent)
             w.done.connect(self._on_installer_done)
             w.failed.connect(self._on_installer_failed)
         self._installer_worker = w
         w.start()
 
     def _on_installer_progress(self, text):
-        if hasattr(self, "install_btn") and text:
+        if not text:
+            return
+        if hasattr(self, "install_btn"):
             self.install_btn.setText(text)
+        if hasattr(self, "install_status"):
+            self.install_status.setText(text)
 
     def _on_installer_done(self, exe_path):
         self._installer_worker = None
-        if hasattr(self, "install_bar"):
-            self.install_bar.setVisible(False)
+        self._hide_install_progress_ui()
         # 装到的位置未必等于 config 预置路径 → 写回，否则下次启动又变「未安装」
         self.app["exe"] = exe_path
         _save_app_exe(self.app.get("key", ""), exe_path)
@@ -4826,8 +5034,7 @@ class AppCard(CardWidget):
     def _on_zip_done(self, tag):
         """zip 安装/更新完成：exe 与版本号已由 worker 写回 config，这里只重建卡片。"""
         self._installer_worker = None
-        if hasattr(self, "install_bar"):
-            self.install_bar.setVisible(False)
+        self._hide_install_progress_ui()
         self.rebuild_body()
         try:
             InfoBar.success("安装完成", "已安装 %s" % (tag or "最新版本"),
@@ -4838,8 +5045,7 @@ class AppCard(CardWidget):
 
     def _on_installer_failed(self, msg):
         self._installer_worker = None
-        if hasattr(self, "install_bar"):
-            self.install_bar.setVisible(False)
+        self._hide_install_progress_ui()
         if hasattr(self, "install_btn"):
             self.install_btn.setEnabled(True)
             self.install_btn.setText("安装")
@@ -5178,8 +5384,10 @@ class AppCard(CardWidget):
 
         self.gen_update_btn.setEnabled(False)
         self.gen_update_btn.setText("更新中…")
+        # 更新同样要下载几百 MB，用带百分比/暂停/取消的那套进度 UI
+        self._show_install_progress_ui("准备更新…")
         if hasattr(self, "gen_update_bar"):
-            self.gen_update_bar.setVisible(True)
+            self.gen_update_bar.setVisible(False)
 
         # 更新路线与检查路线必须一致：git 仓库走 pull，zip 发布走下载解压
         if _git_repo_dir(self.app):
@@ -5190,19 +5398,23 @@ class AppCard(CardWidget):
         else:
             w = ZipAppWorker(self.app, parent=self)
             w.progress.connect(self._on_generic_update_progress)
+            w.percent.connect(self._on_installer_percent)
             w.done.connect(self._on_zip_done)
             w.failed.connect(self._on_generic_update_failed)
         self._gen_update_worker = w
         w.start()
 
     def _on_generic_update_progress(self, text):
-        if hasattr(self, "gen_update_bar") and text:
+        if not text:
+            return
+        if hasattr(self, "gen_update_btn"):
             self.gen_update_btn.setText(text)
+        if hasattr(self, "install_status"):
+            self.install_status.setText(text)
 
     def _on_generic_update_done(self, new_tag):
         self._gen_update_worker = None
-        if hasattr(self, "gen_update_bar"):
-            self.gen_update_bar.setVisible(False)
+        self._hide_install_progress_ui()
         # 重新读版本并刷新整张卡（检查状态也要重置，否则按钮停在“有新版本”）
         self._gen_check_started = False
         self._gen_has_update = False
@@ -5218,11 +5430,11 @@ class AppCard(CardWidget):
 
     def _on_generic_update_failed(self, msg):
         self._gen_update_worker = None
-        if hasattr(self, "gen_update_bar"):
-            self.gen_update_bar.setVisible(False)
-        self.gen_update_btn.setEnabled(True)
-        self.gen_update_btn.setText("更新失败，点击重试")
-        self._gen_retry = True
+        self._hide_install_progress_ui()
+        if hasattr(self, "gen_update_btn"):
+            self.gen_update_btn.setEnabled(True)
+            self.gen_update_btn.setText("更新失败，点击重试")
+            self._gen_retry = True
         QMessageBox.warning(self, "更新失败", msg)
 
     # ===== lite 更新：exe 版本资源 + GitHub Releases latest =====
@@ -7036,12 +7248,15 @@ class AppCard(CardWidget):
         点 install_btn 时守卫看到旧 worker 还活着就 return,用户感觉按钮坏了。
         同时增加 wait(800) 强等线程退出,守卫不会被"isRunning()==True 但马上要退"的状态骗到。
         """
-        w = getattr(self, "_install_worker", None)
+        # 两条下载路线用了两个不同的引用名：ok-script 的老 InstallWorker 存在
+        # _install_worker，新加的 zip/官方安装包 worker 存在 _installer_worker。
+        # 只认一个的话，新路线点取消会**毫无反应**（按钮在，但没人接）。
+        w = getattr(self, "_install_worker", None) or \
+            getattr(self, "_installer_worker", None) or \
+            getattr(self, "_gen_update_worker", None)
         if w is None:
-            self._ilog("取消点击：无运行中 worker，直接隐藏进度 UI")
             self._hide_install_progress_ui()
             return
-        self._ilog("用户点击取消，通知 worker 停止")
         try:
             w.cancel()
         except Exception:
@@ -7060,7 +7275,8 @@ class AppCard(CardWidget):
         except Exception:
             pass
         self._install_worker = None
-        self._ilog("取消完成：worker 引用已清空，进度 UI 已隐藏")
+        self._installer_worker = None
+        self._gen_update_worker = None
         self._hide_install_progress_ui()
         self.rebuild_body()
 
@@ -7076,12 +7292,57 @@ class AppCard(CardWidget):
             self.install_status.setVisible(False)
             self.install_status.setText("")
             self.install_cancel_btn.setVisible(False)
+            self.install_pause_btn.setVisible(False)
+            self.install_pause_btn.setText("⏸ 暂停")
         except Exception:
             pass
         for _b_name in ("install_btn", "rescan_btn"):
             _b = getattr(self, _b_name, None)
             if _b is not None:
                 _b.setEnabled(True)
+
+    def _show_install_progress_ui(self, text=""):
+        """显示安装进度四件套：进度条 / 状态 / 暂停 / 取消。
+
+        新加的 zip 与官方安装包两条下载路线都走这个，跟 ok-script 那条共用同一套控件，
+        免得各写一套、状态不一致。
+        """
+        try:
+            self.install_progress.setVisible(True)
+            self.install_progress.setValue(0)
+            self.install_status.setVisible(True)
+            self.install_status.setText(text or "准备中…")
+            self.install_pause_btn.setVisible(True)
+            self.install_pause_btn.setText("⏸ 暂停")
+            self.install_cancel_btn.setVisible(True)
+        except Exception:
+            pass
+
+    def _on_install_pause_clicked(self):
+        """暂停 / 继续切换。只有支持暂停的 worker 才响应。"""
+        w = getattr(self, "_installer_worker", None)
+        if w is None or not hasattr(w, "pause"):
+            return
+        try:
+            if getattr(w, "_paused", False):
+                w.resume()
+                self.install_pause_btn.setText("⏸ 暂停")
+            else:
+                w.pause()
+                self.install_pause_btn.setText("▶ 继续")
+        except Exception:
+            pass
+
+    def _on_installer_percent(self, pct):
+        if hasattr(self, "install_progress"):
+            try:
+                if pct is None or pct < 0:
+                    self.install_progress.setRange(0, 0)   # 未知总长 → 转圈
+                else:
+                    self.install_progress.setRange(0, 100)
+                    self.install_progress.setValue(max(0, min(100, int(pct))))
+            except Exception:
+                pass
 
     # ===== 动作：打开原版管理窗口（唯一会改配置的入口，由原启动器自己处理） =====
     def open_manager(self):
