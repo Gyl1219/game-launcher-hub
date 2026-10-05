@@ -12,6 +12,7 @@ import json
 import shutil
 import tempfile
 import time
+import unittest.mock as mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, r"D:\OKApps\launcher")
@@ -149,6 +150,34 @@ chk("预约卡没有安装按钮", not hasattr(rc, "install_btn"))
 rc2 = launcher.ReservedCard(res[0], votes=0, voted=True)
 chk("已投过的按钮置灰", rc2.vote_btn.isEnabled() is False
     and rc2.vote_btn.text() == "已想要")
+
+# ===== 遥测：投票匿名汇总（默认必须一条都不发）=====
+sent = []
+with mock.patch.object(launcher, "_telemetry_post",
+                       side_effect=lambda p: sent.append(p)):
+    launcher.record_wish("tele-off")
+chk("未开遥测时投票一条都不发", len(sent) == 0)
+
+with mock.patch.object(launcher, "telemetry_ping_enabled", lambda: True), \
+        mock.patch.object(launcher, "_telemetry_post",
+                          side_effect=lambda p: sent.append(p)):
+    launcher.record_wish("res-2")
+chk("开启遥测后投票会上报", len(sent) == 1)
+chk("上报内容是 wish 事件 + 助手 key",
+    sent and sent[0].get("kind") == "wish" and sent[0].get("key") == "res-2")
+chk("上报不带本机路径等隐私字段",
+    sent and set(sent[0]) <= {"v", "app", "version", "anon_id", "kind", "key", "ts"})
+
+_ok = True
+with mock.patch.object(launcher, "telemetry_ping_enabled", lambda: True), \
+        mock.patch.object(launcher, "_telemetry_post",
+                          side_effect=OSError("network down")):
+    try:
+        launcher.record_wish("res-2")
+    except Exception:
+        _ok = False
+chk("上报失败静默，不影响本地计数", _ok
+    and launcher._wish_counts().get("res-2") == 3)
 
 # ===== 总览页集成 =====
 page = launcher.OverviewPage(live, cards, reserved=res)

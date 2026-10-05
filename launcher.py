@@ -1794,6 +1794,25 @@ def report_ping():
         pass
 
 
+def report_wish(key):
+    """「我想要」投票的匿名上报：只有助手 key + 匿名 ID，不带任何本机信息。
+
+    与 report_ping 同属"统计类"，因此跟 ping 走同一个开关（telemetry.ping）：
+    用户没开统计就**一条都不发**，绝不偷偷上报。失败静默，不阻塞点击。
+    """
+    try:
+        if not telemetry_ping_enabled():
+            return
+        _telemetry_post({
+            "v": 1, "app": "game-launcher-hub", "version": APP_VERSION,
+            "anon_id": _anon_id(), "kind": "wish",
+            "key": str(key)[:64],
+            "ts": int(time.time()),
+        })
+    except Exception:
+        pass
+
+
 def install_excepthook():
     """接管未捕获异常：写本地日志 + （若启用）匿名上报，然后仍走默认行为。"""
     def _hook(etype, value, tb):
@@ -8449,6 +8468,11 @@ def record_wish(key):
     voted = _load_json(_wish_voted_path())
     voted[key] = True
     _save_json(_wish_voted_path(), voted)
+    # 匿名汇总给开发者当适配优先级参考；没开遥测就是空操作
+    try:
+        report_wish(key)
+    except Exception:
+        pass
 
 
 def _wish_counts():
@@ -8858,8 +8882,10 @@ class ReservedSection(QWidget):
 
         note = CaptionLabel(
             "说明：这些助手尚未完成适配，暂不提供下载安装。点「我想要」可投票，"
-            "票数高的优先安排适配。MirrorChyan 的依赖组件（MaaFramework、dotnet10 等）"
-            "是其他助手的运行依赖而非独立应用，故未列入。")
+            "票数高的优先安排适配。左边的数字只统计本机点击；若在设置页开启了遥测，"
+            "投票还会匿名汇总给开发者（只含助手名与随机匿名 ID，不含任何本机信息）。"
+            "MirrorChyan 的依赖组件（MaaFramework、dotnet10 等）是其他助手的运行依赖"
+            "而非独立应用，故未列入。")
         note.setWordWrap(True)
         root.addWidget(note)
 
