@@ -54,7 +54,7 @@ from qfluentwidgets import (
     setTheme, Theme, CardWidget, IconWidget, StrongBodyLabel,
     CaptionLabel, PushButton, ComboBox, FluentIcon, IndeterminateProgressBar,
     LineEdit, InfoBar, InfoBarPosition, RoundMenu, Action,
-    TransparentToolButton,
+    TransparentToolButton, SearchLineEdit,
 )
 
 
@@ -151,35 +151,66 @@ def load_apps():
         raise RuntimeError(f"读取配置文件失败: {cfg_path} ({e})")
 
     root = cfg.get("install_root", "D:/OKApps").replace("/", os.sep)
+
+    # 预约条目单独放 config.reserved.json：数量大（几十条）且字段简单，
+    # 混进 config.json 会把真正的本机配置淹没。缺文件就是没有预约条目，不报错。
+    reserved_cfg = os.path.join(LAUNCHER_DIR, "config.reserved.json")
+    raw_apps = list(cfg.get("apps", []))
+    try:
+        if os.path.isfile(reserved_cfg):
+            with open(reserved_cfg, "r", encoding="utf-8") as rf:
+                raw_apps += list((json.load(rf) or {}).get("apps", []))
+    except Exception:
+        pass
+
     apps = []
-    for a in cfg.get("apps", []):
+    for a in raw_apps:
+        if not (a.get("key") or "").strip():
+            # 没有 key 的条目后面到处按 key 索引，直接丢掉比炸掉强
+            continue
+
         def absify(p):
             if not p:
                 return ""
             if os.path.isabs(p):
                 return p
             return os.path.join(root, p.replace("/", os.sep))
+
         app = dict(a)
         app["install_root"] = root
-        app["exe"] = absify(a.get("exe", ""))
-        app["app_json"] = absify(a.get("app_json", ""))
-        app["working"] = absify(a.get("working", ""))
-        app["pythonw"] = absify(a.get("pythonw", ""))
-        # icon：先用配置路径解析，文件不存在则回退到启动器自带 assets 目录下的同名文件
-        # （注意：图标是跟启动器打包走的，始终在 ASSETS_DIR，不应依赖 install_root 下的 assets）
-        icon = a.get("icon", "")
-        if icon:
-            cand = absify(icon) if (os.path.isabs(icon) or "/" in icon) else \
-                os.path.join(ASSETS_DIR, icon)
-            app["icon"] = cand if os.path.isfile(cand) else \
-                os.path.join(ASSETS_DIR, f"{a.get('key', 'app')}.png")
+        # display 缺失会在 AppCard 里直接下标访问炸掉，兜底成 key
+        app["display"] = (a.get("display") or "").strip() or a["key"]
+
+        if a.get("reserved"):
+            # 预约条目：没有本地安装路径；图标跟启动器走（不依赖 install_root）
+            app["exe"] = app["app_json"] = app["working"] = app["pythonw"] = ""
+            ic = (a.get("icon") or "").strip()
+            app["icon"] = ic if os.path.isabs(ic) else (
+                os.path.join(LAUNCHER_DIR, ic.replace("/", os.sep)) if ic else "")
         else:
-            app["icon"] = os.path.join(ASSETS_DIR, f"{a.get('key', 'app')}.png")
+            app["exe"] = absify(a.get("exe", ""))
+            app["app_json"] = absify(a.get("app_json", ""))
+            app["working"] = absify(a.get("working", ""))
+            app["pythonw"] = absify(a.get("pythonw", ""))
+            # icon：先用配置路径解析，文件不存在则回退到启动器自带 assets 目录下的同名文件
+            # （注意：图标是跟启动器打包走的，始终在 ASSETS_DIR，不应依赖 install_root 下的 assets）
+            icon = a.get("icon", "")
+            if icon:
+                cand = absify(icon) if (os.path.isabs(icon) or "/" in icon) else \
+                    os.path.join(ASSETS_DIR, icon)
+                app["icon"] = cand if os.path.isfile(cand) else \
+                    os.path.join(ASSETS_DIR, f"{a.get('key', 'app')}.png")
+            else:
+                app["icon"] = os.path.join(ASSETS_DIR, f"{a.get('key', 'app')}.png")
         apps.append(app)
     return apps
 
 
 APPS = load_apps()
+# 正式（能装能跑）与预约（只展示、不提供安装）分开：
+# 预约条目不建 AppCard、不进侧栏、不参与 5 秒轮询与游戏扫描，避免几十条空转拖慢界面。
+LIVE_APPS = [a for a in APPS if not a.get("reserved")]
+RESERVED_APPS = [a for a in APPS if a.get("reserved")]
 
 
 def ver_key(v):
@@ -5105,8 +5136,9 @@ class AppCard(CardWidget):
     def _build_card_menu(self):
         """齿轮下拉菜单。测试友好：只构建不 exec（exec 是模态，会阻塞无人值守测试）。"""
         menu = RoundMenu(parent=self)
-        inst = bool(getattr(self, "_installed", False))
-        exe = self.app.get("exe", "") or ""
+        reserved = bool(self.app.get("reserved", False))
+        inst = bool(getattr(self, "_installed", False)) and not reserved
+        exe = ("") if reserved else (self.app.get("exe", "") or "")
 
         a_add = Action(FluentIcon.LINK, "添加桌面快捷方式")
         a_add.triggered.connect(self._create_desktop_shortcut)
@@ -6539,6 +6571,7 @@ class AppCard(CardWidget):
             # 在 QStackedWidget 隐藏页上恒 False，不能用于跨页判断）
             has_update = self.badge.text().startswith("可更新")
         return {
+            "reserved": bool(self.app.get("reserved", False)),
             "installed": bool(getattr(self, "_installed", False)),
             "host_ready": bool(getattr(self, "_host_ready", False)),
             "version": self.ver_tag.text() or "未知",
@@ -7090,6 +7123,17 @@ class AppCard(CardWidget):
     # ===== 动作：启动（直接跑游戏助手本体，这是启动器的本职） =====
     def launch_app(self):
         app = self.app
+        # 预约中的助手没有安装实体，启动一律拒绝（避免弹「找不到程序」这种误导报错）
+        if app.get("reserved"):
+            try:
+                site = (app.get("website") or "").strip()
+                if site:
+                    QDesktopServices.openUrl(QUrl(site))
+                else:
+                    QMessageBox.information(self, "预约中", "该助手尚在适配，敬请期待。")
+            except Exception:
+                pass
+            return
         # 启动计数（「我的使用」榜的数据源）：纯本地统计，失败静默，绝不影响启动
         try:
             record_launch(app.get("key", ""))
@@ -7154,6 +7198,9 @@ class AppCard(CardWidget):
             pass
 
     def install_app(self):
+        # 预约中的助手不提供安装：宁可什么都不做，也不要弹「未配置一键安装」误导人
+        if self.app.get("reserved"):
+            return
         if getattr(self, "_installed", False):
             return
         # 防重复触发：已有安装任务在跑则直接返回。
@@ -8075,6 +8122,10 @@ def build_banner_slides(apps, cards, max_slides=6):
     slides = []
     for app in apps:
         key = app.get("key", "")
+        # 预约条目没有卡片、也不能安装：必须跳过，否则会被下面的「未安装」分支
+        # 判成「尚未安装 / 去安装」，还会把启动器自身那条挤出 max_slides
+        if app.get("reserved"):
+            continue
         card = cards.get(key)
         if card is None:
             continue
@@ -8377,6 +8428,37 @@ def record_launch(key):
     _save_json(_launch_counts_path(), counts)
 
 
+def _wish_counts_path():
+    return os.path.join(_cache_dir(), "wish_counts.json")
+
+
+def _wish_voted_path():
+    return os.path.join(_cache_dir(), "wish_voted.json")
+
+
+def record_wish(key):
+    """「我想要」计数 +1，并记住本机已投过（避免一个人反复刷票）。"""
+    if not key:
+        return
+    counts = _load_json(_wish_counts_path())
+    try:
+        counts[key] = int(counts.get(key, 0)) + 1
+    except Exception:
+        counts[key] = 1
+    _save_json(_wish_counts_path(), counts)
+    voted = _load_json(_wish_voted_path())
+    voted[key] = True
+    _save_json(_wish_voted_path(), voted)
+
+
+def _wish_counts():
+    return _load_json(_wish_counts_path())
+
+
+def _wish_voted():
+    return _load_json(_wish_voted_path())
+
+
 def _parse_last_page(link_header):
     """从 GitHub 分页响应的 Link 头取最后一页页码（per_page=1 时即总条数）。
 
@@ -8606,20 +8688,216 @@ class RankRail(QWidget):
         self.board_usage.set_rows(rows, "启动任意助手后出现")
 
 
+_ECOSYSTEM_LABEL = {
+    "ok-script": "ok-script 系",
+    "maa": "MAA 系",
+    "standalone": "独立客户端",
+    "tool": "通用工具",
+}
+
+_ECOSYSTEM_ORDER = ["ok-script", "maa", "standalone", "tool"]
+
+_BLOCK_COLORS = ["#185FA5", "#0F6E56", "#854F0B", "#534AB7", "#993C1D"]
+
+
+def _clear_layout(lay):
+    """递归清空布局（含嵌套布局里的 widget），用于筛选后重建。"""
+    while lay.count():
+        it = lay.takeAt(0)
+        w = it.widget()
+        if w is not None:
+            w.deleteLater()
+        elif it.layout() is not None:
+            _clear_layout(it.layout())
+
+
+class ReservedCard(CardWidget):
+    """预约条目卡片：只有「我想要 +1」和「官网」，没有任何安装 / 启动入口。"""
+
+    def __init__(self, app, votes=0, voted=False, on_vote=None):
+        super().__init__()
+        self.app = app
+        self._on_vote = on_vote
+        key = app.get("key", "")
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 10, 12, 10)
+        root.setSpacing(6)
+
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        head.addWidget(self._icon_label(app))
+        nm = StrongBodyLabel(app.get("display", key))
+        nm.setStyleSheet("font-size:13px; font-weight:600;")
+        head.addWidget(nm, stretch=1)
+        root.addLayout(head)
+
+        sub_txt = " · ".join([x for x in (app.get("game", ""),
+                                          _ECOSYSTEM_LABEL.get(app.get("ecosystem", ""), ""))
+                              if x])
+        sub = CaptionLabel(sub_txt or "适配中")
+        sub.setWordWrap(True)
+        root.addWidget(sub)
+
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        self.vote_btn = PushButton("已想要" if voted else "我想要 +1")
+        self.vote_btn.setFixedHeight(28)
+        self.vote_btn.setEnabled(not voted)
+        self.vote_btn.setCursor(Qt.PointingHandCursor)
+        self.vote_btn.clicked.connect(lambda: self._vote())
+        row.addWidget(self.vote_btn)
+        row.addWidget(CaptionLabel("%d 人想要" % votes))
+        row.addStretch(1)
+        site = (app.get("website") or "").strip()
+        if site:
+            site_btn = PushButton("官网")
+            site_btn.setFixedHeight(28)
+            site_btn.setCursor(Qt.PointingHandCursor)
+            site_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(site)))
+            row.addWidget(site_btn)
+        root.addLayout(row)
+
+    def _vote(self):
+        key = self.app.get("key", "")
+        try:
+            record_wish(key)
+        except Exception:
+            pass
+        self.vote_btn.setText("已想要")
+        self.vote_btn.setEnabled(False)
+        if self._on_vote is not None:
+            self._on_vote(key)
+
+    def _icon_label(self, app):
+        lab = QLabel()
+        lab.setFixedSize(32, 32)
+        lab.setAlignment(Qt.AlignCenter)
+        p = (app.get("icon") or "")
+        try:
+            if p and os.path.exists(p):
+                lab.setPixmap(QPixmap(p).scaled(
+                    32, 32, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                return lab
+        except Exception:
+            pass
+        # 没有图标时按 key 取色画首字色块（十来个站点取不到图的兜底）
+        name = app.get("display", "") or app.get("key", "")
+        idx = sum(ord(c) for c in (app.get("key", "") or "x")) % len(_BLOCK_COLORS)
+        lab.setText(name[:1])
+        lab.setStyleSheet(
+            "background-color:%s; color:#ffffff; border-radius:8px; "
+            "font-weight:600;" % _BLOCK_COLORS[idx])
+        return lab
+
+
+class ReservedSection(QWidget):
+    """主页下方的「预约中」分区：搜索 + 按生态分组 + 3 列轻量卡。
+
+    默认按「我想要」票数降序——有人要的排前面，正好拿来当适配优先级。
+    """
+
+    def __init__(self, apps, parent=None):
+        super().__init__(parent)
+        self._apps = list(apps or [])
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(10)
+
+        self.title = StrongBodyLabel("")
+        self.title.setStyleSheet("font-size:15px; font-weight:600;")
+        root.addWidget(self.title)
+
+        self.search = SearchLineEdit()
+        self.search.setPlaceholderText("搜索预约中的助手（名称 / 游戏 / 生态）")
+        self.search.setFixedWidth(340)
+        self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(self.rebuild)
+        root.addWidget(self.search)
+
+        self.groups_box = QVBoxLayout()
+        self.groups_box.setSpacing(10)
+        root.addLayout(self.groups_box)
+
+        note = CaptionLabel(
+            "说明：这些助手尚未完成适配，暂不提供下载安装。点「我想要」可投票，"
+            "票数高的优先安排适配。MirrorChyan 的依赖组件（MaaFramework、dotnet10 等）"
+            "是其他助手的运行依赖而非独立应用，故未列入。")
+        note.setWordWrap(True)
+        root.addWidget(note)
+
+        self.rebuild()
+
+    def rebuild(self):
+        _clear_layout(self.groups_box)
+        q = (self.search.text() or "").strip().lower()
+        items = [a for a in self._sorted() if self._match(a, q)]
+        self.title.setText("预约中 · 适配中，敬请期待（%d）" % len(items))
+        if not items:
+            self.groups_box.addWidget(CaptionLabel("没有匹配的助手"))
+            return
+        counts, voted = _wish_counts(), _wish_voted()
+        for eco in _ECOSYSTEM_ORDER:
+            group = [a for a in items
+                     if (a.get("ecosystem") or "standalone") == eco]
+            if not group:
+                continue
+            h = CaptionLabel(_ECOSYSTEM_LABEL.get(eco, eco))
+            h.setStyleSheet("font-weight:600;")
+            self.groups_box.addWidget(h)
+            grid = QGridLayout()
+            grid.setSpacing(10)
+            for i, a in enumerate(group):
+                key = a.get("key", "")
+                grid.addWidget(ReservedCard(
+                    a, int(counts.get(key, 0) or 0),
+                    bool(voted.get(key)), on_vote=lambda _k: None),
+                    i // 3, i % 3)
+            wrap = QWidget()
+            wrap.setLayout(grid)
+            self.groups_box.addWidget(wrap)
+
+    def _sorted(self):
+        counts = _wish_counts()
+        return sorted(
+            self._apps,
+            key=lambda a: (-int(counts.get(a.get("key", ""), 0) or 0),
+                           a.get("display", "")))
+
+    def _match(self, a, q):
+        if not q:
+            return True
+        hay = " ".join([a.get("display", ""), a.get("game", ""),
+                        a.get("ecosystem", ""), a.get("key", "")]).lower()
+        return q in hay
+
+
 class OverviewPage(QWidget):
-    """总览页：顶部横幅轮播 + 轻量状态卡的网格 + 扫描按钮。"""
+    """总览页：横幅轮播 + 榜单 + 正式助手卡片网格 + 下方预约区（整页可滚动）。"""
 
     sig_open_detail = Signal(str)
 
-    def __init__(self, apps, cards, on_scan=None):
+    def __init__(self, apps, cards, on_scan=None, reserved=None):
         super().__init__()
         self._apps = apps
         self._cards = cards
+        self._reserved = list(reserved or [])
         self.overview_cards = []
 
-        root = QVBoxLayout(self)
+        # 整页放进滚动区：预约条目有几十条，不下滑就看不到，不能让页面无限长
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea{border:none; background:transparent;}")
+        inner = QWidget()
+        outer.addWidget(scroll)
+        root = QVBoxLayout(inner)
         root.setContentsMargins(28, 22, 28, 22)
         root.setSpacing(16)
+        scroll.setWidget(inner)
 
         top = QHBoxLayout()
         hint = CaptionLabel(
@@ -8659,6 +8937,13 @@ class OverviewPage(QWidget):
             self.overview_cards.append(oc)
             grid.addWidget(oc, i // 3, i % 3)
         root.addLayout(grid)
+
+        # 下方的预约区：只展示、投票，不提供安装
+        if self._reserved:
+            self.reserved_section = ReservedSection(self._reserved)
+            root.addSpacing(8)
+            root.addWidget(self.reserved_section)
+
         root.addStretch(1)
 
         self._timer = QTimer(self)
@@ -9076,7 +9361,8 @@ class Launcher(QWidget):
         root.setSpacing(0)
 
         # ===== 左侧固定侧栏 =====
-        self.sidebar = SideBar(APPS)
+        # 只列正式助手：预约条目没有安装/运行语义，不该占侧栏（否则几十条撑爆侧栏）
+        self.sidebar = SideBar(LIVE_APPS)
         root.addWidget(self.sidebar)
 
         # ===== 右侧堆叠内容区 =====
@@ -9085,17 +9371,20 @@ class Launcher(QWidget):
         self.stack = QStackedWidget()
         self._page_index = {}
 
-        # 1) 先建好三张 AppCard（总览页要引用它们读状态，必须早于总览页创建）
+        # 1) 先建好各张 AppCard（总览页要引用它们读状态，必须早于总览页创建）
+        #    只给正式助手建卡：预约条目建卡会被 5 秒轮询 / 游戏扫描反复空转拖慢界面
         self.cards = {}  # key -> AppCard（游戏本体扫描结果回调要用）
         game_pages = []
-        for app in APPS:
+        for app in LIVE_APPS:
             key = app.get("key", "")
             card = AppCard(app)
             self.cards[key] = card
             game_pages.append((key, card))
 
-        # 2) 总览页（依赖 self.cards）
-        self.overview_page = OverviewPage(APPS, self.cards, on_scan=self.run_game_scan)
+        # 2) 总览页（依赖 self.cards）：正式助手走卡片网格，预约条目走下方预约区
+        self.overview_page = OverviewPage(
+            LIVE_APPS, self.cards, on_scan=self.run_game_scan,
+            reserved=RESERVED_APPS)
         self.overview_page.sig_open_detail.connect(self.switch_to)
 
         # 3) 设置页

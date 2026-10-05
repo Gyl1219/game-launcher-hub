@@ -1,5 +1,6 @@
 {
   "_comment": "示例配置。使用方式：复制本文件为 config.json，然后把 install_root 改成你本机的实际安装根目录（需全英文路径），各 app 的相对路径一般不用动。",
+  "_comment_reserved": "尚未完成适配的助手不写进 apps，而是统一放在同目录的 config.reserved.json，条目带 \"reserved\": true。这类条目只展示、不提供下载安装（主页下方「预约中」区，可投「我想要」），不建卡片、不进侧栏、不参与轮询。完成适配后：把条目挪进本文件的 apps 并去掉 reserved、补好 exe（或 generic + release_repo/asset_glob），ok-script 系还要在代码 InstallWorker.REPOS 里登记 key，界面无需改动。",
   "install_root": "D:/OKApps",
   "mirrorchyan_cdk": "",
   "_comment_mirrorchyan_res_ids": "可选。各项目在 Mirror酱(mirrorchyan.com) 的资源 ID(rid)。填了且 CDK 有效，下载时会自动把 Mirror酱 加速直链加入候选源并参与测速；没填就只用万载云/GitHub。rid 需向 Mirror酱 官方获取，注意它未必等于 key（如鸣潮 key=ok-ww 但 rid=okww）。ok-script 系三个已有内置默认值，此处填写可覆盖。",
