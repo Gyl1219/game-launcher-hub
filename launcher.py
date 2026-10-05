@@ -48,7 +48,7 @@ from PySide6.QtGui import QIcon, QPixmap, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QWidget, QDialog, QHBoxLayout, QVBoxLayout, QGridLayout,
     QMessageBox, QLabel, QScrollArea, QTextEdit, QProgressBar, QProgressDialog,
-    QStackedWidget, QCheckBox, QFileDialog,
+    QStackedWidget, QCheckBox, QFileDialog, QPushButton,
 )
 from qfluentwidgets import (
     setTheme, Theme, CardWidget, IconWidget, StrongBodyLabel,
@@ -8013,13 +8013,311 @@ class OverviewCard(CardWidget):
         QTimer.singleShot(800, self.refresh)
 
 
+# ===== 总览页顶部：信息横幅轮播 =====
+#
+# 内容全部来自本地已算好的状态（AppCard.snapshot / changelog_text / APP_VERSION），
+# 不发任何网络请求，所以断网、GitHub 抽风、加载失败都不会影响主页展示。
+# 配色统一用「低透明度主色做底 + 主题色文字控件」，因为启动器是 Theme.AUTO，
+# 跟随系统深浅主题，写死亮色底会在深色主题下把文字吃掉。
+
+_SLIDE_PALETTES = [
+    ("rgba(24,95,165,0.12)", "#185FA5"),
+    ("rgba(15,110,86,0.12)", "#0F6E56"),
+    ("rgba(133,79,11,0.12)", "#854F0B"),
+    ("rgba(83,74,183,0.12)", "#534AB7"),
+    ("rgba(153,60,29,0.12)", "#993C1D"),
+]
+
+_RELEASES_URL = "https://github.com/Gyl1219/game-launcher-hub/releases"
+
+
+def _banner_newer_version(badge_text):
+    """从徽章文案「可更新 v3.6.4」里取出目标版本号；不是可更新态则返回空串。"""
+    t = (badge_text or "").strip()
+    if not t.startswith("可更新"):
+        return ""
+    return t.replace("可更新", "", 1).strip()
+
+
+def _banner_changelog_headline(card, target_ver):
+    """从卡片已缓存的更新说明里取首行要点，取不到返回空串。
+
+    changelog_text 的格式是「【vX.Y.Z】\\n正文」。只有标签与目标版本一致时才采信，
+    否则会把别的版本的说明张冠李戴——卡片当前展示的那个版本未必是最新可更新的。
+    """
+    try:
+        text = card.changelog_text.toPlainText()
+    except Exception:
+        return ""
+    if not text or not text.startswith("【"):
+        return ""
+    head, _, body = text.partition("\n")
+    tag = head.strip("【】").strip()
+    if not target_ver or not tag or tag not in target_ver:
+        return ""
+    for line in (body or "").splitlines():
+        line = line.strip()
+        if line:
+            return line[:60]
+    return ""
+
+
+def build_banner_slides(apps, cards, max_slides=6):
+    """按本地状态构造轮播条目：可更新 > 未安装 > 启动器自身发版。
+
+    只读已算好的状态、不发网络请求。启动器自身那条恒在，保证永远有内容可展示。
+    """
+    slides = []
+    for app in apps:
+        key = app.get("key", "")
+        card = cards.get(key)
+        if card is None:
+            continue
+        try:
+            snap = card.snapshot()
+        except Exception:
+            continue
+        name = app.get("display", key)
+        if snap.get("has_update"):
+            ver = _banner_newer_version(snap.get("badge", ""))
+            slides.append({
+                "key": key, "name": name, "icon": app.get("icon", ""),
+                "title": ("可更新到 %s" % ver) if ver else "有新版本可用",
+                "summary": (_banner_changelog_headline(card, ver)
+                            or "有更新可用，前往详情页查看完整更新说明。"),
+                "action": "去更新", "target": key, "url": "",
+            })
+        elif not snap.get("installed") and not snap.get("host_ready"):
+            slides.append({
+                "key": key, "name": name, "icon": app.get("icon", ""),
+                "title": "尚未安装",
+                "summary": "可在详情页一键安装，下载支持暂停与取消。",
+                "action": "去安装", "target": key, "url": "",
+            })
+    slides.append({
+        "key": "__self__", "name": "启动器自身", "icon": "",
+        "title": "v%s 已发布" % APP_VERSION,
+        "summary": "下载支持暂停续传与取消，修复 416 越界；exe 免安装可用。",
+        "action": "看 Release", "target": "", "url": _RELEASES_URL,
+    })
+    return slides[:max_slides]
+
+
+class _BannerSlide(QWidget):
+    """单张横幅：图标 + 名称 / 大字标题 / 一句要点 / 操作按钮。整块可点。"""
+
+    def __init__(self, data, palette, on_activate):
+        super().__init__()
+        self._on_activate = on_activate
+        bg, accent = palette
+        self.setStyleSheet("QWidget{background-color:%s;border-radius:8px;}" % bg)
+        self.setCursor(Qt.PointingHandCursor)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 14, 18, 14)
+        lay.setSpacing(6)
+
+        head = QHBoxLayout()
+        head.setSpacing(10)
+        head.addWidget(self._icon(data, accent))
+        nm = StrongBodyLabel(data.get("name", ""))
+        nm.setStyleSheet("font-size:14px; font-weight:600;")
+        head.addWidget(nm)
+        head.addStretch(1)
+        lay.addLayout(head)
+
+        t = StrongBodyLabel(data.get("title", ""))
+        t.setStyleSheet("font-size:16px; font-weight:600;")
+        lay.addWidget(t)
+
+        s = CaptionLabel(data.get("summary", ""))
+        s.setWordWrap(True)
+        lay.addWidget(s)
+        lay.addStretch(1)
+
+        row = QHBoxLayout()
+        btn = PushButton(data.get("action", "查看"))
+        btn.setFixedHeight(30)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.clicked.connect(self._activate)
+        row.addWidget(btn)
+        row.addStretch(1)
+        lay.addLayout(row)
+
+    def _icon(self, data, accent):
+        lab = QLabel()
+        lab.setFixedSize(38, 38)
+        lab.setAlignment(Qt.AlignCenter)
+        rel = (data.get("icon") or "")
+        p = rel if os.path.isabs(rel) else os.path.join(LAUNCHER_DIR, rel)
+        try:
+            if p and os.path.exists(p):
+                lab.setPixmap(QPixmap(p).scaled(
+                    38, 38, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                lab.setStyleSheet("background:transparent;")
+                return lab
+        except Exception:
+            pass
+        lab.setText((data.get("name", "") or "?")[:2])
+        lab.setStyleSheet(
+            "background-color:%s; color:#ffffff; border-radius:8px; "
+            "font-weight:600;" % accent)
+        return lab
+
+    def _activate(self):
+        if self._on_activate is not None:
+            self._on_activate()
+
+    def mouseReleaseEvent(self, e):
+        self._activate()
+        super().mouseReleaseEvent(e)
+
+
+class BannerCarousel(QWidget):
+    """横幅轮播容器：自动播放、悬停暂停、圆点与箭头切换。
+
+    只在条目内容**真的变化**时才重建（按 key+title+summary 签名比对），否则总览页
+    每 5 秒刷新会把轮播位置和计时器不断重置，视觉上永远停在第一张。
+    """
+
+    sig_open_detail = Signal(str)
+
+    INTERVAL_MS = 6000
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._slides = []
+        self._dots = []
+        self._index = 0
+        self._hovered = False
+        self._signature = None
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(8)
+
+        self.stack = QStackedWidget()
+        self.stack.setMinimumHeight(150)
+        root.addWidget(self.stack, stretch=1)
+
+        bar = QHBoxLayout()
+        bar.setSpacing(8)
+        self.dots_box = QHBoxLayout()
+        self.dots_box.setSpacing(6)
+        bar.addLayout(self.dots_box)
+        bar.addStretch(1)
+        self.prev_btn = PushButton("‹")
+        self.next_btn = PushButton("›")
+        for b in (self.prev_btn, self.next_btn):
+            b.setFixedSize(28, 28)
+            b.setCursor(Qt.PointingHandCursor)
+        self.prev_btn.clicked.connect(lambda: self._go(self._index - 1))
+        self.next_btn.clicked.connect(lambda: self._go(self._index + 1))
+        bar.addWidget(self.prev_btn)
+        bar.addWidget(self.next_btn)
+        root.addLayout(bar)
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._auto_next)
+        self.timer.start(self.INTERVAL_MS)
+        self.setVisible(False)
+
+    def set_slides(self, slides):
+        """设置条目。内容没变则原样返回 False（避免无谓重建）。"""
+        sig = tuple((s.get("key", ""), s.get("title", ""), s.get("summary", ""))
+                    for s in slides)
+        if sig == self._signature:
+            return False
+        self._signature = sig
+        self._slides = list(slides)
+        self._rebuild()
+        return True
+
+    def _rebuild(self):
+        while self.stack.count():
+            w = self.stack.widget(0)
+            self.stack.removeWidget(w)
+            w.deleteLater()
+        while self.dots_box.count():
+            it = self.dots_box.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.deleteLater()
+        self._dots = []
+        if not self._slides:
+            self.setVisible(False)
+            self.timer.stop()
+            return
+        for i, data in enumerate(self._slides):
+            pal = _SLIDE_PALETTES[i % len(_SLIDE_PALETTES)]
+            self.stack.addWidget(
+                _BannerSlide(data, pal, lambda d=data: self._activate(d)))
+            dot = QPushButton("")
+            dot.setFixedSize(8, 8)
+            dot.setCursor(Qt.PointingHandCursor)
+            dot.clicked.connect(lambda _=False, k=i: self._go(k))
+            self.dots_box.addWidget(dot)
+            self._dots.append(dot)
+        if self._index >= len(self._slides):
+            self._index = 0
+        self.stack.setCurrentIndex(self._index)
+        self._update_dots()
+        self.setVisible(True)
+        if not self.timer.isActive():
+            self.timer.start(self.INTERVAL_MS)
+
+    def _go(self, idx):
+        if not self._slides:
+            return
+        self._index = idx % len(self._slides)
+        self.stack.setCurrentIndex(self._index)
+        self._update_dots()
+        if self.timer.isActive():
+            self.timer.start(self.INTERVAL_MS)
+
+    def _auto_next(self):
+        if self._hovered or not self._slides:
+            return
+        self._go(self._index + 1)
+
+    def _update_dots(self):
+        accent = _SLIDE_PALETTES[self._index % len(_SLIDE_PALETTES)][1]
+        for i, d in enumerate(self._dots):
+            on = (i == self._index)
+            d.setStyleSheet(
+                "QPushButton{background-color:%s; border:none; border-radius:4px;}"
+                % (accent if on else "rgba(128,128,128,0.35)"))
+
+    def _activate(self, data):
+        url = (data.get("url") or "").strip()
+        if url:
+            try:
+                QDesktopServices.openUrl(QUrl(url))
+            except Exception:
+                pass
+            return
+        target = (data.get("target") or "").strip()
+        if target:
+            self.sig_open_detail.emit(target)
+
+    def enterEvent(self, e):
+        self._hovered = True
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self._hovered = False
+        super().leaveEvent(e)
+
+
 class OverviewPage(QWidget):
-    """总览页：三张轻量状态卡的网格 + 顶部扫描按钮。"""
+    """总览页：顶部横幅轮播 + 轻量状态卡的网格 + 扫描按钮。"""
 
     sig_open_detail = Signal(str)
 
     def __init__(self, apps, cards, on_scan=None):
         super().__init__()
+        self._apps = apps
+        self._cards = cards
         self.overview_cards = []
 
         root = QVBoxLayout(self)
@@ -8041,6 +8339,12 @@ class OverviewPage(QWidget):
         top.addWidget(self.scan_btn)
         root.addLayout(top)
 
+        # 横幅轮播：内容来自本地状态，无内容时整体隐藏（不占版面）
+        self.carousel = BannerCarousel()
+        self.carousel.sig_open_detail.connect(self.sig_open_detail)
+        root.addWidget(self.carousel)
+        self._refresh_banner()
+
         grid = QGridLayout()
         grid.setSpacing(16)
         for i, app in enumerate(apps):
@@ -8058,9 +8362,17 @@ class OverviewPage(QWidget):
         self._timer.timeout.connect(self.refresh)
         self._timer.start(5000)
 
+    def _refresh_banner(self):
+        try:
+            self.carousel.set_slides(build_banner_slides(self._apps, self._cards))
+        except Exception:
+            # 轮播是锦上添花，任何异常都不能拖垮总览页
+            pass
+
     def refresh(self):
         for oc in self.overview_cards:
             oc.refresh()
+        self._refresh_banner()
 
 
 class SettingsPage(QWidget):
