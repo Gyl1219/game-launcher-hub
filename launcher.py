@@ -8699,6 +8699,26 @@ _ECOSYSTEM_ORDER = ["ok-script", "maa", "standalone", "tool"]
 
 _BLOCK_COLORS = ["#185FA5", "#0F6E56", "#854F0B", "#534AB7", "#993C1D"]
 
+# 图标缩放结果缓存：预约区每次筛选重建都要重新画几十个图标，
+# 不缓存的话光是 QPixmap 缩放就要白花上百毫秒。
+_ICON_CACHE = {}
+
+
+def _cached_pixmap(path, size=32):
+    """按 (路径, 尺寸) 缓存缩放后的 QPixmap，缺失文件返回 None。"""
+    key = (path, size)
+    if key in _ICON_CACHE:
+        return _ICON_CACHE[key]
+    pm = None
+    try:
+        if path and os.path.exists(path):
+            pm = QPixmap(path).scaled(
+                size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    except Exception:
+        pm = None
+    _ICON_CACHE[key] = pm
+    return pm
+
 
 def _clear_layout(lay):
     """递归清空布局（含嵌套布局里的 widget），用于筛选后重建。"""
@@ -8711,11 +8731,21 @@ def _clear_layout(lay):
             _clear_layout(it.layout())
 
 
-class ReservedCard(CardWidget):
-    """预约条目卡片：只有「我想要 +1」和「官网」，没有任何安装 / 启动入口。"""
+class ReservedCard(QWidget):
+    """预约条目卡片：只有「我想要 +1」和「官网」，没有任何安装 / 启动入口。
+
+    刻意**不用 qfluentwidgets 的 CardWidget**：那玩意儿带阴影自绘，几十张一起
+    滚动时重绘开销明显；这里用朴素 QWidget + 半透明底，深浅主题通用且便宜。
+    """
+
+    PAGE = None  # 占位，避免误用
 
     def __init__(self, app, votes=0, voted=False, on_vote=None):
         super().__init__()
+        self.setObjectName("reservedCard")
+        self.setStyleSheet(
+            "QWidget#reservedCard{background-color:rgba(128,128,128,0.10);"
+            "border-radius:8px;}")
         self.app = app
         self._on_vote = on_vote
         key = app.get("key", "")
@@ -8774,13 +8804,10 @@ class ReservedCard(CardWidget):
         lab.setFixedSize(32, 32)
         lab.setAlignment(Qt.AlignCenter)
         p = (app.get("icon") or "")
-        try:
-            if p and os.path.exists(p):
-                lab.setPixmap(QPixmap(p).scaled(
-                    32, 32, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-                return lab
-        except Exception:
-            pass
+        pm = _cached_pixmap(p, 32)
+        if pm is not None:
+            lab.setPixmap(pm)
+            return lab
         # 没有图标时按 key 取色画首字色块（十来个站点取不到图的兜底）
         name = app.get("display", "") or app.get("key", "")
         idx = sum(ord(c) for c in (app.get("key", "") or "x")) % len(_BLOCK_COLORS)
@@ -8797,9 +8824,13 @@ class ReservedSection(QWidget):
     默认按「我想要」票数降序——有人要的排前面，正好拿来当适配优先级。
     """
 
+    PAGE_SIZE = 24          # 首屏只渲染这么多，剩下的点「显示更多」再建，避免一次几百个 widget
+    SEARCH_DELAY_MS = 300   # 搜索防抖：否则每敲一个字都重建全部卡片（实测 0.6s/次）
+
     def __init__(self, apps, parent=None):
         super().__init__(parent)
         self._apps = list(apps or [])
+        self._page = self.PAGE_SIZE
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -8813,7 +8844,12 @@ class ReservedSection(QWidget):
         self.search.setPlaceholderText("搜索预约中的助手（名称 / 游戏 / 生态）")
         self.search.setFixedWidth(340)
         self.search.setClearButtonEnabled(True)
-        self.search.textChanged.connect(self.rebuild)
+        # 搜索防抖：输入过程中每敲一个字都重建会明显卡顿，停手 300ms 再重建
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(self.SEARCH_DELAY_MS)
+        self._search_timer.timeout.connect(self.rebuild)
+        self.search.textChanged.connect(self._schedule_rebuild)
         root.addWidget(self.search)
 
         self.groups_box = QVBoxLayout()
@@ -8829,6 +8865,15 @@ class ReservedSection(QWidget):
 
         self.rebuild()
 
+    def _schedule_rebuild(self):
+        """输入后重置分页并防抖重建（每敲一个字都全量重建会卡）。"""
+        self._page = self.PAGE_SIZE
+        self._search_timer.start()
+
+    def _show_more(self):
+        self._page += self.PAGE_SIZE
+        self.rebuild()
+
     def rebuild(self):
         _clear_layout(self.groups_box)
         q = (self.search.text() or "").strip().lower()
@@ -8837,9 +8882,10 @@ class ReservedSection(QWidget):
         if not items:
             self.groups_box.addWidget(CaptionLabel("没有匹配的助手"))
             return
+        shown = items[:self._page]
         counts, voted = _wish_counts(), _wish_voted()
         for eco in _ECOSYSTEM_ORDER:
-            group = [a for a in items
+            group = [a for a in shown
                      if (a.get("ecosystem") or "standalone") == eco]
             if not group:
                 continue
@@ -8857,6 +8903,14 @@ class ReservedSection(QWidget):
             wrap = QWidget()
             wrap.setLayout(grid)
             self.groups_box.addWidget(wrap)
+
+        left = len(items) - len(shown)
+        if left > 0:
+            more = PushButton("显示更多（还有 %d 个）" % left)
+            more.setFixedHeight(30)
+            more.setCursor(Qt.PointingHandCursor)
+            more.clicked.connect(self._show_more)
+            self.groups_box.addWidget(more)
 
     def _sorted(self):
         counts = _wish_counts()

@@ -111,11 +111,37 @@ sec = launcher.ReservedSection(res)
 chk("预约区按票数降序（有人要的排前）",
     [a["key"] for a in sec._sorted()] == ["res-1", "res-2"])
 chk("标题显示条目数", "（2）" in sec.title.text())
+# 搜索是防抖的：setText 后不应立刻重建（否则每敲一个字都重建 79 张卡）
 sec.search.setText("预约2")
-chk("搜索过滤生效", "（1）" in sec.title.text())
+chk("搜索防抖：setText 后不立即重建", "（2）" in sec.title.text())
+sec.rebuild()
+chk("手动重建后过滤生效", "（1）" in sec.title.text())
 sec.search.setText("不存在的名字")
+sec.rebuild()
 chk("无匹配时给出提示", "（0）" in sec.title.text())
 sec.search.setText("")
+sec.rebuild()
+
+# 分页：79 条不能一次全建成 widget
+many = [dict(a, key="k%d" % i, display="助手%d" % i) for i in range(30)
+        for a in res[:1]]
+big = launcher.ReservedSection(many)
+qapp.processEvents()   # deleteLater 是延迟删除，先跑一轮事件再数
+shown = sum(1 for w in big.findChildren(launcher.ReservedCard))
+chk("首屏只渲染 PAGE_SIZE 张（分页）", shown == launcher.ReservedSection.PAGE_SIZE)
+chk("总数仍显示在标题里", "（30）" in big.title.text())
+big._show_more()
+qapp.processEvents()
+# 注意：deleteLater 是延迟销毁，findChildren 会同时数到新旧卡片，
+# 所以这里只断言"变多了 + 分页上限提高了"，不断言精确数量（上面那个精确断言才行）
+after = sum(1 for w in big.findChildren(launcher.ReservedCard))
+chk("点「显示更多」后渲染更多", after > shown and big._page == 48)
+
+# 图标缓存
+_p = res[0].get("icon", "")
+if _p and os.path.exists(_p):
+    chk("图标缩放结果被缓存", launcher._cached_pixmap(_p) is launcher._cached_pixmap(_p))
+chk("缺失图标返回 None 不抛异常", launcher._cached_pixmap("不存在的文件.png") is None)
 
 rc = launcher.ReservedCard(res[0], votes=3, voted=False)
 chk("预约卡主按钮是「我想要 +1」", "我想要" in rc.vote_btn.text())
