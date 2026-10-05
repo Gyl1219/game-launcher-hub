@@ -7090,6 +7090,11 @@ class AppCard(CardWidget):
     # ===== 动作：启动（直接跑游戏助手本体，这是启动器的本职） =====
     def launch_app(self):
         app = self.app
+        # 启动计数（「我的使用」榜的数据源）：纯本地统计，失败静默，绝不影响启动
+        try:
+            record_launch(app.get("key", ""))
+        except Exception:
+            pass
         # lite 模式：没有 working/pythonw，直接启动 exe 本体
         if app.get("lite") or app.get("generic"):
             exe = app.get("exe", "") or ""
@@ -8309,6 +8314,298 @@ class BannerCarousel(QWidget):
         super().leaveEvent(e)
 
 
+# ===== 总览页右侧：三个小榜（活跃度 / 星标 / 我的使用） =====
+#
+# 活跃度与星标来自 GitHub API（后台线程 + 本地缓存 + 失败回退）：拉不到就显示
+# 「暂无数据」，绝不弹窗报错、更不能拖慢主页加载。我的使用是纯本地启动计数，零网络。
+
+_GITHUB_REPOS = {
+    "ok-nte": "BnanZ0/ok-nte",
+    "ok-ww": "ok-oldking/ok-wuthering-waves",
+    "ok-end-field": "AliceJump/ok-end-field",
+    "whimbox": "nikkigallery/Whimbox",
+    "onedragon-zzz": "OneDragon-Anything/ZenlessZoneZero-OneDragon",
+    "maa-end": "MaaEnd/MaaEnd",
+}
+
+_STATS_TTL_SEC = 6 * 3600        # 成功数据 6 小时内直接用缓存
+_STATS_RETRY_SEC = 30 * 60       # 失败后至少隔 30 分钟才重试，避免每次开主页都打网络
+
+
+def _cache_dir():
+    return os.path.join(LAUNCHER_DIR, ".cache")
+
+
+def _launch_counts_path():
+    return os.path.join(_cache_dir(), "launch_counts.json")
+
+
+def _github_stats_path():
+    return os.path.join(_cache_dir(), "github_stats.json")
+
+
+def _load_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_json(path, data):
+    """先写临时文件再原子替换，避免写一半被读到的脏数据。"""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def record_launch(key):
+    """启动计数 +1 并落盘。纯本地统计，任何失败都静默——不能影响启动本身。"""
+    if not key:
+        return
+    counts = _load_json(_launch_counts_path())
+    try:
+        counts[key] = int(counts.get(key, 0)) + 1
+    except Exception:
+        counts[key] = 1
+    _save_json(_launch_counts_path(), counts)
+
+
+def _parse_last_page(link_header):
+    """从 GitHub 分页响应的 Link 头取最后一页页码（per_page=1 时即总条数）。
+
+    形如 `<...?page=2>; rel="next", <...?page=37>; rel="last"` → 37；
+    没有_last 关系（结果不足一页）→ None，调用方按响应数组长度计。
+    """
+    if not link_header:
+        return None
+    m = re.search(r'[?&]page=(\d+)>;\s*rel="last"', link_header)
+    return int(m.group(1)) if m else None
+
+
+def _github_fetch(url, timeout=8):
+    """GET 一个 GitHub API 地址，返回 (status, headers, body_bytes)。
+
+    status 取不到（响应包装 / 测试替身没有该属性）按 200 处理，与 _download_chunked
+    的容错思路一致。
+    """
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "OKLauncher/%s" % APP_VERSION,
+        "Accept": "application/vnd.github+json",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        code = getattr(r, "status", None) or r.getcode() or 200
+        return code, r.headers, r.read()
+
+
+class GitHubStatsWorker(QThread):
+    """后台拉取各上游仓库的 star 数与近 30 天提交数。
+
+    - 单仓失败不影响其他仓：成功的合并进缓存，失败的保留旧值
+    - fetched_at 只在拿到新数据时更新；attempted_at 每次尝试都更新，
+      用于「失败后 30 分钟内不反复重试」
+    - 提交数用 per_page=1 + Link 头的 last 页码，一次请求拿到窗口内总数
+    """
+
+    done = Signal(dict)
+
+    def run(self):
+        from datetime import datetime, timedelta, timezone
+        now = time.time()
+        cache = _load_json(_github_stats_path())
+        repos = dict(cache.get("repos") or {})
+        fetched_at = float(cache.get("fetched_at") or 0)
+        attempted_at = float(cache.get("attempted_at") or 0)
+        if now - fetched_at < _STATS_TTL_SEC:
+            self.done.emit(repos)
+            return
+        if now - attempted_at < _STATS_RETRY_SEC:
+            self.done.emit(repos)
+            return
+        since = (datetime.now(timezone.utc) - timedelta(days=30)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        any_ok = False
+        for key, repo in _GITHUB_REPOS.items():
+            stars = commits = None
+            try:
+                code, _h, body = _github_fetch(
+                    "https://api.github.com/repos/%s" % repo)
+                if code == 200:
+                    stars = int(json.loads(
+                        body.decode("utf-8")).get("stargazers_count") or 0)
+            except Exception:
+                pass
+            try:
+                code, headers, body = _github_fetch(
+                    "https://api.github.com/repos/%s/commits?since=%s&per_page=1"
+                    % (repo, since))
+                if code == 200:
+                    last = _parse_last_page(headers.get("Link") or "")
+                    if last is None:
+                        arr = json.loads(body.decode("utf-8"))
+                        commits = len(arr) if isinstance(arr, list) else 0
+                    else:
+                        commits = last
+            except Exception:
+                pass
+            if stars is not None or commits is not None:
+                any_ok = True
+                prev = repos.get(key) or {}
+                repos[key] = {
+                    "stars": stars if stars is not None else prev.get("stars"),
+                    "commits30d": (commits if commits is not None
+                                   else prev.get("commits30d")),
+                }
+        if any_ok:
+            fetched_at = now
+        _save_json(_github_stats_path(), {
+            "repos": repos, "fetched_at": fetched_at, "attempted_at": now})
+        self.done.emit(repos)
+
+
+class RankBoard(QWidget):
+    """一个小榜：标题行（点击展开/收起）+ Top3 或全部行。"""
+
+    def __init__(self, title, subtitle, apps_by_key, parent=None):
+        super().__init__(parent)
+        self._apps_by_key = apps_by_key   # key -> (显示名, 图标相对路径)
+        self._expanded = False
+        self._rows = []                   # [(key, 名称, 图标, 指标文案)]
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 8, 10, 8)
+        root.setSpacing(4)
+
+        head = QHBoxLayout()
+        head.setSpacing(4)
+        t = CaptionLabel(title)
+        t.setStyleSheet("font-weight:600;")
+        head.addWidget(t)
+        sub = CaptionLabel(subtitle)
+        head.addWidget(sub)
+        head.addStretch(1)
+        root.addLayout(head)
+
+        self.rows_box = QVBoxLayout()
+        self.rows_box.setSpacing(3)
+        root.addLayout(self.rows_box)
+
+        self.empty_lbl = CaptionLabel("暂无数据")
+        self.empty_lbl.setVisible(False)
+        root.addWidget(self.empty_lbl)
+
+    def set_rows(self, rows, placeholder="暂无数据"):
+        """rows: [(key, 指标文案)]，调用方排好序；空列表显示占位文案。"""
+        self._rows = []
+        for key, metric in rows:
+            name, icon = self._apps_by_key.get(key, (key, ""))
+            self._rows.append((key, name, icon, metric))
+        self._render(placeholder)
+
+    def _render(self, placeholder="暂无数据"):
+        while self.rows_box.count():
+            it = self.rows_box.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.deleteLater()
+        shown = self._rows if self._expanded else self._rows[:3]
+        if not shown:
+            self.empty_lbl.setText(placeholder)
+            self.empty_lbl.setVisible(True)
+            return
+        self.empty_lbl.setVisible(False)
+        medals = ("#BA7517", "#888780", "#993C1D")
+        for i, (key, name, icon, metric) in enumerate(shown):
+            row = QWidget()
+            h = QHBoxLayout(row)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(6)
+            rank = QLabel(str(i + 1))
+            rank.setFixedWidth(12)
+            if i < 3:
+                rank.setStyleSheet("color:%s; font-weight:600;" % medals[i])
+            h.addWidget(rank)
+            ic = QLabel()
+            ic.setFixedSize(18, 18)
+            ic.setAlignment(Qt.AlignCenter)
+            p = icon if os.path.isabs(icon) else (
+                os.path.join(LAUNCHER_DIR, icon) if icon else "")
+            try:
+                if p and os.path.exists(p):
+                    ic.setPixmap(QPixmap(p).scaled(
+                        18, 18, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            except Exception:
+                pass
+            h.addWidget(ic)
+            h.addWidget(CaptionLabel(name), stretch=1)
+            h.addWidget(CaptionLabel(metric))
+            self.rows_box.addWidget(row)
+
+    def mouseReleaseEvent(self, e):
+        # 点标题展开/收起（Top3 <-> 全部）
+        self._expanded = not self._expanded
+        self._render()
+        super().mouseReleaseEvent(e)
+
+
+class RankRail(QWidget):
+    """右栏三个小榜的竖排容器：活跃度 / 星标 / 我的使用。"""
+
+    def __init__(self, apps, parent=None):
+        super().__init__(parent)
+        self._apps_by_key = {}
+        for a in apps:
+            k = a.get("key", "")
+            if k:
+                self._apps_by_key[k] = (a.get("display", k), a.get("icon", ""))
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(10)
+        self.board_activity = RankBoard("活跃度", "近30天提交", self._apps_by_key)
+        self.board_stars = RankBoard("星标数", "社区体量", self._apps_by_key)
+        self.board_usage = RankBoard("我的使用", "本机启动", self._apps_by_key)
+        for b in (self.board_activity, self.board_stars, self.board_usage):
+            root.addWidget(b)
+        root.addStretch(1)
+        self.set_github({})
+        self.refresh_usage()
+
+    def set_github(self, repos):
+        """repos: key -> {"stars": n, "commits30d": n}；缺 key / 缺字段都容忍。"""
+        act, stars = [], []
+        for key, info in (repos or {}).items():
+            if key not in self._apps_by_key or not isinstance(info, dict):
+                continue
+            c, s = info.get("commits30d"), info.get("stars")
+            if isinstance(c, int):
+                act.append((key, str(c)))
+            if isinstance(s, int):
+                stars.append((key, str(s)))
+        act.sort(key=lambda x: -int(x[1]))
+        stars.sort(key=lambda x: -int(x[1]))
+        ph = "网络受限，暂无数据"
+        self.board_activity.set_rows(act, ph)
+        self.board_stars.set_rows(stars, ph)
+
+    def refresh_usage(self):
+        counts = _load_json(_launch_counts_path())
+        items = [(k, int(v)) for k, v in (counts or {}).items()
+                 if k in self._apps_by_key]
+        try:
+            items.sort(key=lambda x: -x[1])
+        except Exception:
+            pass
+        rows = [(k, "%d 次" % v) for k, v in items]
+        self.board_usage.set_rows(rows, "启动任意助手后出现")
+
+
 class OverviewPage(QWidget):
     """总览页：顶部横幅轮播 + 轻量状态卡的网格 + 扫描按钮。"""
 
@@ -8339,11 +8636,17 @@ class OverviewPage(QWidget):
         top.addWidget(self.scan_btn)
         root.addLayout(top)
 
-        # 横幅轮播：内容来自本地状态，无内容时整体隐藏（不占版面）
+        # 顶部一排：左轮播（2/3）+ 右三个小榜（1/3）；榜单失败只显示「暂无数据」
+        top_row = QHBoxLayout()
+        top_row.setSpacing(16)
         self.carousel = BannerCarousel()
         self.carousel.sig_open_detail.connect(self.sig_open_detail)
-        root.addWidget(self.carousel)
+        top_row.addWidget(self.carousel, stretch=5)
+        self.rank_rail = RankRail(apps)
+        top_row.addWidget(self.rank_rail, stretch=2)
+        root.addLayout(top_row)
         self._refresh_banner()
+        self._start_stats_worker()
 
         grid = QGridLayout()
         grid.setSpacing(16)
@@ -8369,10 +8672,39 @@ class OverviewPage(QWidget):
             # 轮播是锦上添花，任何异常都不能拖垮总览页
             pass
 
+    def _start_stats_worker(self):
+        """先用缓存立即渲染，过期/失败超时才后台拉新——主页加载永远不等网络。"""
+        try:
+            cache = _load_json(_github_stats_path())
+            now = time.time()
+            repos = cache.get("repos") or {}
+            if repos:
+                self.rank_rail.set_github(repos)
+            fresh = now - float(cache.get("fetched_at") or 0) < _STATS_TTL_SEC
+            recent_fail = (now - float(cache.get("attempted_at") or 0)
+                           < _STATS_RETRY_SEC)
+            if not fresh and not recent_fail:
+                self._stats_worker = GitHubStatsWorker()
+                self._stats_worker.done.connect(self._on_stats_done)
+                self._stats_worker.start()
+        except Exception:
+            pass
+
+    def _on_stats_done(self, repos):
+        try:
+            self.rank_rail.set_github(repos or {})
+        except Exception:
+            pass
+
     def refresh(self):
         for oc in self.overview_cards:
             oc.refresh()
         self._refresh_banner()
+        # 启动计数是纯本地文件读取，跟 5 秒轮询一起刷即可
+        try:
+            self.rank_rail.refresh_usage()
+        except Exception:
+            pass
 
 
 class SettingsPage(QWidget):
