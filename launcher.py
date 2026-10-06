@@ -43,7 +43,7 @@ import zipfile
 import shutil
 import time
 
-from PySide6.QtCore import Qt, QTimer, QThread, Signal, QUrl, QPoint
+from PySide6.QtCore import Qt, QTimer, QThread, Signal, QUrl, QPoint, QEvent, QObject
 from PySide6.QtGui import QIcon, QPixmap, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QWidget, QDialog, QHBoxLayout, QVBoxLayout, QGridLayout,
@@ -66,7 +66,7 @@ from qfluentwidgets import (
 
 # 启动器自身版本（打包版 / 源码版共用）。发新版时只改这一处，
 # 显示在「设置」页页脚，便于报 bug 时说清自己在跑哪个版本。
-APP_VERSION = "0.3.0"
+APP_VERSION = "1.0.0"
 
 # ===== 应用配置（从 config.json 加载，避免硬编码路径） =====
 # 打包后（PyInstaller）两个目录必须分开算，否则图标全找不到：
@@ -463,6 +463,47 @@ def calculate_update_notes(update_notes, current_version, target_version):
         else:
             notes.append(str(raw))
     return notes
+
+
+# ---- 有界并发队列：限制同时跑的 GitVersionFetcher 数量 ----
+# 借鉴 tubatools 的 SemaphoreSlim(ProcessorCount >= 4 ? 8 : 4)：6 张卡在启动时
+# 各自起一个 git 线程会瞬间吃满磁盘 IO 与 CPU，叠加到建页流程上就是启动脉冲。
+# 这里上限取 4（本项目每卡只有一次轻量本地 git 调用），多余的排队等空位。
+_GIT_MAX_CONCURRENCY = 4
+_GIT_ACTIVE = 0
+_GIT_QUEUE = []
+
+
+def _git_pump():
+    """尽量把队列里的 worker 放进空闲槽位（有空位就启动一个）。"""
+    global _GIT_ACTIVE
+    while _GIT_QUEUE and _GIT_ACTIVE < _GIT_MAX_CONCURRENCY:
+        w = _GIT_QUEUE.pop(0)
+        if w is None:
+            continue
+        try:
+            if w.isRunning():
+                continue
+            _GIT_ACTIVE += 1
+            w.start()
+        except Exception:
+            _GIT_ACTIVE = max(0, _GIT_ACTIVE - 1)
+
+
+def _git_start_bounded(worker):
+    """有界并发地启动一个 GitVersionFetcher，槽位满则排队。"""
+    global _GIT_ACTIVE
+    if worker is None:
+        return
+
+    def _release(*_args):
+        global _GIT_ACTIVE
+        _GIT_ACTIVE = max(0, _GIT_ACTIVE - 1)
+        _git_pump()
+
+    worker.finished.connect(_release)
+    _GIT_QUEUE.append(worker)
+    _git_pump()
 
 
 class GitVersionFetcher(QThread):
@@ -3395,10 +3436,40 @@ class ApplyWorker(QThread):
 
 
 # ===== 仅读取的工具函数（不写任何 app 目录） =====
+_APP_JSON_CACHE = {}   # path -> ((st_mtime_ns, st_size), data)
+
+
 def load_app_json(path):
+    """读取助手的 app.json，带 (mtime_ns, size) 感知的缓存。
+
+    轮询链路每 5 秒每张卡都会调用一次，裸 open()+json.load 单次虽小，累积起来
+    就是 tubatools 注释里警告的那类问题（"142 个 exe × 8~9 次 syscall
+    ≈ 1200 次同步 syscall 卡顿"）。这里用文件签名做失效键：文件内容一变就立即
+    重读，语义与原先完全一致（安装/卸载后照样能马上反映），只是省掉了无变化时
+    的重复磁盘读。
+
+    返回浅拷贝：顶层写入不会污染缓存对象。
+    """
+    try:
+        st = os.stat(path)
+        sig = (st.st_mtime_ns, st.st_size)
+    except Exception:
+        _APP_JSON_CACHE.pop(path, None)
+        return {}
+    hit = _APP_JSON_CACHE.get(path)
+    if hit is not None and hit[0] == sig:
+        try:
+            return dict(hit[1])
+        except Exception:
+            return {}
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f) or {}
+    except Exception:
+        return {}
+    _APP_JSON_CACHE[path] = (sig, data)
+    try:
+        return dict(data)
     except Exception:
         return {}
 
@@ -3495,6 +3566,466 @@ def _pyapp_title_key(app):
         return name.lower()
     exe = app.get("exe", "") or ""
     return os.path.basename(exe).lower().removesuffix(".exe")
+
+
+# ==========================================================================
+# 进程存活检测：全局单例扫描器
+# --------------------------------------------------------------------------
+# 【为什么要重写】
+# 原先每张 AppCard 各自持有一个 5 秒 QTimer，回调链路
+#   refresh_data → refresh_badge → _is_process_running
+# 里同步跑两次 tasklist 子进程。N 张卡 = 每 5 秒最多 2N 次子进程创建，且
+# tasklist /V 的「窗口标题」列要靠向每个窗口 SendMessage(WM_GETTEXT) 取得，
+# 对无响应/繁忙窗口该调用不会超时返回 —— 这正是界面「周期性粘滞、数秒后自行
+# 恢复」的根因（旧注释已自认「200 进程会阻塞 2~5 秒」）。
+#
+# 【借鉴 tubatools（图吧工具箱 WinUI3 版）Backend/GameMonitor】
+#   ① 进程/窗口查询一律走 Win32 API 瞬时调用，绝不 spawn tasklist；
+#   ② 先验筛（可见性 / 最小化），再对幸存者做昂贵操作（取窗口标题）；
+#   其 GameMonitorService 每 2 秒轮询一次也不卡，靠的就是这两条。
+#   ③ 扫描放后台线程，结果经信号回主线程消费，UI 线程零阻塞。
+#   它没有照搬其「独立后端进程 + 命名管道」架构 —— 那是 .NET 项目做法，
+#   在 Python 单文件里 Qt 的 queued 信号槽已等价，搞 IPC 属过度设计。
+# ==========================================================================
+
+PROC_SCAN_TTL = 3.0          # 缓存有效期（秒）。必须 < 心跳间隔 5s，保证每次心跳都能取到新值
+PROC_MSG_TIMEOUT_MS = 200    # 单个窗口取标题的硬超时（毫秒），把「可能无限挂」变成有界
+PROC_KEY_TTL = 60.0          # _pyapp_title_key() 结果缓存时长（秒）
+
+# --- Win32 基础声明（模块级一次性绑定，失败则全部降级到 tasklist）---
+_user32 = None
+_kernel32 = None
+_PTR_T = None                # DWORD_PTR / ULONG_PTR：随位数自适应，避免句柄截断
+try:
+    from ctypes import wintypes
+    _user32 = ctypes.WinDLL("user32", use_last_error=True)
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _PTR_T = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
+    # BUG 防线：ctypes 默认把指针当 c_int，64 位上会截断 HWND/HANDLE。
+    # 故所有 Win32 调用必须显式声明 argtypes/restype。
+    _kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    _kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    _kernel32.Process32FirstW.argtypes = [wintypes.HANDLE,
+                                          ctypes.c_void_p]
+    _kernel32.Process32FirstW.restype = wintypes.BOOL
+    _kernel32.Process32NextW.argtypes = [wintypes.HANDLE,
+                                         ctypes.c_void_p]
+    _kernel32.Process32NextW.restype = wintypes.BOOL
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _kernel32.CloseHandle.restype = wintypes.BOOL
+
+    _WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    _user32.EnumWindows.argtypes = [_WNDENUMPROC, wintypes.LPARAM]
+    _user32.EnumWindows.restype = wintypes.BOOL
+    _user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND,
+                                                 ctypes.POINTER(wintypes.DWORD)]
+    _user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    _user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    _user32.IsWindowVisible.restype = wintypes.BOOL
+    _user32.IsIconic.argtypes = [wintypes.HWND]
+    _user32.IsIconic.restype = wintypes.BOOL
+    _user32.SendMessageTimeoutW.argtypes = [wintypes.HWND, wintypes.UINT, _PTR_T,
+                                            _PTR_T, wintypes.UINT, wintypes.UINT,
+                                            ctypes.POINTER(_PTR_T)]
+    _user32.SendMessageTimeoutW.restype = _PTR_T
+except Exception:
+    # WinDLL 取不到时全部降级到 tasklist 路径。
+    # 注意：_PTR_T 必须仍给出合法类型，否则下方 _PROCESSENTRY32W 的字段声明
+    # 会因收到 None 而直接抛错，反而让整个模块无法导入。
+    _user32 = None
+    _kernel32 = None
+    try:
+        _PTR_T = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
+    except Exception:
+        _PTR_T = ctypes.c_ulong
+
+_WM_GETTEXT = 0x000D
+_SMTO_ABORTIFHUNG = 0x0002
+_SMTO_BLOCK = 0x0001
+_TH32CS_SNAPPROCESS = 0x00000002
+
+
+def _proc_force_tasklist():
+    """人工降级开关：环境变量 LAUNCHER_PROC_FORCE_TASKLIST=1 时走旧路径。"""
+    return os.environ.get("LAUNCHER_PROC_FORCE_TASKLIST") == "1"
+
+
+class _PROCESSENTRY32W(ctypes.Structure):
+    """PROCESSENTRY32W。注意 th32DefaultHeapID 是 ULONG_PTR，宽度随位数变化。"""
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ProcessID", wintypes.DWORD),
+        ("th32DefaultHeapID", _PTR_T),
+        ("th32ModuleID", wintypes.DWORD),
+        ("cntThreads", wintypes.DWORD),
+        ("th32ParentProcessID", wintypes.DWORD),
+        ("pcPriClassBase", ctypes.c_long),
+        ("dwFlags", wintypes.DWORD),
+        ("szExeFile", ctypes.c_wchar * 260),
+    ]
+
+
+def _win_pid_names():
+    """一次快照枚举全部进程 → {pid(int): 'name.exe'} 小写。纯内存，约 1~3ms。
+
+    失败返回 None（调用方降级到 tasklist）。取代原来的
+    `tasklist /FI "IMAGENAME eq <key>.exe"` —— 后者每个 key 都要 spawn 一次子进程。
+    """
+    if _kernel32 is None or _proc_force_tasklist():
+        return None
+    try:
+        snap = _kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
+        if not snap or snap == ctypes.c_void_p(-1).value:
+            return None
+        try:
+            entry = _PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(entry)
+            ok = _kernel32.Process32FirstW(snap, ctypes.byref(entry))
+            if not ok:
+                return None
+            out = {}
+            while ok:
+                try:
+                    out[int(entry.th32ProcessID)] = (entry.szExeFile or "").lower()
+                except Exception:
+                    pass
+                ok = _kernel32.Process32NextW(snap, ctypes.byref(entry))
+            return out or None
+        finally:
+            try:
+                _kernel32.CloseHandle(snap)
+            except Exception:
+                pass
+    except Exception:
+        return None
+
+
+def _win_titles_for(pids):
+    """取指定 pid 集合的窗口标题 → {pid: title_lower}。
+
+    取代原来的 `tasklist /V /FO CSV` —— 后者对每个窗口 SendMessage(WM_GETTEXT)
+    且不设超时，遇到无响应窗口会一直挂住（旧卡顿的主因）。
+
+    三层过滤（借鉴 tubatools GameMonitorService.DetectForegroundGame）：
+      ① GetWindowThreadProcessId 按 pid 预筛（纯查表，不发任何消息）
+      ② IsWindowVisible / IsIconic 先验筛掉不可见与最小化窗口
+      ③ 仅对幸存者 SendMessageTimeoutW(SMTO_ABORTIFHUNG, 200ms) 取标题
+    """
+    if _user32 is None or not pids:
+        return {}
+    want = set(int(p) for p in pids)
+    hwnds = []
+
+    def _collect(h, _l):
+        try:
+            hwnds.append(h)
+        except Exception:
+            pass
+        return True
+
+    found = {}
+    try:
+        _user32.EnumWindows(_WNDENUMPROC(_collect), 0)
+    except Exception:
+        return {}
+    if not hwnds:
+        return {}
+
+    buf_chars = 512
+    for h in hwnds:
+        try:
+            pid_box = wintypes.DWORD(0)
+            _user32.GetWindowThreadProcessId(h, ctypes.byref(pid_box))
+            pid = int(pid_box.value)
+            if pid not in want:
+                continue
+            # ② 先验筛：不可见 / 已最小化的窗口不必再去要标题
+            if not _user32.IsWindowVisible(h) or _user32.IsIconic(h):
+                continue
+            buf = ctypes.create_unicode_buffer(buf_chars)
+            got = _PTR_T(0)
+            # ③ 带超时+遇挂起立即放弃，最多 200ms/窗口
+            ok = _user32.SendMessageTimeoutW(
+                h, _WM_GETTEXT, buf_chars,
+                ctypes.cast(buf, ctypes.c_void_p).value,
+                _SMTO_ABORTIFHUNG | _SMTO_BLOCK, PROC_MSG_TIMEOUT_MS,
+                ctypes.byref(got))
+            if ok and got.value:
+                title = (buf.value or "").lower()
+                if title:
+                    found.setdefault(pid, title)
+        except Exception:
+            continue
+    return found
+
+
+def _tasklist_fallback_names():
+    """ctypes 不可用时的降级路径：tasklist /FO CSV /NH（**不带 /V**，避免取标题挂起）。
+
+    返回 {pid: name_lower}。保留 GBK 解码——比 PowerShell 的 UTF-16 更稳。
+    """
+    try:
+        import csv as _csv
+        import io as _io
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        out = subprocess.run(
+            ["tasklist", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True,
+            encoding="gbk", errors="replace", creationflags=flags, timeout=10,
+        )
+        names = {}
+        for row in _csv.reader(_io.StringIO(out.stdout or "")):
+            if len(row) >= 2:
+                try:
+                    names[int(row[1].strip('"'))] = row[0].strip('"').lower()
+                except Exception:
+                    continue
+        return names
+    except Exception:
+        return {}
+
+
+def scan_running(keys):
+    """一次调用判定所有 key 是否在跑 → {key: bool}。无子进程、无 Qt 依赖、线程安全。
+
+    判定优先级（与原 _is_process_running 语义保持一致）：
+      ① 进程表里存在 '<key>.exe' 镜像名 → 命中（覆盖 Electron / 独立 exe 的 lite 卡，
+         如 whimbox / onedragon-zzz）
+      ② 否则走 PyAppify 形态：真实进程名是内嵌的 pythonw.exe，按窗口标题含 key 子串判定
+         （异环标题含 "ok-nte"、鸣潮含 "ok-ww" 等）
+    """
+    keys = [k for k in (keys or ()) if k]
+    result = {k: False for k in keys}
+    if not keys:
+        return result
+    try:
+        names = _win_pid_names()
+        if not names:
+            names = _tasklist_fallback_names()
+        if not names:
+            return result
+
+        all_names = set(names.values())
+        rest = []
+        for k in keys:
+            exe_name = k if k.endswith(".exe") else (k + ".exe")
+            if exe_name in all_names:
+                result[k] = True
+            else:
+                rest.append(k)
+        if not rest:
+            return result
+
+        # ② 只在没被 ① 判定的 key 上做窗口标题匹配
+        py_pids = [pid for pid, n in names.items() if n == "pythonw.exe"]
+        if py_pids:
+            titles = _win_titles_for(py_pids)
+            if titles:
+                for k in rest:
+                    for t in titles.values():
+                        if k in t:
+                            result[k] = True
+                            break
+    except Exception:
+        pass
+    return result
+
+
+class ProcScanWorker(QThread):
+    """一次性扫描工作线程。
+
+    【Qt 铁律】run() 里只允许调用纯函数、产出纯 Python 值，**绝不触碰任何
+    QWidget / QPixmap**。结果经 Signal(dict) 跨线程 queued 回到主线程消费。
+    """
+    result = Signal(dict)
+
+    def __init__(self, keys, parent=None):
+        super().__init__(parent)
+        self._keys = list(keys or ())
+
+    def run(self):
+        try:
+            data = scan_running(self._keys) or {}
+        except Exception:
+            data = {}
+        try:
+            self.result.emit(data)
+        except Exception:
+            pass
+
+
+class ProcScanner(QObject):
+    """主线程单例：持有 TTL 缓存并驱动扫描线程。
+
+    所有状态只在主线程读写（register/get/put/request/_on_result），因此无需加锁；
+    scan_running() 是无状态纯函数，被主线程（prime）与工作线程同时调用也安全。
+    """
+    updated = Signal(dict)   # 扫描完成通知，卡片可订阅以立即刷新
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._registry = {}      # key -> bool（既是注册表也是缓存）
+        self._ts = 0.0           # 上次成功采样的 time.time()
+        self._inflight = False
+        self._worker = None
+
+    # ---- 主线程 API ----
+    def register(self, key):
+        """登记关注的 key。幂等，重复调用无副作用。"""
+        if key:
+            self._registry.setdefault(key, False)
+
+    def get(self, key):
+        """读缓存 → (命中?, 是否运行)。TTL 内才算命中。"""
+        if key not in self._registry:
+            return (False, False)
+        fresh = (time.time() - self._ts) < PROC_SCAN_TTL
+        return (fresh, bool(self._registry.get(key)))
+
+    def put(self, key, val):
+        """主线程直接写缓存（prime / 外部已知状态时同步）。"""
+        if key:
+            self._registry[key] = bool(val)
+
+    def invalidate(self):
+        """强制使缓存过期：下一次 get() 会 miss，request() 会立即重扫。
+
+        用于「刚杀掉进程 / 刚启动进程」后立即反映状态，不必等下一个 TTL。
+        """
+        self._ts = 0.0
+
+    def request(self, force=False):
+        """心跳驱动的异步扫描入口。TTL 未过或有任务在飞则直接返回。"""
+        try:
+            if self._inflight:
+                return
+            if not force and (time.time() - self._ts) < PROC_SCAN_TTL:
+                return
+            keys = list(self._registry.keys())
+            if not keys:
+                return
+            self._inflight = True
+            w = ProcScanWorker(keys, self)
+            w.result.connect(self._on_result)
+            w.finished.connect(w.deleteLater)
+            w.finished.connect(self._clear_worker)
+            self._worker = w
+            w.start()
+        except Exception:
+            self._inflight = False
+
+    def prime(self, key):
+        """冷启动 / 强制时在主线程同步快扫一次。
+
+        现在成本约 10~30ms（且有每窗口 200ms 硬上限保护），可接受。冷启动首帧
+        必须有值，否则会在第一个心跳周期里显示错误状态。
+        """
+        try:
+            val = bool((scan_running([key]) or {}).get(key, False))
+        except Exception:
+            val = False
+        self._registry[key] = val
+        self._ts = time.time()   # prime 本身即一次有效采样
+        return val
+
+    # ---- 内部 ----
+    def _clear_worker(self):
+        self._worker = None
+
+    def _on_result(self, data):
+        self._inflight = False
+        try:
+            for k in self._registry.keys():
+                self._registry[k] = bool((data or {}).get(k, False))
+            self._ts = time.time()
+        except Exception:
+            pass
+        try:
+            self.updated.emit(dict(self._registry))
+        except Exception:
+            pass
+
+    def shutdown(self):
+        """退出时调用：避免 "QThread: Destroyed while thread is still running"。"""
+        w = self._worker
+        if w is not None and w.isRunning():
+            try:
+                w.requestInterruption()
+                w.wait(2000)
+            except Exception:
+                pass
+        self._worker = None
+        self._inflight = False
+
+
+_PROC_SCANNER = None
+
+
+def proc_scanner():
+    """全局单例 ProcScanner。"""
+    global _PROC_SCANNER
+    if _PROC_SCANNER is None:
+        _PROC_SCANNER = ProcScanner(QApplication.instance())
+    return _PROC_SCANNER
+
+
+class HeartBeat(QObject):
+    """全局单一心跳，取代 N 张卡片各自相位随机的 5 秒 QTimer。
+
+    收益有两层：
+      ① N 个随机相位 → 1 个确定时刻，卡顿不再随机分布；
+      ② 配合 ProcScanner 的 TTL 缓存，一个心跳周期只触发**一次**扫描
+         （现在是每 5 秒 2N 次 subprocess）。
+    借鉴 tubatools：它也用后台线程 + 固定间隔轮询，只是位于独立后端进程。
+    """
+    tick = Signal()
+    INTERVAL_MS = 5000
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._timer = QTimer(self)
+        self._timer.setInterval(self.INTERVAL_MS)
+        self._timer.timeout.connect(self._on_tick)
+        self._enabled = False
+
+    def set_enabled(self, on):
+        """窗口最小化/切到无关页时暂停轮询，恢复时由调用方 request(force=True)。"""
+        on = bool(on)
+        if on == self._enabled:
+            return
+        self._enabled = on
+        try:
+            if on:
+                self._timer.start()
+            else:
+                self._timer.stop()
+        except Exception:
+            pass
+
+    def start(self):
+        self.set_enabled(True)
+
+    def _on_tick(self):
+        try:
+            proc_scanner().request()
+        except Exception:
+            pass
+        try:
+            self.tick.emit()
+        except Exception:
+            pass
+
+
+_HEARTBEAT = None
+
+
+def heartbeat():
+    """全局单例心跳。"""
+    global _HEARTBEAT
+    if _HEARTBEAT is None:
+        _HEARTBEAT = HeartBeat(QApplication.instance())
+    return _HEARTBEAT
 
 
 def get_current_profile(data):
@@ -4797,11 +5328,26 @@ class AppCard(CardWidget):
         self.install_pause_btn.clicked.connect(self._on_install_pause_clicked)
         root.addWidget(self.install_pause_btn)
 
+        # ===== 社区反馈区（常驻，lite / generic / 标准三种 body 模式共用）=====
+        # 刻意挂在 root 上而不是 body_box 里：body_box 每次 rebuild_body 都会被
+        # 清空重建，而这里的内容来自网络缓存，跟着重建既没必要又会闪。
+        self._build_community_section(root)
+
         root.addStretch(1)
 
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self.refresh_data)
-        self._timer.start(5000)
+        # 轮询改由全局单一心跳驱动。
+        # 原本这里每张卡一个独立 5s QTimer（N 张卡 = N 个随机相位），回调链路里
+        # 同步跑两次 tasklist 子进程 —— 界面「周期性粘滞、数秒后自行恢复」的根因，
+        # 详见「进程存活检测」模块注释。现在：所有卡的刷新对齐到一个确定时刻，
+        # 且一个心跳周期全局只做一次扫描（在后台线程），UI 线程零阻塞。
+        heartbeat().tick.connect(self.refresh_data)
+        self._pyapp_key_val = ""
+        self._pyapp_key_ts = 0.0
+        _k = self._pyapp_key()
+        if _k:
+            proc_scanner().register(_k)
+            # 扫描线程完成后立即刷新，状态延迟从「最多一个心跳」降到毫秒级
+            proc_scanner().updated.connect(self._on_proc_updated)
 
         self.rebuild_body()  # 首次填充
 
@@ -5450,7 +5996,9 @@ class AppCard(CardWidget):
             return
 
         # 更新前必须关掉程序：它运行中是 git 仓库被占用 + 代码正在被使用
-        if self._is_process_running():
+        # force=True：这是「放行还是拦截」的决策点，必须拿此刻真实状态，
+        # 不能读可能过期的缓存（缓存 TTL 3s，误判会让更新写坏运行中的代码）
+        if self._is_process_running(force=True):
             ans = QMessageBox.question(
                 self, "需要先关闭程序",
                 "该程序正在运行，更新会修改它的代码，必须先关闭。\n\n"
@@ -5466,7 +6014,29 @@ class AppCard(CardWidget):
                                capture_output=True, text=True, encoding="gbk",
                                errors="replace",
                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                time.sleep(2)
+                # 原本这里是主线程的 **time.sleep(2)** —— 点一次「更新」必然硬冻结
+                # 整扇窗口 2 秒整（全代码里唯一确定性的秒级卡顿，拖窗口会立刻露馅）。
+                # 改为把后续流程交给 singleShot：等进程退出的这 2 秒里事件循环照常转，
+                # 界面可拖动可响应，到点后由回调接着往下走。
+                self.gen_update_btn.setEnabled(False)
+                self.gen_update_btn.setText("正在关闭程序…")
+                QTimer.singleShot(2000, self._continue_generic_update)
+                return
+
+        # 程序本来就没运行（或无需 taskkill）：直接续跑
+        self._continue_generic_update()
+
+    def _continue_generic_update(self):
+        """taskkill 之后 / 直接放行的通用更新续跑逻辑。
+
+        【为什么拆出来】原先这段紧跟在主线程 time.sleep(2) 后面，点一次「更新」
+        窗口就冻结 2 秒。拆成独立方法后可被 QTimer.singleShot 延后调用，期间
+        Qt 事件循环不会被占住。
+        """
+        try:
+            self.gen_update_btn.setEnabled(True)
+        except Exception:
+            pass
 
         if getattr(self, "_gen_update_worker", None) is not None and \
                 self._gen_update_worker.isRunning():
@@ -6601,54 +7171,449 @@ class AppCard(CardWidget):
             "game_found": getattr(self, "game_found_path", ""),
         }
 
-    def _is_process_running(self):
-        """判定本 app 对应的原启动器是否真实在跑（兜底 app.json.running 不可靠）。
+    def _pyapp_key(self):
+        """取 PyAppify 内部名，带短 TTL 缓存。
 
-        监测目标就是那个 exe 程序本体（如 ok-nte.exe）。判定优先级：
-          1）先看进程表里是否有该 exe 的镜像名（tasklist /FI IMAGENAME）——最直接、最准；
-          2）PyAppify 打包的启动器常以内嵌 pythonw.exe 方式运行（exe 主体藏在 pythonw
-             里，进程表里见不到 ok-nte.exe 镜像名，只见 pythonw.exe），且 PyAppify
-             会把 CommandLine/ExecutablePath 在 wmic 视角下清空（token 降权），无法靠
-             命令行匹配 working 目录。**唯一可靠线索是窗口标题**（tasklist /V CSV 第 9
-             列），异环标题固定含 "ok-nte"、鸣潮含 "ok-ww" 等。tasklist 走纯 cmd、
-             GBK 编码与 encoding="gbk" 完美匹配，不会有 PowerShell 那种 UTF-16/UTF-8
-             编码混乱的坑（曾因 encoding="gbk" 解 PowerShell stdout 抛 UnicodeDecodeError
-             导致整条路径静默 return False 的根因）。
-
-        所有子进程走 CREATE_NO_WINDOW，不弹黑窗。
+        _pyapp_title_key() 内部会走 load_app_json() 读磁盘；原先每 5 秒每张卡都要
+        调它一次，属于白白多出来的磁盘 IO。这里缓存 60 秒 —— app.json 的 name
+        字段几乎不会变（回退到 exe 基名的场景更不会变）。
         """
         try:
-            key = _pyapp_title_key(self.app)  # PyAppify 内部名，如 ok-ef / ok-nte
+            cached = getattr(self, "_pyapp_key_val", "") or ""
+            if cached and (time.time() - getattr(self, "_pyapp_key_ts", 0.0)) < PROC_KEY_TTL:
+                return cached
+            key = _pyapp_title_key(self.app) or ""
+            self._pyapp_key_val = key
+            self._pyapp_key_ts = time.time()
+            return key
+        except Exception:
+            return getattr(self, "_pyapp_key_val", "") or ""
+
+    def _on_proc_updated(self, _snapshot=None):
+        """扫描线程产出结果后立刻刷新，使运行态不必等到下一个心跳才更新。"""
+        try:
+            self.refresh_data()
+        except Exception:
+            pass
+
+    # ================= 社区反馈（GitHub issue） =================
+    def _build_community_section(self, root):
+        """构建「社区反馈」区块（常驻，不随 rebuild_body 重建）。
+
+        【为什么用 GitHub 而不是自建评价系统】
+        这 6 个助手全是 GitHub 开源项目，真实的用户讨论与问题反馈本来就都在各自的
+        issue 区里。自建一套"评分+评论"只会是数据孤岛 —— 开发者不会来这个小工具里
+        看评价，用户写的问题永远躺在本机数据库里没人修。直接用 issue 则直达开发者。
+
+        区块内容：
+          · 健康度行：star 数 / 近 30 天提交数（复用总览页已有的 GitHubStatsWorker 缓存）
+                      / 未解决 issue 数（CommunityWorker）
+          · 最近几条真实 issue，点击直达
+          · 「反馈问题」一键提单，自动预填环境信息
+        """
+        self._community_key = self.app.get("key", "") or ""
+        self._community_repo = _GITHUB_REPOS.get(self._community_key, "")
+        self._community_worker = None
+        self._community_loaded = False
+        if not self._community_repo:
+            # 没有登记仓库的助手（如纯本地工具）不显示这一块
+            return
+
+        box = QVBoxLayout()
+        box.setSpacing(8)
+
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        head.addWidget(CaptionLabel("评分与反馈"))
+        head.addStretch(1)
+        self.community_link_btn = PushButton("在 GitHub 打开")
+        self.community_link_btn.setFixedHeight(28)
+        self.community_link_btn.setCursor(Qt.PointingHandCursor)
+        self.community_link_btn.clicked.connect(
+            lambda: self._open_url("https://github.com/%s" % self._community_repo))
+        head.addWidget(self.community_link_btn)
+        box.addLayout(head)
+
+        # ===== 评分块：左边大分数，右边横向指标条 =====
+        # 视觉结构对齐 TapTap / WeGame 的评分区（大分数在左、条形明细在右）。
+        # 【但右侧绝不是"评价分布"】—— 那两个平台的分布来自 32 条 / 1.7 万条真实
+        # 用户评分；这里一条用户评分都没有。所以右侧放的是**真实可得的客观指标**
+        # （提交频率 / star / 待解决问题）。照抄视觉结构可以，伪造分布数据不行。
+        score_row = QHBoxLayout()
+        score_row.setSpacing(20)
+
+        left = QVBoxLayout()
+        left.setSpacing(3)
+        self.rating_score = QLabel("—")
+        self.rating_score.setAlignment(Qt.AlignCenter)
+        self.rating_score.setStyleSheet(
+            "font-size:34px; font-weight:600; color:#FFB74D; background:transparent;")
+        left.addWidget(self.rating_score)
+
+        self.rating_stars = StarRating()
+        self.rating_stars.valueChanged.connect(self._on_rating_changed)
+        left.addWidget(self.rating_stars, 0, Qt.AlignHCenter)
+
+        self.rating_text = CaptionLabel("")
+        self.rating_text.setAlignment(Qt.AlignCenter)
+        self.rating_text.setWordWrap(True)
+        left.addWidget(self.rating_text)
+        left.addStretch(1)
+
+        left_wrap = QWidget()
+        left_wrap.setLayout(left)
+        left_wrap.setFixedWidth(158)
+        score_row.addWidget(left_wrap)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(7)
+        self._metric_bars = {}
+        self._metric_vals = {}
+        for i, (mk, mlabel) in enumerate((
+                ("commits", "近 30 天提交"),
+                ("stars", "社区星标"),
+                ("issues", "待解决问题"))):
+            lab = CaptionLabel(mlabel)
+            lab.setFixedWidth(80)
+            grid.addWidget(lab, i, 0)
+            bar = QProgressBar()
+            bar.setRange(0, 100)
+            bar.setValue(0)
+            bar.setFixedHeight(8)
+            bar.setTextVisible(False)
+            bar.setStyleSheet(_bar_qss("#378ADD"))
+            grid.addWidget(bar, i, 1)
+            val = CaptionLabel("—")
+            val.setFixedWidth(56)
+            grid.addWidget(val, i, 2)
+            self._metric_bars[mk] = bar
+            self._metric_vals[mk] = val
+        grid.setColumnStretch(1, 1)
+        score_row.addLayout(grid, 1)
+
+        box.addLayout(score_row)
+
+        self.community_stats = CaptionLabel("")
+        self.community_stats.setWordWrap(True)
+        box.addWidget(self.community_stats)
+
+        self.community_list = QVBoxLayout()
+        self.community_list.setSpacing(4)
+        box.addLayout(self.community_list)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.feedback_btn = PushButton("反馈问题")
+        self.feedback_btn.setFixedHeight(32)
+        self.feedback_btn.setCursor(Qt.PointingHandCursor)
+        self.feedback_btn.setToolTip(
+            "在 GitHub 上提交问题，会自动带上版本与系统信息")
+        self.feedback_btn.clicked.connect(self._on_feedback_clicked)
+        row.addWidget(self.feedback_btn)
+
+        self.issues_btn = PushButton("查看全部问题")
+        self.issues_btn.setFixedHeight(32)
+        self.issues_btn.setCursor(Qt.PointingHandCursor)
+        self.issues_btn.clicked.connect(
+            lambda: self._open_url(
+                "https://github.com/%s/issues" % self._community_repo))
+        row.addWidget(self.issues_btn)
+        row.addStretch(1)
+        box.addLayout(row)
+
+        root.addLayout(box)
+        # 先按缓存画一次（秒开），真正拉取留到首次显示时，省 GitHub API 配额
+        self._render_community()
+
+    def showEvent(self, event):
+        """首次显示本页时才去拉社区数据。
+
+        未认证的 GitHub API 限速 60 次/小时，而这里只有 6 个助手 —— 但没必要在
+        启动时一次性全拉，用户真正点进哪一个再拉哪一个就够了。
+        """
+        super().showEvent(event)
+        if getattr(self, "_community_loaded", True):
+            return
+        self._community_loaded = True
+        QTimer.singleShot(300, self.refresh_community)
+
+    def _open_url(self, url):
+        try:
+            QDesktopServices.openUrl(QUrl(url))
+        except Exception:
+            pass
+
+    def refresh_community(self, force=False):
+        """先渲染缓存（秒开），缓存过期时再后台拉新。"""
+        repo = getattr(self, "_community_repo", "")
+        if not repo:
+            return
+        self._render_community()
+        try:
+            cache = _load_json(_github_community_path())
+            entry = (cache.get("repos") or {}).get(self._community_key) or {}
+            fresh = (time.time() - float(entry.get("fetched_at") or 0)) < _COMMUNITY_TTL_SEC
+        except Exception:
+            fresh = False
+        if fresh and not force:
+            return
+        w = getattr(self, "_community_worker", None)
+        if w is not None and w.isRunning():
+            return
+        try:
+            w = CommunityWorker(self._community_key, repo, parent=self)
+            w.done.connect(self._on_community_done)
+            self._community_worker = w
+            w.start()
+        except Exception:
+            pass
+
+    def _on_community_done(self, key, _data):
+        if key != getattr(self, "_community_key", ""):
+            return
+        self._render_community()
+
+    def _render_community(self):
+        """把缓存里的社区数据画出来。任何异常都不该影响主功能。"""
+        try:
+            if not hasattr(self, "community_stats"):
+                return
+            key = self._community_key
+            stats = (_load_json(_github_stats_path()).get("repos") or {}).get(key) or {}
+            comm = (_load_json(_github_community_path()).get("repos") or {}).get(key) or {}
+
+            # 客观指标已改到右侧条形区展示，这行只在完全没有数据时给提示，
+            # 避免与条形区重复显示同样三个数字
+            has_any = (stats.get("stars") is not None
+                       or stats.get("commits30d") is not None
+                       or comm.get("open_issues") is not None)
+            self.community_stats.setVisible(not has_any)
+            if not has_any:
+                self.community_stats.setText(
+                    "尚未获取到社区数据（可点右上角按钮直接打开仓库）")
+
+            # 星级：优先用用户自己打的分，否则用客观推算值
+            my = 0
+            try:
+                my = int((_load_json(_my_ratings_path()) or {}).get(key) or 0)
+            except Exception:
+                my = 0
+            score, why = compute_health_score(stats, comm)
+            if hasattr(self, "rating_stars"):
+                # set_value 不发射信号，故这里不会递归触发 _on_rating_changed
+                self.rating_stars.set_value(my or int(round(score or 0)))
+            if hasattr(self, "rating_score"):
+                # 大分数必须与星星、来源文案三者一致：
+                # 用户打过分的显示他的分，否则显示推算分。不能出现「五颗星 + 我的评分 5 分
+                # 但大数字写 3.8」这种自相矛盾的组合。
+                if my:
+                    self.rating_score.setText("%.1f" % my)
+                elif score is not None:
+                    self.rating_score.setText("%.1f" % score)
+                else:
+                    self.rating_score.setText("—")
+            if hasattr(self, "rating_text"):
+                if my:
+                    self.rating_text.setText("我的评分 %d 分" % my)
+                    self.rating_text.setToolTip(
+                        "你打的分。客观推算为 %s 分（%s）" % (score, why)
+                        if score is not None else "你打的分")
+                elif score is not None:
+                    self.rating_text.setText("按活跃度推算")
+                    self.rating_text.setToolTip(
+                        "%s\n\n点星星可打你自己的分，打分后以你的为准" % why)
+                else:
+                    self.rating_text.setText("点星星可打分")
+                    self.rating_text.setToolTip("数据不足，暂时推不出分数")
+
+            # 右侧指标条：全部是真实客观数据，**不是用户评分分布**
+            if hasattr(self, "_metric_bars"):
+                try:
+                    self._update_metrics(stats, comm)
+                except Exception:
+                    pass
+
+            # 重建 issue 列表
+            _clear_layout(self.community_list)
+            issues = comm.get("issues") or []
+            if not issues:
+                tip = "暂无未解决的问题" if comm else "正在获取…"
+                self.community_list.addWidget(CaptionLabel(tip))
+                return
+            for it in issues:
+                if not isinstance(it, dict):
+                    continue
+                num = int(it.get("number") or 0)
+                title = (it.get("title") or "").strip() or "(无标题)"
+                line = "#%d  %s" % (num, title)
+                if len(line) > 52:
+                    line = line[:51] + "…"
+                tail = []
+                cmt = int(it.get("comments") or 0)
+                if cmt:
+                    tail.append("%d 评论" % cmt)
+                rel = _rel_time(it.get("created_at") or it.get("updated_at"))
+                if rel:
+                    tail.append(rel)
+                if tail:
+                    line += "      " + " · ".join(tail)
+
+                btn = QPushButton(line)
+                btn.setFixedHeight(28)
+                btn.setCursor(Qt.PointingHandCursor)
+                btn.setToolTip(title)
+                btn.setStyleSheet(
+                    "QPushButton { text-align:left; padding:2px 10px; border:none;"
+                    " background:rgba(255,255,255,0.05); border-radius:6px;"
+                    " color:rgba(255,255,255,0.86); font-size:12px; }"
+                    "QPushButton:hover { background:rgba(255,255,255,0.12); }"
+                )
+                url = "https://github.com/%s/issues/%d" % (self._community_repo, num)
+                btn.clicked.connect(lambda _=False, u=url: self._open_url(u))
+                self.community_list.addWidget(btn)
+        except Exception:
+            pass
+
+    def _update_metrics(self, stats, comm):
+        """更新右侧三个指标条。
+
+        归一化口径（各自独立，因为量纲不同）：
+          · 提交数：以 100 次/月为满格
+          · star  ：以 5000 为满格
+          · 未解决：以 30 为满格，且**反向配色**——待处理越少越绿，越多越红，
+                    否则"条越长越好"的直觉会把这个指标看反
+        """
+        def _set(mk, text, pct, color):
+            bar = self._metric_bars.get(mk)
+            if bar is not None:
+                bar.setValue(max(0, min(100, int(pct))))
+                bar.setStyleSheet(_bar_qss(color))
+            lab = self._metric_vals.get(mk)
+            if lab is not None:
+                lab.setText(text)
+
+        try:
+            commits = stats.get("commits30d")
+            if commits is None:
+                _set("commits", "—", 0, "#546E7A")
+            else:
+                c = int(commits)
+                _set("commits", "%d" % c, min(100.0, float(c)), "#378ADD")
+        except Exception:
+            _set("commits", "—", 0, "#546E7A")
+
+        try:
+            stars_n = stats.get("stars")
+            if stars_n is None:
+                _set("stars", "—", 0, "#546E7A")
+            else:
+                s = int(stars_n)
+                _set("stars", _fmt_count(s),
+                     min(100.0, s * 100.0 / 5000.0), "#EF9F27")
+        except Exception:
+            _set("stars", "—", 0, "#546E7A")
+
+        try:
+            opened = comm.get("open_issues")
+            if opened is None:
+                _set("issues", "—", 0, "#546E7A")
+            else:
+                o = int(opened)
+                # truncated：这一页已满 100 条，真实数量可能更多，标 +
+                mark = ("%d+" % o) if comm.get("truncated") else ("%d" % o)
+                oc = "#639922" if o <= 3 else ("#EF9F27" if o <= 20 else "#E24B4A")
+                _set("issues", mark, min(100.0, o * 100.0 / 30.0), oc)
+        except Exception:
+            _set("issues", "—", 0, "#546E7A")
+
+    def _on_rating_changed(self, v):
+        """用户点星星打的分，存本地并覆盖推算值。
+
+        存的是用户数据（不是缓存），所以写在独立文件里，清缓存不会被带走。
+        """
+        try:
+            data = _load_json(_my_ratings_path()) or {}
+            data[self._community_key] = int(v)
+            _save_json(_my_ratings_path(), data)
+        except Exception:
+            pass
+        self._render_community()
+
+    def _build_issue_body(self):
+        """拼一键反馈的正文模板。
+
+        重点是**把用户懒得填的环境信息自动填好** —— 报 bug 的真正门槛从来不是
+        "愿不愿意说"，而是"要填一堆版本号、系统、日志路径太麻烦"。
+        """
+        lines = [
+            "### 问题描述",
+            "<!-- 请描述：什么时候出现、做了什么操作、看到什么现象 -->",
+            "",
+            "",
+            "### 环境信息（已自动填写）",
+            "- 助手版本：%s" % (self.data.get("current_version") or "未知"),
+            "- 启动器版本：%s" % APP_VERSION,
+            "- 系统：%s" % _windows_desc(),
+        ]
+        try:
+            working = self.app.get("working", "") or ""
+            if working:
+                lines.append("- 工作目录：%s" % working)
+        except Exception:
+            pass
+        lines.append("")
+        lines.append("<!-- 由游戏助手启动器自动生成 -->")
+        return "\n".join(lines)
+
+    def _on_feedback_clicked(self):
+        """打开 GitHub 新建 issue 页并预填模板。"""
+        repo = getattr(self, "_community_repo", "")
+        if not repo:
+            return
+        try:
+            query = urllib.parse.urlencode({
+                "title": "[反馈] ",
+                "body": self._build_issue_body(),
+            })
+            self._open_url("https://github.com/%s/issues/new?%s" % (repo, query))
+        except Exception:
+            self._open_url("https://github.com/%s/issues/new" % repo)
+
+    def _is_process_running(self, force=False):
+        """判定本 app 对应的原启动器是否真实在跑（兜底 app.json.running 不可靠）。
+
+        判定**语义与旧实现完全一致**，只是把查询方式从「spawn tasklist 子进程」
+        换成「Win32 API + 全局 TTL 缓存」：
+          ① 进程表里存在 '<key>.exe' 镜像名 → 命中（覆盖 Electron / 独立 exe 的
+             lite、generic 卡，如 whimbox）
+          ② PyAppify 形态下真实进程名是内嵌的 pythonw.exe（进程表里见不到
+             ok-nte.exe），此时**唯一可靠线索是窗口标题**（异环标题含 "ok-nte"、
+             鸣潮含 "ok-ww" 等）
+
+        【为什么改】旧实现在此处同步跑两次 tasklist，其中 /V 模式要向每个窗口
+        SendMessage(WM_GETTEXT) 取标题，而该调用对无响应/繁忙窗口**不会超时返回**
+        —— 这正是界面「周期性粘滞、数秒后自行恢复」的根因（旧注释自认
+        「200 进程会阻塞 2~5 秒」）。现在默认路径只读一个 TTL 缓存，主线程零阻塞。
+        全部使用 W 后缀 API 获取 Unicode 字符串，顺带消除了 GBK 解码环节。
+
+        :param force: True 时跳过缓存强制立即重扫一次（约 10~30ms，单窗口 200ms
+                      硬上限保护）。用于「决定是否放行更新 / 卸载」这类**宁可慢一点
+                      也绝不能判错**的决策点；常规轮询一律走缓存（force=False）。
+        """
+        try:
+            key = self._pyapp_key()
             if not key:
                 return False
-
-            import subprocess as _sp
-            import csv as _csv
-            import io as _io
-            flags = getattr(_sp, "CREATE_NO_WINDOW", 0)
-
-            # ① 优先查 exe 镜像名（某些版本/状态下进程表里会有 ok-nte.exe）
-            out = _sp.run(
-                ["tasklist", "/FI", f"IMAGENAME eq {key}.exe", "/NH"],
-                capture_output=True, text=True,
-                encoding="gbk", errors="replace", creationflags=flags,
-            )
-            if f"{key}.exe" in out.stdout.lower():
-                return True
-
-            # ② 回退：pythonw 形态运行时，按窗口标题定位（cmd GBK、稳）
-            #    限定 /FI pythonw.exe 避免扫全表（200 进程会阻塞 2~5 秒）
-            out = _sp.run(
-                ["tasklist", "/FI", "IMAGENAME eq pythonw.exe",
-                 "/V", "/FO", "CSV", "/NH"],
-                capture_output=True, text=True,
-                encoding="gbk", errors="replace", creationflags=flags,
-            )
-            for row in _csv.reader(_io.StringIO(out.stdout)):
-                # CSV: image,pid,session,ses#,mem,status,user,cpu,window title
-                if len(row) >= 9 and key in row[8].lower():
-                    return True
-            return False
+            if force:
+                # 决策点：必须拿到此刻的真实状态，不能拿过期缓存误判
+                return bool(proc_scanner().prime(key))
+            hit, val = proc_scanner().get(key)
+            if hit:
+                return bool(val)
+            # 尚未登记或缓存已过期（如刚从最小化恢复）：同步快扫一次补齐。
+            # 有 per-window 200ms 上限，最坏情况仍远小于原来的不定长挂起。
+            return bool(proc_scanner().prime(key))
         except Exception:
             return False
 
@@ -6794,6 +7759,12 @@ class AppCard(CardWidget):
             ok, msg = _kill_app_by_title(key)
         QMessageBox.information(self.window(), "强制关闭", msg)
         # 立即刷新状态（不依赖下次 5 秒轮询）
+        # 先让缓存失效：否则 _is_process_running 会读到 TTL 内的旧缓存，
+        # 刚杀掉的进程仍可能显示为「运行中」，要等 3 秒才纠正。
+        try:
+            proc_scanner().invalidate()
+        except Exception:
+            pass
         self.refresh_data()
 
     def refresh_update_button(self):
@@ -7022,7 +7993,8 @@ class AppCard(CardWidget):
             worker = GitVersionFetcher(exe, parent=self)
             worker.fetched.connect(self._on_versions_fetched)
             worker.failed.connect(self._on_version_fetch_failed)
-            worker.start()
+            # 有界并发：槽位满时排队，避免 6 张卡同时拉 git 造成启动瞬间 IO 脉冲
+            _git_start_bounded(worker)
             self._version_fetcher = worker
             self._version_fetch_started = True
             # 异步请求刚发出去时，先在 changelog 上提示一下"正在拉取"，避免用户看到缓存说明
@@ -7524,7 +8496,8 @@ class AppCard(CardWidget):
         # app.json.running 是原启动器启动时写、关闭时没清的陈旧字段（注释见
         # _is_process_running），进程死透后还常驻 true，会让卸载按钮永远点不动。
         # refresh_badge 已接实时检测兜底，uninstall_app 当时漏接了。
-        if self._is_process_running():
+        # force=True：卸载是不可逆操作，误判「没运行」会删到正在运行的程序
+        if self._is_process_running(force=True):
             QMessageBox.warning(
                 self.window(), "无法卸载",
                 f"「{self.app['display']}」正在运行，请先关闭后再卸载。"
@@ -8401,6 +9374,11 @@ _GITHUB_REPOS = {
 _STATS_TTL_SEC = 6 * 3600        # 成功数据 6 小时内直接用缓存
 _STATS_RETRY_SEC = 30 * 60       # 失败后至少隔 30 分钟才重试，避免每次开主页都打网络
 
+# 「社区反馈」区块（详情页）：拉该助手仓库的未解决 issue
+_COMMUNITY_TTL_SEC = 3 * 3600    # 社区数据 3 小时内用缓存
+_COMMUNITY_RETRY_SEC = 10 * 60   # 失败后 10 分钟内不重试
+_COMMUNITY_ISSUE_LIMIT = 5       # 详情页展示的 issue 条数
+
 
 def _cache_dir():
     return os.path.join(LAUNCHER_DIR, ".cache")
@@ -8412,6 +9390,15 @@ def _launch_counts_path():
 
 def _github_stats_path():
     return os.path.join(_cache_dir(), "github_stats.json")
+
+
+def _github_community_path():
+    return os.path.join(_cache_dir(), "github_community.json")
+
+
+def _my_ratings_path():
+    """用户自己打的星（key -> 1~5）。与缓存分开：这是用户数据，不该被清缓存带走。"""
+    return os.path.join(_cache_dir(), "my_ratings.json")
 
 
 def _load_json(path):
@@ -8495,19 +9482,184 @@ def _parse_last_page(link_header):
     return int(m.group(1)) if m else None
 
 
+def _github_token_path():
+    """GitHub 令牌的存放位置（DPAPI 加密后的二进制）。
+
+    刻意**不写进 config.json**：那个文件可能被同步 / 分享 / 提交到仓库，
+    而 GitHub 令牌等同密码。这里单独存一份只有本机当前用户能解开的密文。
+    """
+    return os.path.join(_cache_dir(), "github_token.bin")
+
+
+class _DATA_BLOB(ctypes.Structure):
+    _fields_ = [("cbData", wintypes.DWORD),
+                ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+
+_CRYPTPROTECT_UI_FORBIDDEN = 0x01
+
+
+def _dpapi_protect(raw):
+    """Windows DPAPI 加密：密文只对本机当前用户可解。失败返回 None。"""
+    try:
+        crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+        crypt32.CryptProtectData.argtypes = [
+            ctypes.POINTER(_DATA_BLOB), ctypes.c_wchar_p,
+            ctypes.POINTER(_DATA_BLOB), ctypes.c_void_p, ctypes.c_void_p,
+            wintypes.DWORD, ctypes.POINTER(_DATA_BLOB)]
+        crypt32.CryptProtectData.restype = wintypes.BOOL
+
+        buf = ctypes.create_string_buffer(raw, len(raw))
+        din = _DATA_BLOB(len(raw), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+        dout = _DATA_BLOB()
+        ok = crypt32.CryptProtectData(
+            ctypes.byref(din), "oklauncher-github-token", None, None, None,
+            _CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(dout))
+        if not ok:
+            return None
+        try:
+            return ctypes.string_at(dout.pbData, dout.cbData)
+        finally:
+            ctypes.windll.kernel32.LocalFree(dout.pbData)
+    except Exception:
+        return None
+
+
+def _dpapi_unprotect(blob):
+    """Windows DPAPI 解密。失败返回 None（换了用户 / 重装系统就会解不开）。"""
+    try:
+        crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+        crypt32.CryptUnprotectData.argtypes = [
+            ctypes.POINTER(_DATA_BLOB), ctypes.POINTER(ctypes.c_wchar_p),
+            ctypes.POINTER(_DATA_BLOB), ctypes.c_void_p, ctypes.c_void_p,
+            wintypes.DWORD, ctypes.POINTER(_DATA_BLOB)]
+        crypt32.CryptUnprotectData.restype = wintypes.BOOL
+
+        buf = ctypes.create_string_buffer(blob, len(blob))
+        din = _DATA_BLOB(len(blob), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+        dout = _DATA_BLOB()
+        ok = crypt32.CryptUnprotectData(
+            ctypes.byref(din), None, None, None, None,
+            _CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(dout))
+        if not ok:
+            return None
+        try:
+            return ctypes.string_at(dout.pbData, dout.cbData)
+        finally:
+            ctypes.windll.kernel32.LocalFree(dout.pbData)
+    except Exception:
+        return None
+
+
+_GH_TOKEN_CACHE = {"loaded": False, "value": ""}
+
+
+def load_github_token():
+    """读取已保存的令牌；没有或解不开都返回空串（降级为匿名 60 次/小时）。
+
+    解密结果在进程内缓存一次，避免每次请求都跑一遍 DPAPI。
+    """
+    if _GH_TOKEN_CACHE["loaded"]:
+        return _GH_TOKEN_CACHE["value"]
+    val = ""
+    try:
+        p = _github_token_path()
+        if os.path.isfile(p):
+            with open(p, "rb") as f:
+                raw = _dpapi_unprotect(f.read())
+            if raw:
+                val = raw.decode("utf-8", "strict").strip()
+    except Exception:
+        val = ""
+    _GH_TOKEN_CACHE["loaded"] = True
+    _GH_TOKEN_CACHE["value"] = val
+    return val
+
+
+def save_github_token(token):
+    """保存令牌（DPAPI 加密落盘）。空串等同于清除。"""
+    global _GH_TOKEN_CACHE
+    token = (token or "").strip()
+    try:
+        if not token:
+            return clear_github_token()
+        blob = _dpapi_protect(token.encode("utf-8"))
+        if blob is None:
+            return False
+        os.makedirs(os.path.dirname(_github_token_path()), exist_ok=True)
+        with open(_github_token_path(), "wb") as f:
+            f.write(blob)
+        _GH_TOKEN_CACHE["loaded"] = True
+        _GH_TOKEN_CACHE["value"] = token
+        return True
+    except Exception:
+        return False
+
+
+def clear_github_token():
+    """清除已保存的令牌，回到匿名访问。"""
+    global _GH_TOKEN_CACHE
+    _GH_TOKEN_CACHE["loaded"] = True
+    _GH_TOKEN_CACHE["value"] = ""
+    try:
+        p = _github_token_path()
+        if os.path.isfile(p):
+            os.remove(p)
+        return True
+    except Exception:
+        return False
+
+
+def github_authenticated():
+    """是否已配置 GitHub 令牌（决定 API 配额是 60 还是 5000 每小时）。"""
+    return bool(load_github_token())
+
+
+def _github_rate_limit():
+    """查当前 API 配额，返回 (limit, remaining)；拿不到返回 None。
+
+    核心配额（core）才是普通 REST 调用的额度：匿名 60/小时，带令牌 5000/小时。
+    """
+    try:
+        code, _h, body = _github_fetch("https://api.github.com/rate_limit", timeout=8)
+        if code != 200:
+            return None
+        core = (json.loads(body.decode("utf-8", "replace"))
+                .get("resources") or {}).get("core") or {}
+        return (int(core.get("limit") or 0), int(core.get("remaining") or 0))
+    except Exception:
+        return None
+
+
 def _github_fetch(url, timeout=8):
     """GET 一个 GitHub API 地址，返回 (status, headers, body_bytes)。
 
     status 取不到（响应包装 / 测试替身没有该属性）按 200 处理，与 _download_chunked
     的容错思路一致。
     """
-    req = urllib.request.Request(url, headers={
+    headers = {
         "User-Agent": "OKLauncher/%s" % APP_VERSION,
         "Accept": "application/vnd.github+json",
-    })
+    }
+    # 带上令牌后配额从 60 次/小时提升到 5000 次/小时（设置页可配置）
+    tok = load_github_token()
+    if tok:
+        headers["Authorization"] = "Bearer %s" % tok
+    req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         code = getattr(r, "status", None) or r.getcode() or 200
         return code, r.headers, r.read()
+
+
+class GithubQuotaWorker(QThread):
+    """查一次 API 配额，用于验证令牌是否真生效（网络请求不能放主线程）。"""
+    done = Signal(object)   # (limit, remaining) 或 None
+
+    def run(self):
+        try:
+            self.done.emit(_github_rate_limit())
+        except Exception:
+            self.done.emit(None)
 
 
 class GitHubStatsWorker(QThread):
@@ -8573,6 +9725,292 @@ class GitHubStatsWorker(QThread):
         _save_json(_github_stats_path(), {
             "repos": repos, "fetched_at": fetched_at, "attempted_at": now})
         self.done.emit(repos)
+
+
+class CommunityWorker(QThread):
+    """拉取某助手 GitHub 仓库的「未解决 issue」概况，供详情页「社区反馈」区块用。
+
+    设计要点：
+      · **只拉当前打开的那个助手**（1 次请求），不像 GitHubStatsWorker 那样 6 个全拉——
+        未认证的 GitHub API 限速 60 次/小时，省着用。
+      · 一次 /issues?state=open&per_page=100 请求同时得到两样东西：
+          ① 未解决 issue 数
+          ② 最近若干条 issue（标题/编号/时间/评论数），直接当"评价列表"用
+      · **必须排除 PR**：GitHub 的 issues 列表接口会把 Pull Request 混进来，
+        带 pull_request 字段的条目就是 PR。不剔除的话数字偏高，
+        用户点进去会发现"问题"其实是别人提的代码合并请求。
+      · 失败保留旧值，只更新 attempted_at，避免每次开页面都打网络。
+
+    这是"评价/反馈"功能的数据源：这些开源助手真实的用户讨论都在 GitHub 上，
+    自建一套评价系统只会变成没人看的数据孤岛，而 issue 是开发者真正会看的渠道。
+    """
+    done = Signal(str, dict)   # (key, 该仓库的社区数据)
+
+    def __init__(self, key, repo, parent=None):
+        super().__init__(parent)
+        self.key = key
+        self.repo = repo
+
+    def run(self):
+        try:
+            cache = _load_json(_github_community_path())
+            repos = dict(cache.get("repos") or {})
+            prev = dict(repos.get(self.key) or {})
+            now = time.time()
+
+            if now - float(prev.get("fetched_at") or 0) < _COMMUNITY_TTL_SEC:
+                self.done.emit(self.key, prev)
+                return
+            if now - float(prev.get("attempted_at") or 0) < _COMMUNITY_RETRY_SEC:
+                self.done.emit(self.key, prev)
+                return
+
+            fresh = self._fetch()
+            if fresh is None:
+                # 拉取失败：保留旧值，只记尝试时间
+                prev["attempted_at"] = now
+                repos[self.key] = prev
+                _save_json(_github_community_path(),
+                           {"repos": repos, "updated_at": now})
+                self.done.emit(self.key, prev)
+                return
+
+            fresh["fetched_at"] = now
+            fresh["attempted_at"] = now
+            # 失败的旧值不能覆盖成功的新值，但这里 fresh 是完整结果，直接用
+            repos[self.key] = fresh
+            _save_json(_github_community_path(), {"repos": repos, "updated_at": now})
+            self.done.emit(self.key, fresh)
+        except Exception:
+            try:
+                self.done.emit(self.key, {})
+            except Exception:
+                pass
+
+    def _fetch(self):
+        """拉一页 open issues，返回 dict；失败返回 None。"""
+        try:
+            url = ("https://api.github.com/repos/%s/issues"
+                   "?state=open&per_page=100&sort=created&direction=desc"
+                   % self.repo)
+            code, _headers, body = _github_fetch(url, timeout=10)
+            if code != 200:
+                return None
+            arr = json.loads(body.decode("utf-8", "replace"))
+            if not isinstance(arr, list):
+                return None
+        except Exception:
+            return None
+
+        real_issues = []
+        for it in arr:
+            if not isinstance(it, dict):
+                continue
+            # PR 会被混进 issues 列表，靠这个字段识别并剔除
+            if it.get("pull_request"):
+                continue
+            real_issues.append({
+                "number": int(it.get("number") or 0),
+                "title": (it.get("title") or "").strip(),
+                "comments": int(it.get("comments") or 0),
+                "created_at": it.get("created_at") or "",
+                "updated_at": it.get("updated_at") or "",
+            })
+
+        # 返回满 100 条说明后面可能还有，只能给个下限
+        truncated = len(arr) >= 100
+        return {
+            "open_issues": len(real_issues),
+            "truncated": truncated,
+            "issues": real_issues[:_COMMUNITY_ISSUE_LIMIT],
+        }
+
+
+def compute_health_score(stats, comm):
+    """按 GitHub 客观数据推算一个 1.0~5.0 的分数，供星级展示用。
+
+    【这不是"用户评价"，是客观推算】
+    UI 必须标明来源，否则屏幕上的分数就是凭空编的 —— 这个项目里不能干这种事。
+    用户自己打过星后，以用户打分为准（存在 _my_ratings_path()）。
+
+    规则按权重从高到低：
+      ① 近 30 天提交数 —— 直接反映项目还活不活，权重最大
+      ② 未解决 issue 数 —— 反映维护者响应是否跟得上
+      ③ star 数 —— 社区规模，只做小幅微调，避免"star 高就分数高"
+
+    返回 (score, 说明文字)；数据不足返回 (None, 原因)。
+    """
+    commits = stats.get("commits30d")
+    if commits is None:
+        return None, "尚无提交数据"
+    try:
+        commits = int(commits)
+    except Exception:
+        return None, "提交数据异常"
+
+    if commits >= 100:
+        base, why = 5.0, "近 30 天 %d 次提交，非常活跃" % commits
+    elif commits >= 50:
+        base, why = 4.5, "近 30 天 %d 次提交，更新勤快" % commits
+    elif commits >= 20:
+        base, why = 4.0, "近 30 天 %d 次提交，持续维护" % commits
+    elif commits >= 5:
+        base, why = 3.0, "近 30 天仅 %d 次提交，维护较慢" % commits
+    elif commits >= 1:
+        base, why = 2.0, "近 30 天仅 %d 次提交，接近停更" % commits
+    else:
+        base, why = 1.0, "近 30 天没有提交，疑似停更"
+
+    score = base
+    opened = comm.get("open_issues")
+    if opened is not None:
+        try:
+            opened = int(opened)
+            if opened <= 3:
+                score += 0.5
+                why += "；仅 %d 个未解决" % opened
+            elif opened > 50:
+                score -= 0.5
+                why += "；积压 %d 个未解决" % opened
+        except Exception:
+            pass
+
+    stars = stats.get("stars")
+    if stars is not None:
+        try:
+            stars = int(stars)
+            if stars >= 5000:
+                score += 0.25
+            elif stars >= 1000:
+                score += 0.1
+        except Exception:
+            pass
+
+    score = max(1.0, min(5.0, score))
+    return round(score, 1), why
+
+
+class StarRating(QWidget):
+    """可点击的五星评分控件（整数 1~5）。
+
+    刻意只做整数星：半星在点选交互里没有意义（用户点不出 4.3）。
+    推算出来的小数分另行用文字展示，例如「★★★★☆ 4.3」。
+    """
+    valueChanged = Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._value = 0
+        self._hover = 0
+        self.setMouseTracking(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedSize(106, 26)
+        self.setToolTip("点击星星打分（你打的分会覆盖推算值）")
+        self._label = QLabel("", self)
+        self._label.setGeometry(0, 0, 106, 26)
+        self._label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self._label.setStyleSheet(
+            "font-size:17px; letter-spacing:3px; color:#FFB74D; background:transparent;")
+        self._render()
+
+    def value(self):
+        return self._value
+
+    def set_value(self, v):
+        try:
+            self._value = max(0, min(5, int(v)))
+        except Exception:
+            self._value = 0
+        self._render()
+
+    def _render(self):
+        v = self._hover or self._value
+        self._label.setText("★" * v + "☆" * (5 - v))
+
+    def _index_at(self, pos):
+        step = max(1.0, self.width() / 5.0)
+        v = int(pos.x() / step) + 1
+        return max(1, min(5, v))
+
+    def mouseMoveEvent(self, e):
+        try:
+            self._hover = self._index_at(e.position())
+        except Exception:
+            self._hover = 0
+        self._render()
+
+    def leaveEvent(self, e):
+        self._hover = 0
+        self._render()
+
+    def mousePressEvent(self, e):
+        try:
+            v = self._index_at(e.position())
+        except Exception:
+            return
+        self._value = v
+        self._render()
+        self.valueChanged.emit(v)
+
+
+def _rel_time(iso_str):
+    """把 GitHub 的 ISO 时间转成「3 天前」这种相对描述。失败返回空串。"""
+    if not iso_str:
+        return ""
+    try:
+        from datetime import datetime, timezone
+        s = iso_str.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        delta = datetime.now(timezone.utc) - dt
+        secs = delta.total_seconds()
+        if secs < 0:
+            return "刚刚"
+        if secs < 3600:
+            return "%d 分钟前" % max(1, int(secs // 60))
+        if secs < 86400:
+            return "%d 小时前" % int(secs // 3600)
+        if secs < 86400 * 30:
+            return "%d 天前" % int(secs // 86400)
+        if secs < 86400 * 365:
+            return "%d 个月前" % int(secs // (86400 * 30))
+        return "%d 年前" % int(secs // (86400 * 365))
+    except Exception:
+        return ""
+
+
+def _fmt_count(n):
+    """1234 → 1.2k。用于 star / 提交数这类可能上万的数字。"""
+    try:
+        n = int(n)
+    except Exception:
+        return "—"
+    if n < 1000:
+        return str(n)
+    if n < 10000:
+        return "%.1fk" % (n / 1000.0)
+    return "%.0fk" % (n / 1000.0)
+
+
+def _bar_qss(color):
+    """横向指标条的样式（深色主题下与卡片底色协调）。"""
+    return ("QProgressBar { background-color:rgba(255,255,255,0.10);"
+            " border:none; border-radius:4px; }"
+            "QProgressBar::chunk { background-color:%s; border-radius:4px; }" % color)
+
+
+def _windows_desc():
+    """当前系统描述，用于一键反馈时自动填写环境信息。"""
+    try:
+        import platform
+        bits = platform.architecture()[0] or ""
+        return "Windows %s (%s)" % (platform.release(), bits)
+    except Exception:
+        try:
+            return "Windows (%d 位)" % (struct.calcsize("P") * 8)
+        except Exception:
+            return "Windows"
 
 
 class RankBoard(QWidget):
@@ -8725,22 +10163,58 @@ _BLOCK_COLORS = ["#185FA5", "#0F6E56", "#854F0B", "#534AB7", "#993C1D"]
 
 # 图标缩放结果缓存：预约区每次筛选重建都要重新画几十个图标，
 # 不缓存的话光是 QPixmap 缩放就要白花上百毫秒。
+#
+# 【借鉴 tubatools ToolIconService】原先这里是**无上限 dict，只增不删**。
+# 它的做法是内存 LRU(512) + 磁盘持久缓存 + 源文件 mtime stale 检查 + 90 天/50MB/
+# 2000 文件的定期淘汰。本项目图标载体数量有限，磁盘层收益不大，故只采纳关键两条：
+#   · 有界 LRU —— 防止长时间运行、反复筛选重建后无限增长；
+#   · stale 检查 —— 源文件 mtime 变了就重绘，避免拿到过期图标。
 _ICON_CACHE = {}
+_ICON_CACHE_MAX = 512
 
 
 def _cached_pixmap(path, size=32):
-    """按 (路径, 尺寸) 缓存缩放后的 QPixmap，缺失文件返回 None。"""
+    """按 (路径, 尺寸) 缓存缩放后的 QPixmap，缺失文件返回 None。
+
+    带 LRU 淘汰与源文件失效检查。
+    """
     key = (path, size)
-    if key in _ICON_CACHE:
-        return _ICON_CACHE[key]
+    hit = _ICON_CACHE.get(key)
+    if hit is not None:
+        pm, stamp = hit
+        try:
+            if pm is None:
+                # 之前记为「文件缺失」：再确认一次，仍缺则短路返回（省掉 QPixmap 构造）
+                if not (path and os.path.exists(path)):
+                    _ICON_CACHE[key] = _ICON_CACHE.pop(key)
+                    return None
+            elif stamp is not None and os.path.getmtime(path) == stamp:
+                # 命中且源文件没变：移到末尾维持 LRU 语义
+                _ICON_CACHE[key] = _ICON_CACHE.pop(key)
+                return pm
+        except Exception:
+            pass
+        _ICON_CACHE.pop(key, None)
+
     pm = None
+    stamp = None
     try:
         if path and os.path.exists(path):
-            pm = QPixmap(path).scaled(
-                size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            stamp = os.path.getmtime(path)
+            raw = QPixmap(path)
+            if not raw.isNull():
+                pm = raw.scaled(size, size, Qt.KeepAspectRatio,
+                                Qt.SmoothTransformation)
     except Exception:
         pm = None
-    _ICON_CACHE[key] = pm
+
+    # LRU 淘汰：超过上限丢最久未用的一项（dict 保持插入顺序，首项即最久未用）
+    if key not in _ICON_CACHE and len(_ICON_CACHE) >= _ICON_CACHE_MAX:
+        try:
+            _ICON_CACHE.pop(next(iter(_ICON_CACHE)), None)
+        except Exception:
+            pass
+    _ICON_CACHE[key] = (pm, stamp)
     return pm
 
 
@@ -9026,9 +10500,10 @@ class OverviewPage(QWidget):
 
         root.addStretch(1)
 
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self.refresh)
-        self._timer.start(5000)
+        # 并入全局心跳。总览页本身**不扫进程**——它只读各卡片的 snapshot()。
+        # 连接顺序上 AppCard 先注册（Launcher 先建卡后建总览页），Qt 按连接顺序
+        # 调用槽，故这里刷到的必是本轮最新值，不会出现"总览滞后一拍"。
+        heartbeat().tick.connect(self.refresh)
 
     def _refresh_banner(self):
         try:
@@ -9195,10 +10670,68 @@ class SettingsPage(QWidget):
         root.addWidget(self.tele_tip)
         self._refresh_tele_tip()
 
+        # ---------- GitHub 账号 ----------
+        root.addSpacing(18)
+        root.addWidget(StrongBodyLabel("GitHub 账号"))
+        tip_g = CaptionLabel(
+            "登录后 GitHub API 配额从 60 次/小时提升到 5000 次/小时，"
+            "助手的星标、提交数、问题列表能拉得更勤更全（几十个预约项目也够用）。"
+            "令牌只加密存在本机，不写进 config.json，也不随任何上报发出。")
+        tip_g.setWordWrap(True)
+        root.addWidget(tip_g)
+
+        self.gh_state = CaptionLabel("")
+        self.gh_state.setWordWrap(True)
+        self.gh_state.setStyleSheet("color:#888780; font-size:11px;")
+        root.addWidget(self.gh_state)
+
+        row_g = QHBoxLayout()
+        row_g.setSpacing(8)
+        self.gh_edit = LineEdit()
+        self.gh_edit.setPlaceholderText("粘贴 GitHub 个人访问令牌")
+        self.gh_edit.setEchoMode(LineEdit.EchoMode.Password)
+        row_g.addWidget(self.gh_edit, 1)
+
+        self.gh_save_btn = PushButton("保存")
+        self.gh_save_btn.setFixedHeight(32)
+        self.gh_save_btn.setCursor(Qt.PointingHandCursor)
+        self.gh_save_btn.clicked.connect(self._on_github_save)
+        row_g.addWidget(self.gh_save_btn)
+
+        self.gh_clear_btn = PushButton("清除")
+        self.gh_clear_btn.setFixedHeight(32)
+        self.gh_clear_btn.setCursor(Qt.PointingHandCursor)
+        self.gh_clear_btn.clicked.connect(self._on_github_clear)
+        row_g.addWidget(self.gh_clear_btn)
+        root.addLayout(row_g)
+
+        row_g2 = QHBoxLayout()
+        row_g2.setSpacing(8)
+        self.gh_open_btn = PushButton("去 GitHub 生成令牌")
+        self.gh_open_btn.setFixedHeight(32)
+        self.gh_open_btn.setCursor(Qt.PointingHandCursor)
+        self.gh_open_btn.clicked.connect(self._on_github_open_page)
+        row_g2.addWidget(self.gh_open_btn)
+
+        self.gh_quota_btn = PushButton("查询剩余配额")
+        self.gh_quota_btn.setFixedHeight(32)
+        self.gh_quota_btn.setCursor(Qt.PointingHandCursor)
+        self.gh_quota_btn.clicked.connect(self._on_github_quota)
+        row_g2.addWidget(self.gh_quota_btn)
+        row_g2.addStretch(1)
+        root.addLayout(row_g2)
+
+        self.gh_msg = CaptionLabel("")
+        self.gh_msg.setWordWrap(True)
+        self.gh_msg.setStyleSheet("color:#888780; font-size:11px;")
+        root.addWidget(self.gh_msg)
+        self._refresh_github_state()
+
         # 线程句柄：页面常驻，worker 必须挂在 self 上防被 GC
         self._self_worker = None
         self._self_dl_worker = None
         self._self_info = None
+        self._gh_worker = None
 
     def _refresh_tele_tip(self):
         """提示当前是「真的会发」还是「没配端点所以实际不发」，避免误导。"""
@@ -9230,6 +10763,88 @@ class SettingsPage(QWidget):
             return
         self.tele_ping_chk.setEnabled(self.tele_chk.isChecked())
         self._refresh_tele_tip()
+
+    # ---------- GitHub 账号 ----------
+    def _refresh_github_state(self):
+        if github_authenticated():
+            tok = load_github_token()
+            masked = (tok[:4] + "…" + tok[-4:]) if len(tok) > 10 else "已设置"
+            self.gh_state.setText("已登录（令牌 %s）· 配额 5000 次/小时" % masked)
+            self.gh_edit.setPlaceholderText("已保存令牌，可粘贴新的覆盖")
+            self.gh_clear_btn.setEnabled(True)
+        else:
+            self.gh_state.setText("未登录 · 匿名访问，配额仅 60 次/小时")
+            self.gh_edit.setPlaceholderText("粘贴 GitHub 个人访问令牌")
+            self.gh_clear_btn.setEnabled(False)
+
+    def _on_github_save(self):
+        token = self.gh_edit.text().strip()
+        if not token:
+            QMessageBox.information(
+                self, "提示",
+                "请先粘贴令牌：点「去 GitHub 生成令牌」，生成后复制回来。\n\n"
+                "只需要读取公开仓库数据，**不需要勾选任何权限**，"
+                "生成时直接拉到最底点 Generate token 即可。")
+            return
+        if not save_github_token(token):
+            QMessageBox.warning(
+                self, "保存失败",
+                "无法加密保存令牌（本机 DPAPI 不可用）。\n"
+                "令牌不会被明文写入任何文件，请检查系统权限后重试。")
+            return
+        self.gh_edit.clear()
+        self._refresh_github_state()
+        self.gh_msg.setText("已保存，正在向 GitHub 验证…")
+        self._start_github_quota_check()
+
+    def _on_github_clear(self):
+        clear_github_token()
+        self.gh_edit.clear()
+        self._refresh_github_state()
+        self.gh_msg.setText("已清除，恢复匿名访问（60 次/小时）。")
+
+    def _on_github_open_page(self):
+        try:
+            # fine-grained token：可以什么都不勾选，只读公开数据
+            QDesktopServices.openUrl(
+                QUrl("https://github.com/settings/personal-access-tokens"))
+        except Exception:
+            pass
+
+    def _start_github_quota_check(self):
+        w = getattr(self, "_gh_worker", None)
+        if w is not None and w.isRunning():
+            return
+        try:
+            w = GithubQuotaWorker(parent=self)
+            w.done.connect(self._on_github_quota_done)
+            self._gh_worker = w
+            w.start()
+        except Exception:
+            pass
+
+    def _on_github_quota(self):
+        self.gh_quota_btn.setEnabled(False)
+        self.gh_msg.setText("正在查询…")
+        self._start_github_quota_check()
+
+    def _on_github_quota_done(self, res):
+        try:
+            self.gh_quota_btn.setEnabled(True)
+        except Exception:
+            pass
+        if not res:
+            self.gh_msg.setText("查询失败：网络不通，或令牌已失效。")
+            return
+        limit, remaining = res
+        if limit >= 5000:
+            self.gh_msg.setText("令牌生效：配额 %d 次/小时，剩余 %d 次。"
+                                % (limit, remaining))
+        else:
+            self.gh_msg.setText(
+                "当前是匿名访问：配额 %d 次/小时，剩余 %d 次。"
+                "登录后可提升到 5000 次/小时。" % (limit, remaining))
+        self._refresh_github_state()
 
     # ---------- 启动器自身更新 ----------
 
@@ -9494,6 +11109,37 @@ class Launcher(QWidget):
         # 的下载按钮点亮即可，用户自己决定要不要升。
         QTimer.singleShot(2500, self._self_update_silent_check)
 
+        # 心跳统一在这里启动：此刻所有 AppCard 与总览页都已把 tick 连接挂好
+        # （它们各自 __init__ 里只 connect 不 start），因此第一次 tick 时订阅者
+        # 全部就绪，不会出现「半张卡没刷到」的错位。
+        heartbeat().start()
+
+    def changeEvent(self, event):
+        """窗口最小化时暂停轮询——界面都看不见了，没必要每 5 秒扫一遍进程。
+
+        恢复时立即让缓存失效并强制重扫一次，否则用户切回来会先看到长达一个
+        心跳周期的旧状态（例如助手实际已退出、徽章却还显示「运行中」）。
+        """
+        try:
+            if event.type() == QEvent.Type.WindowStateChange:
+                minimized = bool(self.isMinimized())
+                heartbeat().set_enabled(not minimized)
+                if not minimized:
+                    proc_scanner().invalidate()
+                    proc_scanner().request(force=True)
+        except Exception:
+            pass
+        super().changeEvent(event)
+
+    def closeEvent(self, event):
+        """退出：停心跳并回收扫描线程，避免 "QThread: Destroyed while running"。"""
+        try:
+            heartbeat().set_enabled(False)
+            proc_scanner().shutdown()
+        except Exception:
+            pass
+        super().closeEvent(event)
+
     def _self_update_silent_check(self):
         """启动后静默查一次自身更新。失败静默（没网/限流都不该在启动时打扰用户）。"""
         page = getattr(self, "settings_page", None)
@@ -9635,6 +11281,21 @@ def _relaunch_as_admin():
     return runas(exe, [script], cwd)
 
 
+def _on_app_quit():
+    """退出兜底：停心跳 + 回收扫描线程（幂等，与 Launcher.closeEvent 互补）。
+
+    避免 stderr 出现 "QThread: Destroyed while thread is still running"。
+    """
+    try:
+        heartbeat().set_enabled(False)
+    except Exception:
+        pass
+    try:
+        proc_scanner().shutdown()
+    except Exception:
+        pass
+
+
 def main():
     # 默认不在启动时强制提权：否则每次双击都弹一次 UAC，且提权副本偶发起不来
     # 会表现为“双击没反应/打不开”。需要管理员的操作（如强制关闭）改为按需提权。
@@ -9672,6 +11333,8 @@ def main():
     setTheme(Theme.AUTO)
     win = Launcher()
     win.show()
+    # 退出兜底：非经 Launcher.closeEvent 的路径（如 app.quit()）也要回收线程
+    app.aboutToQuit.connect(_on_app_quit)
     sys.exit(app.exec())
 
 
