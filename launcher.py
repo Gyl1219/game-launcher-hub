@@ -66,7 +66,7 @@ from qfluentwidgets import (
 
 # 启动器自身版本（打包版 / 源码版共用）。发新版时只改这一处，
 # 显示在「设置」页页脚，便于报 bug 时说清自己在跑哪个版本。
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
 # ===== 应用配置（从 config.json 加载，避免硬编码路径） =====
 # 打包后（PyInstaller）两个目录必须分开算，否则图标全找不到：
@@ -144,6 +144,14 @@ def load_apps():
                 shutil.copyfile(example_path, cfg_path)
         except Exception:
             pass
+    if not os.path.isfile(cfg_path):
+        # 打包版把 config.example.json 解包到 RES_DIR（sys._MEIPASS），正常情况下上面已复制成功。
+        # 到这里说明既没有 config.json、随包模板也不在 —— 给一句能照着做的提示，别只抛裸 FileNotFound。
+        raise RuntimeError(
+            "找不到配置文件，且随包模板也不存在。\n"
+            f"  需要：{cfg_path}\n"
+            f"  可把随包带的 config.example.json 复制为该路径后重试（或手动放一份 config.json）。"
+        )
     try:
         with open(cfg_path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
@@ -155,6 +163,9 @@ def load_apps():
     # 预约条目单独放 config.reserved.json：数量大（几十条）且字段简单，
     # 混进 config.json 会把真正的本机配置淹没。缺文件就是没有预约条目，不报错。
     reserved_cfg = os.path.join(LAUNCHER_DIR, "config.reserved.json")
+    if not os.path.isfile(reserved_cfg):
+        # 打包版：config.reserved.json 随包放在只读资源目录 RES_DIR，首次运行时 exe 旁边还没有
+        reserved_cfg = os.path.join(RES_DIR, "config.reserved.json")
     raw_apps = list(cfg.get("apps", []))
     try:
         if os.path.isfile(reserved_cfg):

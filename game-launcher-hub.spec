@@ -1,7 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('assets', 'assets')]
+# 随包只读资源（解包到 RES_DIR = sys._MEIPASS）：
+#   assets/              图标等
+#   config.example.json  首次运行自动复制成 APP_DIR/config.json 的模板（缺它打包版一启动就报错）
+#   config.reserved.json 预约条目（代码在 APP_DIR 找不到时会回退到 RES_DIR 读）
+datas = [
+    ('assets', 'assets'),
+    ('config.example.json', '.'),
+    ('config.reserved.json', '.'),
+]
 binaries = []
 hiddenimports = ['dulwich', 'dulwich.porcelain', 'dulwich.client', 'dulwich.repo']
 tmp_ret = collect_all('qfluentwidgets')
