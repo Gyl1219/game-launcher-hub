@@ -190,6 +190,100 @@ runas /user:Administrator "python launcher.py"
 
 ---
 
+## 上游生态：预约中（79）
+
+以下为已收录、适配中的上游项目（按生态分组，点击名称直达仓库/官网），启动器内同一清单支持搜索与「我想要」投票：
+
+**ok-script 系（9）**
+
+- [ok-Onmyoji](https://github.com/YunLiuZ/ok-Onmyoji)
+- [ok-er - 伊瑟](https://github.com/ok-oldking/ok-etheria)
+- [ok-kes](https://ok-script.com/ok-kes/)
+- [ok-script 按键精灵](https://ok-script.com/app/)
+- [原神 ok-gi](https://github.com/ok-oldking/ok-genshin-impact)
+- [少前2 ok-gf2](https://github.com/AliceJump/ok-gf2)
+- [二重夜渊](https://ok-script.com/ok-duet-night-abyss/)
+- [崩铁助手](https://ok-script.com/ok-starrailassistant/)（崩坏：星穹铁道）
+- [星痕共鸣](https://ok-script.com/ok-star-resonance/)
+
+**MaaFramework 系（32）**
+
+- [MAATree](https://github.com/caicai00001/MAATree)
+- [MAA_Punish](https://github.com/overflow65537/MAA_Punish)
+- [MAA_SnowBreak](https://github.com/overflow65537/MAA_SnowBreak)
+- [MBCCtools](https://github.com/quietlysnow/MBCCtools)
+- [MCCA](https://github.com/MaaXYZ/MCCA)
+- [Maa-Assistant-Browndust2](https://github.com/alkaidjin/Maa-Assistant-Browndust2)
+- [Maa-HBR](https://github.com/KarylDAZE/Maa-HBR)
+- [MaaADr](https://github.com/Azureetude/MaaADr)
+- [MaaAshEchoes](https://github.com/moulai/MaaAshEchoes)
+- [MaaDuDuL](https://mddl.codax.site/docs/)
+- [MaaFgo](https://github.com/xlxyvergil/MaaFgo)
+- [MaaGC](https://github.com/KhazixW2/MAAGC)
+- [MaaGF2Exilium](https://github.com/DarkLingYun/MaaGF2Exilium)
+- [MaaGakumasu](https://github.com/SuperWaterGod/MaaGakumasu)
+- [MaaGumballs](https://maagb.xyz/)
+- [MaaKEDR](https://github.com/APPLe-DF/MaaKEDR)
+- [MaaLYSK](https://maalysk.top/)
+- [MaaNTE](https://github.com/1bananachicken/MaaNTE)
+- [MaaPVZ](https://github.com/Maa-Assistant-PVZ-The-best/MAAPVZ)
+- [MaaQNZL](https://github.com/chenxing-ye/MaaQNZL)
+- [MaaResonance](https://github.com/DaiMao204/MaaResonance)
+- [MaaStarResonance](https://github.com/233Official/MaaStarResonance)
+- [MaaYYs](https://github.com/TanyaShue/MaaYYs)
+- [MaaYuan](http://maayuan.com/)
+- [Maa_KES](https://github.com/miaojiuqing/Maa_Kes)
+- [Maa_MHXY_MG](https://github.com/gitlihang/Maa_MHXY_MG)
+- [火影忍者手游MAA](https://github.com/duorua/narutomobile)
+- [识宝小助手](https://github.com/miaojiuqing/Maa_bbb)
+- [MCC_Framework](https://github.com/MAACrossCore/MCC_Framework)（交错战线）
+- [MRA](https://github.com/Saratoga-Official/MRA)（战舰少女R）
+- [MAA](https://maa.plus/)（明日方舟）
+- [MaaVillageConquest](https://github.com/kpAjun/MaaVillageConquest)（村长征战团）
+
+**独立生态（38）**
+
+- [AALC](https://github.com/KIYI671/AhabAssistantLimbusCompany)
+- [AUTO-MAS](https://auto-mas.top/)
+- [Ark-Pets](https://arkpets.harryh.cn/?from=mc)
+- [Auto_Resonance](https://github.com/Night-stars-1/Auto_Resonance)
+- [BAAH 爱丽丝助手](https://github.com/sanmusen214/BAAH)
+- [BAAS](https://baas.wiki/)
+- [BetterGI](https://bettergi.com/)
+- [BetterNTE](https://github.com/BetterAutoFramework/BetterNTE)
+- [FFmpegFreeUI](https://ffmpegfreeui.top/)
+- [Haiyu](https://github.com/BlameTwo/Haiyu)
+- [IMAO](https://github.com/kahvia-d/IMAO)
+- [LALC](https://github.com/HSLix/LixAssistantLimbusCompany)
+- [LocalizeLC](https://www.zeroasso.top/)
+- [M9A](https://1999.fan/)
+- [MATR](https://github.com/NotZoruak/MATR)
+- [MMleo](https://github.com/fictionalflaw/MMleo)
+- [MaaBD2](https://github.com/sunyink/MFABD2)
+- [MangaProof](https://github.com/gunfub/MangaProof)
+- [MicYou](https://micyou.top/)
+- [New-ZexNote](https://github.com/BaiXiaoTao520/New-ZexNote)
+- [OEA](https://oea.biohazard.top/)
+- [OnmyojiDesktopAssistant](https://github.com/AquamarineCyan/OnmyojiDesktopAssistant)
+- [PCL-CE](https://www.pclc.cc/projects/pcl-ce/)
+- [Polymerium](https://github.com/d3ara1n/Polymerium)
+- [ReveriePaint](https://reveriepaint.lanrhyme.top/)
+- [SLIMEIM_Maa](https://github.com/miaojiuqing/SLIMEIM_Maa)
+- [SRA](https://starrailassistant.top/)
+- [SkiHide](https://skihide.xyz/)
+- [三月七小助手](https://m7a.top/)
+- [千机链](https://one-dragon.com/tools/zh/script_chainer.html)
+- [明日方舟速通](https://github.com/AegirTech/ArkLights)
+- [模拟宇宙自动化](https://github.com/CHNZYX/Auto_Simulated_Universe)
+- [胡桃重制版](https://github.com/SnapHutaoRemasteringProject/Snap.Hutao.Remastered)
+- [花笺 Floral Notepaper](https://github.com/Achilng/floral-notepaper)
+- [Better HSR-Currency Wars](https://github.com/439awsl-hue/Better-HSR-Currency-Wars)（崩坏：星穹铁道）
+- [异环驱动计算器](https://github.com/hxwd94666/NTE-Drive-Calculator)
+- [MR3A](https://github.com/originalsage/MR3A)（忍者必须死3）
+- [SSAH](https://github.com/SodaCodeSave/StellaSora-Auto-Helper)（星塔旅人）
+
+---
+
 ## 贡献 / 接手
 
 本项目以 **GPL-3.0** 开源，欢迎接手维护。
