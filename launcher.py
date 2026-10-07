@@ -43,7 +43,7 @@ import zipfile
 import shutil
 import time
 
-from PySide6.QtCore import Qt, QTimer, QThread, Signal, QUrl, QPoint, QEvent, QObject
+from PySide6.QtCore import Qt, QTimer, QThread, Signal, QUrl, QPoint, QSize, QEvent, QObject
 from PySide6.QtGui import QIcon, QPixmap, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QWidget, QDialog, QHBoxLayout, QVBoxLayout, QGridLayout,
@@ -66,7 +66,7 @@ from qfluentwidgets import (
 
 # 启动器自身版本（打包版 / 源码版共用）。发新版时只改这一处，
 # 显示在「设置」页页脚，便于报 bug 时说清自己在跑哪个版本。
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.1.0"
 
 # ===== 应用配置（从 config.json 加载，避免硬编码路径） =====
 # 打包后（PyInstaller）两个目录必须分开算，否则图标全找不到：
@@ -8828,14 +8828,18 @@ class UpdateDialog(QDialog):
 
 
 class NavButton(QWidget):
-    """侧栏里的一行导航项：3px 选中指示条 + 20px 图标 + 文字。"""
+    """侧栏里的一行导航项：选中指示条 + 图标 + 文字。
+
+    折叠态（set_collapsed(True)）只留图标并居中：隐藏文字标签与指示条、
+    左右边距对称收紧，整行仍可点击，选中态改由整行背景高亮表达。
+    尺寸随窗口缩放（apply_scale）：图标/字体/行高/边距按倍率 s 同步放大。
+    """
 
     clicked = Signal(str)
 
     def __init__(self, key, text, icon=None, icon_path=None):
         super().__init__()
         self.key = key
-        self.setFixedHeight(44)
         self.setCursor(Qt.PointingHandCursor)
 
         lay = QHBoxLayout(self)
@@ -8846,53 +8850,109 @@ class NavButton(QWidget):
         self._bar.setFixedWidth(3)
         lay.addWidget(self._bar)
 
+        # 图标源保留原路径/FluentIcon，缩放时按新尺寸重新生成 pixmap
+        self._icon_path = ""
+        self._fluent_icon = None
         if icon_path and os.path.exists(icon_path):
-            ic = QLabel()
-            ic.setPixmap(QPixmap(icon_path).scaled(
-                20, 20, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-            ic.setFixedSize(20, 20)
-            ic.setStyleSheet("background:transparent;")
-            lay.addWidget(ic)
+            self._icon = QLabel()
+            self._icon.setStyleSheet("background:transparent;")
+            self._icon_path = icon_path
         else:
-            iw = IconWidget(icon or FluentIcon.HOME)
-            iw.setFixedSize(20, 20)
-            lay.addWidget(iw)
+            self._icon = IconWidget(icon or FluentIcon.HOME)
+            self._fluent_icon = icon or FluentIcon.HOME
+        self._icon.setFixedSize(20, 20)
+        lay.addWidget(self._icon)
 
         self._label = QLabel(text)
         lay.addWidget(self._label)
         lay.addStretch(1)
+        self.setFixedHeight(44)
+        self._s = 0.0  # 首次 apply_scale 必生效（行高/图标/字体按倍率重设）
         self.set_selected(False)
+
+    def apply_scale(self, s):
+        """按倍率 s 重设图标尺寸/字体/行高/边距（幂等，值没变不重设）。"""
+        if s == getattr(self, "_s", None):
+            return
+        self._s = s
+        px = max(16, int(round(20 * s)))
+        h = max(40, int(round(44 * s)))
+        self.setFixedHeight(h)
+        self._icon.setFixedSize(px, px)
+        if self._icon_path:
+            self._icon.setPixmap(QPixmap(self._icon_path).scaled(
+                px, px, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        # IconWidget 的 paintEvent 按控件自身尺寸绘制，setFixedSize 即完成缩放
+        self.layout().setSpacing(max(8, int(round(10 * s))))
+        self.set_collapsed(getattr(self, "_collapsed", False))  # 重设随缩放变化的边距
+        self.set_selected(getattr(self, "_selected", False))  # 重设字体
+
+    def set_collapsed(self, on):
+        self._collapsed = on
+        s = getattr(self, "_s", 1.0)
+        m = max(8, int(round(10 * s)))
+        if on:
+            self.layout().setContentsMargins(m, 0, m, 0)
+            self._bar.setVisible(False)
+            self._label.setVisible(False)
+        else:
+            self.layout().setContentsMargins(
+                m, 0, max(8, int(round(12 * s))), 0)
+            self._bar.setVisible(True)
+            self._label.setVisible(True)
 
     def mouseReleaseEvent(self, e):
         self.clicked.emit(self.key)
         super().mouseReleaseEvent(e)
 
     def set_selected(self, on):
+        self._selected = on
+        fs = max(14, int(round(14 * getattr(self, "_s", 1.0))))
+        br = max(6, int(round(6 * getattr(self, "_s", 1.0))))
         if on:
             self.setStyleSheet(
-                "NavButton { background-color:rgba(255,255,255,0.09); border-radius:6px; }")
+                "NavButton { background-color:rgba(255,255,255,0.09); "
+                "border-radius:%dpx; }" % br)
             self._bar.setStyleSheet("background:#4a9eff; border-radius:1px;")
             self._label.setStyleSheet(
-                "color:#ffffff; font-size:14px; font-weight:600; background:transparent;")
+                "color:#ffffff; font-size:%dpx; font-weight:600; "
+                "background:transparent;" % fs)
         else:
             self.setStyleSheet(
-                "NavButton { background:transparent; border-radius:6px; }"
-                "NavButton:hover { background-color:rgba(255,255,255,0.05); }")
+                "NavButton { background:transparent; border-radius:%dpx; }"
+                "NavButton:hover { background-color:rgba(255,255,255,0.05); }"
+                % br)
             self._bar.setStyleSheet("background:transparent; border-radius:1px;")
             self._label.setStyleSheet(
-                "color:#c9ccd4; font-size:14px; background:transparent;")
+                "color:#c9ccd4; font-size:%dpx; background:transparent;" % fs)
 
 
 class SideBar(QWidget):
-    """固定 220px 宽的深色侧栏：顶部品牌区 + 中部导航 + 底部设置。"""
+    """深色侧栏：顶部品牌区（含折叠按钮）+ 中部导航 + 底部设置。
+
+    折叠有两驱动：① 自适应——主窗口宽度 < AUTO_COLLAPSE_BELOW 自动收起、
+    拉宽自动展开（每次 resize 都按窗口宽度重算，是主导行为）；
+    ② 手动——点品牌区折叠按钮临时翻转，下一次拖动窗口即回到自适应。
+    尺寸自适应：宽度/图标/字体/行高随窗口大小按 scale_for() 连续缩放
+    （1240 基准 1.0 → 2560 全屏约 1.6），大屏全屏不再显得字小图标小。
+    """
+
+    EXPANDED_W = 220
+    COLLAPSED_W = 56
+    AUTO_COLLAPSE_BELOW = 900  # 窗口宽度低于此值自动折叠成图标列
+    BASE_WIDTH = 1240          # 设计基准窗口宽（Launcher 默认 resize 值）
+    MAX_SCALE = 1.7            # 缩放上限，防超宽屏把侧栏撑得离谱
 
     sig_changed = Signal(str)
 
     def __init__(self, apps):
         super().__init__()
-        self.setFixedWidth(220)
         self.setStyleSheet("background-color:#232329;")
         self._buttons = {}
+        # None = 尚未应用过任何态：保证 __init__ 末尾的首次 _apply_collapsed
+        # 不被幂等守卫跳过（setFixedWidth 必须至少执行一次）
+        self._collapsed = None
+        self._s = 0.0  # 首次 apply_scale 必生效
 
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 0, 8, 12)
@@ -8906,17 +8966,22 @@ class SideBar(QWidget):
         bl.setSpacing(10)
         logo = QLabel()
         logo_path = os.path.join(ASSETS_DIR, "launcher-icon.png")
-        if os.path.exists(logo_path):
-            logo.setPixmap(QPixmap(logo_path).scaled(
-                28, 28, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        logo.setFixedSize(28, 28)
         logo.setStyleSheet("background:transparent;")
         bl.addWidget(logo)
-        name = QLabel("游戏助手启动器")
-        name.setStyleSheet(
+        self._logo = logo  # 折叠态隐藏，品牌区只留折叠按钮
+        self._logo_path = logo_path
+        self._brand_label = QLabel("游戏助手启动器")
+        self._brand_label.setStyleSheet(
             "color:#ffffff; font-size:15px; font-weight:700; background:transparent;")
-        bl.addWidget(name)
+        bl.addWidget(self._brand_label)
         bl.addStretch(1)
+        # 折叠/展开按钮：CareLeft/CareRight 实心小尖角，语义即「收起/展开」
+        self._toggle_btn = TransparentToolButton(FluentIcon.CARE_LEFT_SOLID, brand)
+        self._toggle_btn.setCursor(Qt.PointingHandCursor)
+        self._toggle_btn.setToolTip("收起侧栏")
+        self._toggle_btn.clicked.connect(self.toggle_collapsed)
+        bl.addWidget(self._toggle_btn)
+        self._brand = brand
         root.addWidget(brand)
 
         line = QWidget()
@@ -8932,6 +8997,57 @@ class SideBar(QWidget):
         root.addStretch(1)
         self._add(root, "settings", "设置", FluentIcon.SETTING, None)
 
+        # 初始先按展开应用版式；主窗口宽度此刻还拿不到（尚未挂进布局），
+        # 由 Launcher.__init__ 挂好后立刻调 auto_adapt(width()) 校正成真实态。
+        self._apply_collapsed(False)
+
+    def scale_for(self, window_width):
+        """窗口宽 → 侧栏倍率：以 BASE_WIDTH 为 1.0 线性放大，封顶 MAX_SCALE。
+        窄窗不缩（下限 1.0）——本来就靠折叠省地方，字再小就没法看了。"""
+        if window_width <= 0:
+            return 1.0
+        return max(1.0, min(self.MAX_SCALE, window_width / float(self.BASE_WIDTH)))
+
+    def apply_scale(self, s):
+        """把倍率应用到品牌区与所有导航项（幂等）。"""
+        if s == self._s:
+            return
+        self._s = s
+        px = max(28, int(round(28 * s)))
+        self._brand.setFixedHeight(max(64, int(round(64 * s))))
+        self._logo.setFixedSize(px, px)
+        if os.path.exists(self._logo_path):
+            self._logo.setPixmap(QPixmap(self._logo_path).scaled(
+                px, px, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        fs = max(15, int(round(15 * s)))
+        self._brand_label.setStyleSheet(
+            "color:#ffffff; font-size:%dpx; font-weight:700; background:transparent;" % fs)
+        tb = max(28, int(round(28 * s)))
+        self._toggle_btn.setFixedSize(tb, tb)
+        root = self.layout()
+        m = max(8, int(round(8 * s)))
+        root.setContentsMargins(m, 0, m, max(12, int(round(12 * s))))
+        root.setSpacing(max(4, int(round(4 * s))))
+        for b in self._buttons.values():
+            b.apply_scale(s)
+        # 宽度两态也随倍率放大（setFixedWidth 幂等，重复设无害）
+        if self._collapsed is not None:
+            self.setFixedWidth(self._side_w(self._collapsed))
+
+    def _side_w(self, collapsed):
+        s = self._s if self._s > 0 else 1.0
+        base = self.COLLAPSED_W if collapsed else self.EXPANDED_W
+        return max(base, int(round(base * s)))
+
+    def auto_adapt(self, window_width):
+        """自适应：折叠态按宽度阈值切换；同时按窗口宽刷新整体倍率。
+
+        每次 resize 都按宽度重算并直接应用——手动折叠只是临时翻转，
+        用户一拖窗口边框就回到自适应结果，两套驱动不会互相打架。
+        """
+        self.apply_scale(self.scale_for(window_width))
+        self._apply_collapsed(window_width < self.AUTO_COLLAPSE_BELOW)
+
     def _add(self, layout, key, text, icon, icon_rel):
         path = ""
         if icon_rel:
@@ -8939,8 +9055,34 @@ class SideBar(QWidget):
                     else os.path.join(LAUNCHER_DIR, icon_rel))
         btn = NavButton(key, text, icon, path)
         btn.clicked.connect(self._on_click)
+        btn.setToolTip(text)  # 折叠态下靠 tooltip 认名字
         self._buttons[key] = btn
         layout.addWidget(btn)
+
+    def toggle_collapsed(self):
+        """手动翻转。不再持久化到 config.json：折叠态现在由窗口宽度实时决定，
+        存「上次是不是手动折的」反而和自适应打架。"""
+        self._apply_collapsed(not self._collapsed)
+
+    def _apply_collapsed(self, on):
+        if self._collapsed == on:
+            return  # 幂等：resize 高频触发，状态没变绝不重排版式
+        self._collapsed = on
+        self.setFixedWidth(self._side_w(on))
+        self._logo.setVisible(not on)
+        self._brand_label.setVisible(not on)
+        # 折叠态品牌区只留折叠按钮，对称边距使其近似居中
+        s = self._s if self._s > 0 else 1.0
+        bl = self._brand_label.parent().layout()
+        m = max(6, int(round(6 * s)))
+        bl.setContentsMargins(
+            (max(12, int(round(12 * s))) if not on else m), 0,
+            (max(12, int(round(12 * s))) if not on else m), 0)
+        self._toggle_btn.setIcon(
+            FluentIcon.CARE_RIGHT_SOLID if on else FluentIcon.CARE_LEFT_SOLID)
+        self._toggle_btn.setToolTip("展开侧栏" if on else "收起侧栏")
+        for b in self._buttons.values():
+            b.set_collapsed(on)
 
     def _on_click(self, key):
         self.select(key)
@@ -11057,7 +11199,10 @@ class Launcher(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("游戏助手启动器")
-        self.setMinimumSize(1080, 680)
+        # 最小宽 800：折叠侧栏(56) + 游戏页卡片最小宽(560) + 页边距(56) + 余量。
+        # 原为 1080；放宽后窗口能拖到比 SideBar.AUTO_COLLAPSE_BELOW 更窄，
+        # 侧栏「窄窗口自动收成一列图标」的自适应才有触发空间。
+        self.setMinimumSize(800, 680)
         self.resize(1240, 800)
         # 窗口图标用「游戏助手启动器」通用图标，而不是某个具体游戏图标
         self.setWindowIcon(QIcon(os.path.join(ASSETS_DIR, "launcher-icon.png")))
@@ -11070,6 +11215,8 @@ class Launcher(QWidget):
         # 只列正式助手：预约条目没有安装/运行语义，不该占侧栏（否则几十条撑爆侧栏）
         self.sidebar = SideBar(LIVE_APPS)
         root.addWidget(self.sidebar)
+        # 挂进布局后立刻按主窗口当前宽度校正折叠态（启动即窄窗也能正确收起）
+        self.sidebar.auto_adapt(self.width())
 
         # ===== 右侧堆叠内容区 =====
         # 所有页面一次性预创建并常驻：QStackedWidget 切页只是隐藏/显示、不销毁 widget，
@@ -11124,6 +11271,18 @@ class Launcher(QWidget):
         # （它们各自 __init__ 里只 connect 不 start），因此第一次 tick 时订阅者
         # 全部就绪，不会出现「半张卡没刷到」的错位。
         heartbeat().start()
+
+    def resizeEvent(self, event):
+        """窗口宽度变化 → 侧栏自适应（窄收图标列、宽复图标+名字）。
+
+        只转发宽度，不做其它事；SideBar.auto_adapt 幂等，拖动过程中
+        同一状态不会反复重排。super 放最后，保证布局按新宽度重算。
+        """
+        try:
+            self.sidebar.auto_adapt(self.width())
+        except Exception:
+            pass
+        super().resizeEvent(event)
 
     def changeEvent(self, event):
         """窗口最小化时暂停轮询——界面都看不见了，没必要每 5 秒扫一遍进程。
