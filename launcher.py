@@ -10514,6 +10514,9 @@ class RankBoard(QWidget):
         self.empty_lbl = CaptionLabel("暂无数据")
         self.empty_lbl.setVisible(False)
         root.addWidget(self.empty_lbl)
+        # 底部弹性：外层给本卡分配的高度大于内容时，富余留在这里，
+        # 内容保持顶部对齐（否则 QVBoxLayout 会把行距拉开、三行散开）。
+        root.addStretch(1)
 
     def set_rows(self, rows, placeholder="暂无数据"):
         """rows: [(key, 指标文案)]，调用方排好序；空列表显示占位文案。"""
@@ -10586,9 +10589,12 @@ class RankRail(QWidget):
         self.board_activity = RankBoard("活跃度", "近30天提交", self._apps_by_key)
         self.board_stars = RankBoard("星标数", "社区体量", self._apps_by_key)
         self.board_usage = RankBoard("我的使用", "本机启动", self._apps_by_key)
+        # 三个榜均分整栏高度（stretch=1）：全屏时左轮播涨得很高，
+        # 若这里不加权，三块只占内容自然高度、下方空一大片，左右严重失衡。
+        # 配合 RankBoard 内部的底部 addStretch，富余空间落在每块卡的底部，
+        # 行内容仍顶部对齐，不会把三行拉散。
         for b in (self.board_activity, self.board_stars, self.board_usage):
-            root.addWidget(b)
-        root.addStretch(1)
+            root.addWidget(b, 1)
         self.set_github({})
         self.refresh_usage()
 
