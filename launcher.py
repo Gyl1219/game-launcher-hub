@@ -9482,12 +9482,9 @@ def build_banner_slides(apps, cards, max_slides=6):
                 "summary": "已是最新版本，点此查看详情或启动。",
                 "action": "去启动", "target": key, "url": "",
             })
-    slides.append({
-        "key": "__self__", "name": "启动器自身", "icon": "", "poster": "",
-        "title": "v%s 已发布" % APP_VERSION,
-        "summary": "下载支持暂停续传与取消，修复 416 越界；exe 免安装可用。",
-        "action": "看 Release", "target": "", "url": _RELEASES_URL,
-    })
+    # 原「启动器自身」条目已移除：轮播定位是「展示各游戏当前版本海报」，
+    # 混一条启动器自身的广告位不搭（用户要求）。空态由 _rebuild 兜底：
+    # slides 为空时隐藏轮播并停定时器，不会留下空白框。
     return slides[:max_slides]
 
 
