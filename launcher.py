@@ -10805,6 +10805,7 @@ class SettingsPage(QWidget):
         root.addWidget(tip0)
 
         self._root_card = CardWidget()
+        self._root_card.setMinimumHeight(64)  # 防滚动容器把卡片压成一条线
         cl = QHBoxLayout(self._root_card)
         cl.setContentsMargins(14, 12, 14, 12)
         cl.setSpacing(12)
@@ -11527,7 +11528,9 @@ class Launcher(QWidget):
         self._add_page("overview", self.overview_page)
         for key, card in game_pages:
             self._add_page(key, _make_scroll_page(card))
-        self._add_page("settings", self.settings_page)
+        # 设置页内容较长（安装位置/CDK/更新/遥测/GitHub…），必须可滚动，
+        # 否则窗口一矮各分区就被压扁叠在一起（用户实测）。复用统一的滚动页容器。
+        self._add_page("settings", _make_scroll_page(self.settings_page, max_width=760))
 
         root.addWidget(self.stack, stretch=1)
 
