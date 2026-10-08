@@ -11476,6 +11476,31 @@ def _make_scroll_page(child, max_width=900):
     return page
 
 
+class SettingsDialog(QDialog):
+    """独立设置窗口：包住常驻的 SettingsPage。
+
+    为什么独立成窗：设置内容较长，塞主窗口堆叠页里要么撑出滚动条、
+    要么在窗口变矮时把分区压扁；独立窗尺寸自定（默认 780x720，可自由缩放、
+    可最大化），形态也与 TapTap/WeGame 的设置一致。SettingsPage 实例
+    常驻主窗口（self-update 静默检查等直接引用它），对话框只借用显示。
+    """
+
+    def __init__(self, page, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("设置")
+        self.resize(780, 720)
+        self.setMinimumSize(560, 420)
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+        # 复用统一的滚动容器：内容超出窗口高度就滚动，绝不挤压分区
+        v.addWidget(_make_scroll_page(page, max_width=760))
+
+        page.show()  # 页面此前在 stack 里可能处于隐藏态
+
+
 class Launcher(QWidget):
     def __init__(self):
         super().__init__()
@@ -11524,13 +11549,13 @@ class Launcher(QWidget):
         # 3) 设置页
         self.settings_page = SettingsPage()
 
-        # 4) 按「总览 → 三个游戏 → 设置」顺序入栈，全部常驻
+        # 4) 按「总览 → 三个游戏」顺序入栈，全部常驻
+        #    设置不放 stack：点侧栏「设置」弹独立 SettingsDialog（见 switch_to），
+        #    独立窗尺寸自定、可自由缩放，内容长也只是窗内滚动，不挤压主窗口布局。
         self._add_page("overview", self.overview_page)
         for key, card in game_pages:
             self._add_page(key, _make_scroll_page(card))
-        # 设置页内容较长（安装位置/CDK/更新/遥测/GitHub…），必须可滚动，
-        # 否则窗口一矮各分区就被压扁叠在一起（用户实测）。复用统一的滚动页容器。
-        self._add_page("settings", _make_scroll_page(self.settings_page, max_width=760))
+        self._settings_dialog = None  # 惰性创建，复用同一实例
 
         root.addWidget(self.stack, stretch=1)
 
@@ -11609,12 +11634,32 @@ class Launcher(QWidget):
         self.stack.addWidget(page)
 
     def switch_to(self, key):
-        """切到指定页面（侧栏点击、总览页点卡片两条路径共用）。"""
+        """切到指定页面（侧栏点击、总览页点卡片两条路径共用）。
+
+        "settings" 特殊：不切 stack，弹独立设置窗口（非模态，可与主窗口并存）。
+        """
+        if key == "settings":
+            self._open_settings_dialog()
+            # 侧栏高亮弹回当前实际页面，避免「设置」停在选中态造成误导
+            current = self.stack.currentWidget()
+            for k, idx in self._page_index.items():
+                if idx == self.stack.currentIndex() and k != "settings":
+                    self.sidebar.select(k)
+                    break
+            return
         idx = self._page_index.get(key)
         if idx is None:
             return
         self.stack.setCurrentIndex(idx)
         self.sidebar.select(key)  # 内部有幂等守卫，不会递归
+
+    def _open_settings_dialog(self):
+        """弹出设置独立窗（单例复用；已开则置顶激活，不重复创建）。"""
+        if self._settings_dialog is None:
+            self._settings_dialog = SettingsDialog(self.settings_page, parent=self)
+        self._settings_dialog.show()
+        self._settings_dialog.raise_()
+        self._settings_dialog.activateWindow()
 
 
     def run_game_scan(self):
