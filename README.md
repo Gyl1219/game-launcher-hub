@@ -123,15 +123,21 @@ AUTO-MAS：拿这些已装好的助手，编排多账号任务队列、无人值
 
 ## 环境依赖
 
-- Python 3.10+
-- [PySide6](https://pypi.org/project/PySide6/)
-- [PyQt-Fluent-Widgets](https://pypi.org/project/PyQt-Fluent-Widgets/)（`qfluentwidgets`）
+- Python 3.10+（仅支持 Windows）
+- [PySide6](https://pypi.org/project/PySide6/) — Qt for Python
+- [PySide6-Fluent-Widgets](https://pypi.org/project/PySide6-Fluent-Widgets/) — 导入名是 `qfluentwidgets`
+- [dulwich](https://pypi.org/project/dulwich/) — 纯 Python 的 git 实现，拉版本列表用
 
-安装：
+安装（版本以 `requirements.txt` 为准）：
 
 ```bash
-pip install PySide6 PyQt-Fluent-Widgets
+pip install -r requirements.txt
 ```
+
+> ⚠ 包名注意：本项目用 **PySide6**-Fluent-Widgets。网上多数教程写的是
+> `PyQt-Fluent-Widgets`（Qt5/PyQt 版），**装错会崩**。
+
+想改代码请看 [CONTRIBUTING.md](./CONTRIBUTING.md)。
 
 ---
 
@@ -289,6 +295,10 @@ runas /user:Administrator "python launcher.py"
 本项目以 **GPL-3.0** 开源，欢迎接手维护。
 
 - 代码托管：https://github.com/Gyl1219/game-launcher-hub
+- **贡献指南**：[CONTRIBUTING.md](./CONTRIBUTING.md) — 环境搭建、本地运行/打包、
+  测试怎么跑、提 PR 的规范，以及四条「破坏就会闪退」的铁律
+- **依赖清单**：[requirements.txt](./requirements.txt)
+- 报 Bug / 提功能请求：直接开 [Issue](https://github.com/Gyl1219/game-launcher-hub/issues/new/choose)（有模板）
 - 上游生态入口：
   - ok-script 框架：https://ok-script.com/
   - ok-wuthering-waves（鸣潮，社区最活跃）：https://github.com/ok-oldking/ok-wuthering-waves

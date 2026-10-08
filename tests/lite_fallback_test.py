@@ -254,7 +254,12 @@ if not check("err" in got and "xmly" in got["err"],
     fails.append("src-allfail")
 
 print()
+_rc = 0
 if fails:
     print("[FAILED] 未通过: %s" % ", ".join(sorted(set(fails))))
-    sys.exit(1)
-print("[ALL OK] 前端回退逻辑全部通过")
+    _rc = 1
+else:
+    print("[ALL OK] 前端回退逻辑全部通过")
+sys.stdout.flush()
+sys.stderr.flush()
+os._exit(_rc)   # 避开 Qt 线程销毁污染退出码（详见 generic_app_test.py 注释）

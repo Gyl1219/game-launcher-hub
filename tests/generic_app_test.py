@@ -135,4 +135,10 @@ chk("ok-script 卡仍走原路径（非 lite 非 generic）",
     and getattr(ok_card, "_generic", False) is False)
 
 print("\n%d failed" % len(fails))
-sys.exit(1 if fails else 0)
+_rc = 1 if fails else 0
+sys.stdout.flush()
+sys.stderr.flush()
+# 必须 os._exit：本用例造了 AppCard，会带起常驻后台线程；正常退出时
+# Qt 报 "QThread: Destroyed while thread is still running" 并把退出码
+# 污染成 0xC0000409，明明 0 failed 也会被 CI 判成失败。
+os._exit(_rc)

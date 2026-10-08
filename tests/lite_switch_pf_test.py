@@ -64,4 +64,7 @@ py = os.path.join(os.path.dirname(exe), "python-embedded", "python.exe")
 chk("后端 pip 用的 python 存在", os.path.isfile(py))
 
 print("\n%d failed" % len(fails))
-sys.exit(1 if fails else 0)
+_rc = 1 if fails else 0
+sys.stdout.flush()
+sys.stderr.flush()
+os._exit(_rc)   # 避开 Qt 线程销毁污染退出码（详见 generic_app_test.py 注释）

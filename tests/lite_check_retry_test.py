@@ -5,6 +5,31 @@ import launcher
 from PySide6.QtWidgets import QApplication
 qapp = QApplication(sys.argv)
 
+
+class _Sig:
+    def connect(self, *a, **k): pass
+
+
+class _NoopWorker:
+    """不启动真实线程的 worker 桩。
+
+    必须在构造 AppCard **之前**换上：卡片 __init__ 会调 _lite_start_check()
+    起真实的联网检查线程。留着它跑，测试结束时 os._exit 会撞在线程持有的
+    原生锁上，偶发 0xC0000005 访问违例（实测 5 次崩 2 次）。
+    从源头不建线程，才是稳定解法；事后 wait()/sleep 都只是碰运气。
+    """
+
+    def __init__(self, *a, **k):
+        self.done = _Sig()
+        self.failed = _Sig()
+
+    def start(self):
+        pass
+
+
+_orig_check_worker = launcher.LiteReleaseCheckWorker   # 真类留个引用，便于需要时还原
+launcher.LiteReleaseCheckWorker = _NoopWorker
+
 app = [a for a in launcher.APPS if a.get("key") == "whimbox"][0]
 card = launcher.AppCard(app)
 card._rebuild_lite_body()
@@ -62,4 +87,7 @@ chk("成功后按钮脱离重试态(文案=%r)" % card.update_btn.text(),
 chk("成功后 ver_hint 含仓库最新", "3.1.0" in card.ver_hint.text())
 
 print("\n%d failed" % len(fails))
-sys.exit(1 if fails else 0)
+_rc = 1 if fails else 0
+sys.stdout.flush()
+sys.stderr.flush()
+os._exit(_rc)   # 避开 Qt 线程销毁污染退出码（详见 generic_app_test.py 注释）

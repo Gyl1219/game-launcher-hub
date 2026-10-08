@@ -13,7 +13,7 @@ import tempfile
 import unittest.mock as mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-sys.path.insert(0, r"D:\OKApps\launcher")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import launcher  # noqa: E402
 from PySide6.QtWidgets import QApplication, QTextEdit  # noqa: E402
@@ -61,8 +61,17 @@ class FakeCard:
         }
 
 
-def app_def(key, display, icon=""):
-    return {"key": key, "display": display, "icon": icon}
+def app_def(key, display, icon="", poster=""):
+    return {"key": key, "display": display, "icon": icon, "poster": poster}
+
+
+def make_big_image(path, w=900, h=600):
+    """造一张够大的真图当海报用（poster_for 会校验宽度 >= _POSTER_MIN_W）。"""
+    from PySide6.QtGui import QImage
+    img = QImage(w, h, QImage.Format_RGB32)
+    img.fill(0xFF3366CC)
+    img.save(path, "PNG")
+    return path
 
 
 # ===== 版本号解析 =====
@@ -110,13 +119,29 @@ chk("已安装且无更新的不进轮播",
     not any(s["key"] == "ok-nte" for s in slides))
 chk("未安装的进轮播且动作是「去安装」",
     any(s["key"] == "maa-end" and s["action"] == "去安装" for s in slides))
-chk("启动器自身那条恒在（保证永远有内容）",
-    any(s["key"] == "__self__" for s in slides))
-self_slide = [s for s in slides if s["key"] == "__self__"][0]
-chk("自身条目版本号取自 APP_VERSION",
-    launcher.APP_VERSION in self_slide["title"])
-chk("自身条目带 Release 链接", self_slide["url"].startswith("https://"))
-chk("自身条目不触发跳转详情页", self_slide["target"] == "")
+# v1.2.0 起轮播不再放「启动器自身」条目（定位是展示各游戏当前版本海报），
+# 空态改由 BannerCarousel._rebuild 隐藏轮播兜底。这里固化新行为。
+chk("不再包含「启动器自身」条目",
+    not any(s["key"] == "__self__" for s in slides))
+
+# 已装且最新、但配了海报的助手应进轮播（展示当前版本）
+_big = make_big_image(os.path.join(TMP, "pp.png"))
+_pkey, _purl = "ok-nte", "https://example.com/pp.png"
+_ppath = launcher._poster_cache_path(_pkey, _purl)
+os.makedirs(os.path.dirname(_ppath), exist_ok=True)
+shutil.copyfile(_big, _ppath)
+slides_poster = launcher.build_banner_slides(
+    [app_def("ok-nte", "异环", poster=_purl)],
+    {"ok-nte": FakeCard(installed=True, version="v1.4.9")})
+chk("已装最新但有海报的助手进轮播",
+    any(s["key"] == "ok-nte" for s in slides_poster))
+chk("该条目标题带当前版本",
+    any(s["key"] == "ok-nte" and "v1.4.9" in s["title"] for s in slides_poster))
+chk("该条目带上海报路径",
+    any(s["key"] == "ok-nte" and s.get("poster") for s in slides_poster))
+chk("已装最新且无海报的不进轮播",
+    launcher.build_banner_slides([app_def("ok-nte", "异环")],
+                                 {"ok-nte": FakeCard(installed=True)}) == [])
 
 # 没有 changelog 时的兜底文案
 slides_nb = launcher.build_banner_slides(
@@ -136,12 +161,12 @@ class BoomCard:
     def snapshot(self):
         raise RuntimeError("boom")
 
-chk("卡片缺失被跳过", launcher.build_banner_slides(
-    [app_def("x", "X")], {}) == [launcher.build_banner_slides([], {})[0]])
-chk("snapshot 抛异常不影响其余条目",
+# v1.2.0 起没有「启动器自身」兜底条目，所以卡片缺失时结果就是空列表
+chk("卡片缺失被跳过", launcher.build_banner_slides([app_def("x", "X")], {}) == [])
+chk("snapshot 抛异常被跳过（只剩正常那条）",
     len(launcher.build_banner_slides(
         [app_def("x", "X"), app_def("y", "Y")],
-        {"x": BoomCard(), "y": FakeCard(installed=False)})) == 2)
+        {"x": BoomCard(), "y": FakeCard(installed=False)})) == 1)
 
 # ===== 轮播容器 =====
 car = launcher.BannerCarousel()

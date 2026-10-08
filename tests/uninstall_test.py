@@ -11,7 +11,7 @@ import tempfile
 import unittest.mock as mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-sys.path.insert(0, r"D:\OKApps\launcher")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import launcher  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
@@ -157,7 +157,9 @@ def make_card():
          "app_json": "", "working": "", "pythonw": "",
          "icon": "", "website": ""}
     c = launcher.AppCard(a)
-    c._is_process_running = lambda: False
+    # 真实签名是 _is_process_running(force=False)（10-07 进程检测重构加的），
+    # mock 必须一起接受该关键字，否则 uninstall_app 里 force=True 的调用会 TypeError。
+    c._is_process_running = lambda force=False: False
     c.rebuild_body = lambda: None
     return c
 

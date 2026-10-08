@@ -1,0 +1,25 @@
+# 运行时依赖（版本与当前发布版 v1.2.0 的实测环境一致）
+#
+# 安装：pip install -r requirements.txt
+# 只有跑源码的话，这三样就够了。
+
+# GUI 框架：Qt for Python
+PySide6==6.11.1
+
+# Fluent 风格控件
+# 注意：pip 包名是 PySide6-Fluent-Widgets，导入名却是 qfluentwidgets。
+# 别装成 PyQt-Fluent-Widgets（那是 Qt5/PyQt 版），装错会崩。
+PySide6-Fluent-Widgets==1.11.3
+
+# 纯 Python 的 git 实现：拉远程 tag 列表；无系统 git 时兜底 checkout
+dulwich==1.2.12
+
+
+# ---- 可选：仅「打包发布」时需要 ----
+# pip install pyinstaller==6.22.3
+# 打包命令见 CONTRIBUTING.md 的「本地打包」。
+
+
+# 说明：本项目**不**依赖 pywin32 / Pillow —— 图片缩放与解码全走 Qt 自带的
+# QImage/QPixmap（原生支持 jpg / png / webp），写桌面 .lnk 用的是纯 struct
+# 拼二进制。这两个包只是开发机上恰好装着，不要误加进来。

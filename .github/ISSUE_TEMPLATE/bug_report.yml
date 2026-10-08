@@ -1,0 +1,96 @@
+name: "🐞 Bug 反馈"
+description: "报告启动器的异常行为"
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！填之前请注意：
+        - **贴日志前把敏感信息打码**：本机路径、用户名、MirrorChyan CDK、GitHub 令牌、邮箱。
+        - 如果只是"看起来不对但其实正常"，请先看 README 的「已知限制」。
+
+  - type: input
+    id: version
+    attributes:
+      label: 启动器版本
+      description: 设置页最底部有「版本 vX.Y.Z」
+      placeholder: "v1.2.0"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: 操作系统
+      placeholder: "Windows 11 23H2 / Windows 10 22H2"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: 涉及模块
+      multiple: true
+      options:
+        - 安装（一键下载安装）
+        - 更新（版本切换 / 应用到 working）
+        - 启动 / 运行状态检测
+        - 总览页（轮播 / 排行榜 / 预约区）
+        - 侧栏 / 界面布局
+        - 设置页
+        - 打包版启动失败
+        - 其它
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+      description: 尽量精确到"点了哪个按钮"
+      placeholder: |
+        1. 打开总览页
+        2. 点「鸣潮」卡片的「更新」
+        3. 下拉选 v3.6.4
+        4. 按钮文案仍显示「更新到 v3.6.7」
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+      placeholder: "按钮应变成「降级到 v3.6.4」"
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际发生了什么
+      description: 有截图/录屏请直接拖进来
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 错误日志
+      description: |
+        `logs/error.log` 的相关片段（**贴之前务必打码敏感信息**）。
+        会自动按代码块渲染，不用手动加反引号。
+      render: text
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 已确认用的是**最新版**启动器（设置页 → 检查更新）
+          required: true
+        - label: 已搜索过现有 Issue，不是重复问题
+          required: true
+        - label: 日志中的路径 / 用户名 / CDK / 令牌已打码
+          required: true

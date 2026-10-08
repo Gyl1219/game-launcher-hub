@@ -457,4 +457,7 @@ with patch.object(launcher, "_exe_file_version", return_value="2.4.7"), \
         chk("装完：说明文本跟着搬", card3._lite_version_map.get("2.5.1（当前后端）") == "2.5.1 说明")
 
 print("\n%d failed" % len(fails))
-sys.exit(1 if fails else 0)
+_rc = 1 if fails else 0
+sys.stdout.flush()
+sys.stderr.flush()
+os._exit(_rc)   # 避开 Qt 线程销毁污染退出码（详见 generic_app_test.py 注释）

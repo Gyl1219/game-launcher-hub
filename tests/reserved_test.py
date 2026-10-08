@@ -15,7 +15,7 @@ import time
 import unittest.mock as mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-sys.path.insert(0, r"D:\OKApps\launcher")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import launcher  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
@@ -89,8 +89,11 @@ cards = {"live-a": FakeCard(), "no-display": FakeCard()}
 slides = launcher.build_banner_slides(apps, cards)
 chk("轮播不含预约条目",
     not any(s["key"] in ("res-1", "res-2") for s in slides))
-chk("启动器自身条目仍在（未被挤掉）",
-    any(s["key"] == "__self__" for s in slides))
+# v1.2.0 起轮播不再有「启动器自身」兜底条目，改为「已装最新但有海报」也进轮播。
+# 这里固化新契约：预约条目绝不产出「去安装」动作（否则会被误当成可安装项）。
+chk("预约条目不会被给出安装动作",
+    not any(s.get("action") == "去安装" and s["key"] in ("res-1", "res-2")
+            for s in slides))
 
 # ===== 安装 / 启动守卫 =====
 res_card_cfg = [a for a in res if a["key"] == "res-1"][0]
