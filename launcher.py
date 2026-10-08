@@ -51,6 +51,7 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QDialog, QHBoxLayout, QVBoxLayout, QGridLayout,
     QMessageBox, QLabel, QScrollArea, QTextEdit, QProgressBar, QProgressDialog,
     QStackedWidget, QCheckBox, QFileDialog, QPushButton,
+    QGraphicsScene, QGraphicsPixmapItem, QGraphicsBlurEffect,
 )
 from qfluentwidgets import (
     setTheme, Theme, CardWidget, IconWidget, StrongBodyLabel,
@@ -9488,6 +9489,30 @@ def build_banner_slides(apps, cards, max_slides=6):
     return slides[:max_slides]
 
 
+def _blur_pixmap(pm, radius=20):
+    """高斯模糊一张 QPixmap（用 Qt 自带 QGraphicsBlurEffect，零新依赖）。
+
+    离屏场景渲染：把图放进 QGraphicsScene → 挂模糊特效 → render 回 QPixmap。
+    失败时原样返回（宁可没模糊，也不能因为特效不可用而画不出背景）。
+    """
+    try:
+        scene = QGraphicsScene()
+        item = QGraphicsPixmapItem(pm)
+        blur = QGraphicsBlurEffect()
+        blur.setBlurRadius(radius)
+        blur.setBlurHints(QGraphicsBlurEffect.QualityHint)
+        item.setGraphicsEffect(blur)
+        scene.addItem(item)
+        out = QPixmap(pm.size())
+        out.fill(Qt.transparent)
+        painter = QPainter(out)
+        scene.render(painter, QRectF(out.rect()), QRectF(pm.rect()))
+        painter.end()
+        return out if not out.isNull() else pm
+    except Exception:
+        return pm
+
+
 class _BannerSlide(QWidget):
     """单张横幅：海报作背景（无图时纯色渐变）+ 图标 / 名称 / 大字标题 / 要点 / 按钮。
 
@@ -9507,6 +9532,7 @@ class _BannerSlide(QWidget):
             if not pm.isNull() and pm.width() >= _POSTER_MIN_W:
                 self._poster = p
         self.setCursor(Qt.PointingHandCursor)
+        self._bg_cache = {}   # (poster, w, h) -> 模糊底缓存，避免每次重绘都跑高斯模糊
         # 有海报时底色交给 paintEvent 画，不能用样式表铺底色盖住图
         self.setStyleSheet(
             "QWidget{background-color:%s;border-radius:8px;}" % self._bg
@@ -9564,7 +9590,14 @@ class _BannerSlide(QWidget):
         return lab
 
     def paintEvent(self, e):
-        """画海报背景（Cover 裁切）+ 左侧渐变蒙版。无海报时走样式表纯色，不进这里。"""
+        """画海报背景：**完整显示**海报（不裁人）+ 两侧模糊补边 + 左侧渐变蒙版。
+
+        为什么不用 Cover：海报是 16:9（1920x1080），横幅是 ~3:1 的横条。
+        Cover 必须在"保留中间一条"和"切掉上下"之间二选一，全屏时等于把
+        人物头部直接裁掉（用户实测）。改用 Contain + 同图放大模糊铺底：
+        画面一个像素不少，两侧空白由同色系模糊填满，视觉上仍是整块横幅
+        ——这也是 B站/Steam 横幅的通用做法。
+        """
         if not self._poster:
             super().paintEvent(e)
             return
@@ -9575,14 +9608,37 @@ class _BannerSlide(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.SmoothPixmapTransform, True)
         p.setClipPath(self._rounded())
-        # Cover：按控件比例裁切居中，绝不拉伸变形
         w, h = self.width(), self.height()
         sw, sh = pm.width(), pm.height()
-        scale = max(w / float(sw), h / float(sh))
-        tw, th = int(sw * scale), int(sh * scale)
-        scaled = pm.scaled(tw, th, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        p.drawPixmap((w - tw) // 2, (h - th) // 2, scaled)
-        # 渐变蒙版：左深（放文字）右透，保证白字可读
+        if sw <= 0 or sh <= 0 or w <= 0 or h <= 0:
+            p.end()
+            return
+
+        # ① 打底：同图放大铺满 + 真高斯模糊 —— 两侧是同色系的柔光，不是生硬的放大局部
+        cover = max(w / float(sw), h / float(sh))
+        bw, bh = max(1, int(sw * cover)), max(1, int(sh * cover))
+        key = (self._poster, w, h)
+        bg = self._bg_cache.get(key) if self._bg_cache else None
+        if bg is None or bg.isNull():
+            base = pm.scaled(bw, bh, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            bg = _blur_pixmap(base, radius=max(8, min(40, bw // 40)))
+            # 只留最近一张，避免反复 resize 时无限堆积
+            self._bg_cache = {key: bg}
+        p.drawPixmap((w - bg.width()) // 2, (h - bg.height()) // 2, bg)
+
+        # ② 主体：完整显示（Contain），居中，绝不裁切画面内容
+        fit = min(w / float(sw), h / float(sh))
+        fw, fh = max(1, int(sw * fit)), max(1, int(sh * fit))
+        front = pm.scaled(fw, fh, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        fx, fy = (w - fw) // 2, (h - fh) // 2
+        # 主体左右两侧轻微压暗，让中间画面更聚焦（模糊底本身已够柔，不必太重）
+        if fx > 0:
+            p.fillRect(0, 0, fx, h, QColor(0, 0, 0, 55))
+        if fx + fw < w:
+            p.fillRect(fx + fw, 0, w - (fx + fw), h, QColor(0, 0, 0, 55))
+        p.drawPixmap(fx, fy, front)
+
+        # ③ 左侧渐变蒙版：保证叠在上面的白字任何画面下都读得清
         g = QLinearGradient(0, 0, w, 0)
         g.setColorAt(0.0, QColor(0, 0, 0, 205))
         g.setColorAt(0.55, QColor(0, 0, 0, 120))
@@ -9656,13 +9712,13 @@ class BannerCarousel(QWidget):
         self.timer.start(self.INTERVAL_MS)
         self.setVisible(False)
 
-    # 横幅宽高比：宽度 / 高度。取 3.0 —— 总览页横幅是「一条」而非大图，
-    # 太高会挤掉下方卡片；3.0 下常见宽度(640~900)对应 213~300px，比例恒定。
-    RATIO = 3.0
-    # 上下限只防极端（超窄窗口不至于压成一条、超宽不至于吞掉整屏），
-    # 不能设得太紧——否则常见宽度全部撞上限，高度又变成固定值，比例白锁。
+    # 横幅宽高比：宽度 / 高度。2.4 是折中——越接近海报自身的 16:9(1.78)，
+    # 两侧模糊补边越窄、画面越大；但太高会把下方卡片挤到看不见。
+    RATIO = 2.4
+    # 下限防超窄窗压成一条；上限放宽到 520，别把全屏比例又卡成固定值
+    # （上一版上限 330 导致全屏实际比例 4:1，是"头看不到"的主因之一）
     MIN_H = 150
-    MAX_H = 330
+    MAX_H = 520
 
     def _apply_ratio(self):
         """按当前宽度锁定横幅高度 —— 保证海报 Cover 裁切比例恒定。
