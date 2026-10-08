@@ -23,6 +23,7 @@
       "working": "ok-nte/ok-nte/data/apps/ok-nte/working",
       "pythonw": "ok-nte/ok-nte/data/apps/ok-nte/python/pythonw.exe",
       "icon": "assets/ok-nte.png",
+      "poster": "https://img-tc.tapimg.com/market/images/50fba011240094ada1c4bf2fd4f56d08.jpg/_tap_screenshot.jpg",
       "website": "https://ok-script.com/ok-nte/"
     },
     {
@@ -44,6 +45,7 @@
       "working": "ok-end-field/data/apps/ok-end-field/working",
       "pythonw": "ok-end-field/data/apps/ok-end-field/python/pythonw.exe",
       "icon": "assets/ok-end-field.png",
+      "poster": "https://img-tc.tapimg.com/market/images/52fe8d20c93586192326a8589bae7fbc.jpg/_tap_screenshot.jpg",
       "website": "https://ok-script.com/ok-end-field/"
     },
     {
@@ -81,6 +83,7 @@
       "working": "",
       "pythonw": "",
       "icon": "maa-end.png",
+      "poster": "https://img-tc.tapimg.com/market/images/52fe8d20c93586192326a8589bae7fbc.jpg/_tap_screenshot.jpg",
       "website": "https://maaend.com/"
     }
   ]
