@@ -66,7 +66,7 @@ from qfluentwidgets import (
 
 # 启动器自身版本（打包版 / 源码版共用）。发新版时只改这一处，
 # 显示在「设置」页页脚，便于报 bug 时说清自己在跑哪个版本。
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 # ===== 应用配置（从 config.json 加载，避免硬编码路径） =====
 # 打包后（PyInstaller）两个目录必须分开算，否则图标全找不到：
@@ -902,6 +902,79 @@ def _load_cfg_safe():
             return json.load(f)
     except Exception:
         return {}
+
+
+def _human_size(nbytes):
+    """字节数 → 「49.6 GB / 853.7 GB」这类可读串（保留 1 位小数，二进制单位）。"""
+    try:
+        n = float(nbytes)
+    except Exception:
+        return "未知"
+    step = 1024.0
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < step or unit == "TB":
+            return ("%.0f %s" % (n, unit)) if unit == "B" else ("%.1f %s" % (n, unit))
+        n /= step
+    return "未知"
+
+
+def _drive_space_text(path):
+    """取 path 所在磁盘的「可用 / 总空间」，失败返回占位文案。
+
+    用 ctypes 走 Win32 GetDiskFreeSpaceExW，与本项目其它进程/磁盘调用风格一致；
+    不引入新依赖，且 UNC / 未就绪盘（如光驱）不会抛异常卡 UI。
+    """
+    try:
+        p = os.path.abspath(path or ".")
+        # 取盘符根（如 D:\），网络路径退化为原样传给 API
+        drive = os.path.splitdrive(p)[0]
+        if drive and not drive.endswith(("\\", "/")):
+            drive += "\\"
+        target = drive or p
+        free = ctypes.c_ulonglong()
+        total = ctypes.c_ulonglong()
+        ok = ctypes.windll.kernel32.GetDiskFreeSpaceExW(
+            ctypes.c_wchar_p(target), None, ctypes.byref(total), ctypes.byref(free))
+        if not ok:
+            return "空间未知"
+        return "%s 可用 / %s 总空间" % (_human_size(free.value), _human_size(total.value))
+    except Exception:
+        return "空间未知"
+
+
+def _drive_display_name(path):
+    """把路径显示成「本地磁盘 (D:)」这种形态（TapTap 风格），失败退回原路径。"""
+    try:
+        drive = os.path.splitdrive(os.path.abspath(path or ""))[0]
+        if not drive:
+            return path or ""
+        letter = drive.rstrip(":\\/").upper()
+        kind = "本地磁盘"
+        try:
+            # 4=DRIVE_REMOVABLE(可移动/U盘) 2=DRIVE_REMOVABLE 也含 U 盘；5=DRIVE_CDROM
+            t = ctypes.windll.kernel32.GetDriveTypeW(ctypes.c_wchar_p(drive + "\\"))
+            if t == 5:
+                kind = "光盘驱动器"
+            elif t in (2, 3):
+                # 2/3 可能是 U 盘或固定盘，用容量粗分不可靠，统一叫本地磁盘
+                kind = "本地磁盘"
+            elif t == 4:
+                kind = "网络驱动器"
+            elif t == 6:
+                kind = "内存盘"
+        except Exception:
+            pass
+        return "%s (%s:)" % (kind, letter)
+    except Exception:
+        return path or ""
+
+
+def _resolve_install_root(raw):
+    """把 config 里的 install_root 规范成绝对路径（兼容正斜杠、相对值）。"""
+    txt = str(raw or "").strip()
+    if not txt:
+        return ""
+    return os.path.abspath(txt.replace("/", os.sep))
 
 
 def mirrorchyan_rid_for(key):
@@ -10719,7 +10792,81 @@ class SettingsPage(QWidget):
 
         cfg = self._read_cfg()
 
+        # ===== 安装位置（全局 install_root）=====
+        # 形态借鉴 TapTap / WeGame：上面一张「盘符 + 可用/总空间」卡片，
+        # 下面是路径行（输入框 + 浏览 + 打开），最后列出已装助手各自的实际目录。
+        # 改这里只影响「之后新装的助手」，不会搬动已装好的——这点必须写清楚。
         root.addSpacing(4)
+        root.addWidget(StrongBodyLabel("安装位置"))
+        tip0 = CaptionLabel(
+            "新装的助手会放到这个目录下（各助手再按自己的子目录分开）。"
+            "改动只影响之后的安装，已装好的不会自动搬家。")
+        tip0.setWordWrap(True)
+        root.addWidget(tip0)
+
+        self._root_card = CardWidget()
+        cl = QHBoxLayout(self._root_card)
+        cl.setContentsMargins(14, 12, 14, 12)
+        cl.setSpacing(12)
+        # 左侧：磁盘图标 + 盘符名（本地磁盘 (D:)）
+        ic = IconWidget(FluentIcon.FOLDER)
+        ic.setFixedSize(24, 24)
+        cl.addWidget(ic)
+        box = QVBoxLayout()
+        box.setSpacing(2)
+        self._drive_label = StrongBodyLabel("")
+        self._drive_label.setStyleSheet("font-size:14px; font-weight:600;")
+        box.addWidget(self._drive_label)
+        self._space_label = CaptionLabel("")
+        self._space_label.setStyleSheet("color:#8a8d96; font-size:12px;")
+        box.addWidget(self._space_label)
+        cl.addLayout(box)
+        cl.addStretch(1)
+        # 右侧：可用空间大字（WeGame 风格，右对齐）
+        self._free_label = StrongBodyLabel("")
+        self._free_label.setStyleSheet("font-size:15px; font-weight:700;")
+        cl.addWidget(self._free_label)
+        root.addWidget(self._root_card)
+
+        # 路径行：输入框 + 浏览 + 打开
+        row_p = QHBoxLayout()
+        row_p.setSpacing(8)
+        self.root_edit = LineEdit()
+        self.root_edit.setPlaceholderText("例如 D:/OKApps")
+        self.root_edit.setFixedHeight(34)
+        self.root_edit.textChanged.connect(self._refresh_root_card)
+        row_p.addWidget(self.root_edit, 1)
+        self.root_browse_btn = PushButton("浏览")
+        self.root_browse_btn.setFixedSize(80, 34)
+        self.root_browse_btn.setCursor(Qt.PointingHandCursor)
+        self.root_browse_btn.clicked.connect(self._on_browse_root)
+        row_p.addWidget(self.root_browse_btn)
+        self.root_open_btn = PushButton("打开")
+        self.root_open_btn.setFixedSize(80, 34)
+        self.root_open_btn.setCursor(Qt.PointingHandCursor)
+        self.root_open_btn.clicked.connect(self._on_open_root)
+        row_p.addWidget(self.root_open_btn)
+        root.addLayout(row_p)
+
+        self._root_msg = CaptionLabel("")
+        self._root_msg.setWordWrap(True)
+        self._root_msg.setStyleSheet("color:#888780; font-size:11px;")
+        root.addWidget(self._root_msg)
+
+        # 已安装助手各自的实际目录（TapTap 的「已安装游戏 + 路径」列表）
+        root.addSpacing(6)
+        self._installed_title = StrongBodyLabel("已安装助手")
+        root.addWidget(self._installed_title)
+        self._installed_list = QVBoxLayout()
+        self._installed_list.setSpacing(2)
+        root.addLayout(self._installed_list)
+
+        self.root_edit.setText(
+            _resolve_install_root(cfg.get("install_root", "")) or "")
+        self._refresh_root_card()
+        self._refresh_installed_list()
+
+        root.addSpacing(10)
         root.addWidget(StrongBodyLabel("MirrorChyan CDK"))
         tip1 = CaptionLabel(
             "填写后，一键安装/更新会优先走国内加速源。到 mirrorchyan.com 登录，"
@@ -11055,6 +11202,109 @@ class SettingsPage(QWidget):
         # 没拿到 exe 资产就别给下载按钮（点下去必然失败）
         self.self_dl_btn.setEnabled(bool(info.get("url")))
 
+    # ---------- 安装位置 ----------
+    def _refresh_root_card(self):
+        """把输入框里的路径同步到卡片：盘符名 + 可用/总空间 + 右对齐可用空间。"""
+        raw = (self.root_edit.text() or "").strip()
+        if not raw:
+            self._drive_label.setText("未指定")
+            self._space_label.setText("留空则使用默认目录")
+            self._free_label.setText("")
+            self._root_msg.setText("")
+            return
+        p = _resolve_install_root(raw)
+        self._drive_label.setText(_drive_display_name(p))
+        space = _drive_space_text(p)
+        self._space_label.setText(space)
+        # 右侧大字只放「可用」，与 TapTap 的观感一致
+        try:
+            free = space.split("可用")[0].strip()
+        except Exception:
+            free = ""
+        self._free_label.setText(free)
+        drv = os.path.splitdrive(p)[0]
+        if drv and not os.path.exists(drv + "\\"):
+            self._root_msg.setText("⚠ 磁盘 %s 不存在或未就绪，安装会失败。" % drv)
+        elif os.path.isdir(p):
+            self._root_msg.setText("目录已存在，新助手将装到它的子目录里。")
+        else:
+            self._root_msg.setText("目录尚不存在，安装时会自动创建。")
+
+    def _on_browse_root(self):
+        cur = _resolve_install_root(self.root_edit.text()) or ""
+        start = cur if os.path.isdir(cur) else (os.path.splitdrive(cur)[0] + "\\" if cur else "")
+        d = QFileDialog.getExistingDirectory(
+            self, "选择安装位置", start or os.path.expanduser("~"))
+        if d:
+            self.root_edit.setText(d)
+            self._refresh_root_card()
+
+    def _on_open_root(self):
+        p = _resolve_install_root(self.root_edit.text())
+        if not p:
+            QMessageBox.information(self, "打开", "请先填写安装位置。")
+            return
+        if not os.path.isdir(p):
+            try:
+                os.makedirs(p, exist_ok=True)
+            except Exception as e:
+                QMessageBox.warning(self, "打开", "目录不存在且创建失败：%s" % e)
+                return
+        try:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(p))
+        except Exception as e:
+            QMessageBox.warning(self, "打开", "打开失败：%s" % e)
+
+    def _refresh_installed_list(self):
+        """列出已装助手及各自实际目录（对应卡片 exe 字段所在目录）。"""
+        lay = self._installed_list
+        while lay.count():
+            it = lay.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        n = 0
+        for app in LIVE_APPS:
+            exe = app.get("exe", "") or ""
+            if not exe or not os.path.isfile(exe):
+                continue
+            d = os.path.dirname(exe)
+            n += 1
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            nm = CaptionLabel(app.get("display", app.get("key", "")))
+            nm.setFixedWidth(90)
+            row.addWidget(nm)
+            pth = CaptionLabel(d)
+            pth.setStyleSheet("color:#8a8d96; font-size:12px;")
+            pth.setToolTip(d)
+            pth.setWordWrap(True)
+            row.addWidget(pth, 1)
+            btn = TransparentToolButton(FluentIcon.FOLDER, self)
+            btn.setFixedSize(26, 26)
+            btn.setToolTip("打开该目录")
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.clicked.connect(lambda _c=False, _d=d: self._open_dir(_d))
+            row.addWidget(btn)
+            wrap = QWidget()
+            wrap.setLayout(row)
+            lay.addWidget(wrap)
+        if n == 0:
+            empty = CaptionLabel("（还没有已安装的助手）")
+            empty.setStyleSheet("color:#888780; font-size:12px;")
+            lay.addWidget(empty)
+        self._installed_title.setText("已安装助手（%d）" % n)
+
+    def _open_dir(self, d):
+        try:
+            if os.path.isdir(d):
+                QDesktopServices.openUrl(QUrl.fromLocalFile(d))
+            else:
+                QMessageBox.information(self, "打开", "目录不存在：%s" % d)
+        except Exception as e:
+            QMessageBox.warning(self, "打开", "打开失败：%s" % e)
+
     def _on_self_check_failed(self, msg):
         self._self_worker = None
         self.self_check_btn.setEnabled(True)
@@ -11146,6 +11396,31 @@ class SettingsPage(QWidget):
         wz = (self.wz_edit.text() or "").strip()
         if wz and not wz.endswith("/"):
             wz += "/"
+
+        # install_root：空值不落盘（回落到代码默认），非空则校验后写正斜杠形式
+        raw_root = (self.root_edit.text() or "").strip()
+        if raw_root:
+            root_abs = _resolve_install_root(raw_root)
+            if not os.path.isabs(root_abs):
+                QMessageBox.warning(self, "安装位置无效",
+                                    "请填写完整的绝对路径，例如 D:/OKApps")
+                return
+            parent = os.path.dirname(root_abs.rstrip("\\/")) or root_abs
+            if not os.path.isdir(root_abs) and not os.path.isdir(parent):
+                QMessageBox.warning(
+                    self, "安装位置无效",
+                    "该路径的上一级目录不存在，无法创建：\n%s" % parent)
+                return
+            # 盘符不存在（如 Z:）直接拦下，避免安装时才发现写不进去
+            drv = os.path.splitdrive(root_abs)[0]
+            if drv and not os.path.exists(drv + "\\"):
+                QMessageBox.warning(self, "安装位置无效",
+                                    "磁盘 %s 不存在或未就绪。" % drv)
+                return
+            cfg["install_root"] = root_abs.replace("\\", "/")
+        else:
+            cfg.pop("install_root", None)
+
         cfg["mirrorchyan_cdk"] = cdk
         cfg["wanzaiyun_proxy"] = wz
         try:
@@ -11154,11 +11429,16 @@ class SettingsPage(QWidget):
         except Exception as e:
             QMessageBox.warning(self, "保存失败", "写 config.json 失败：%s" % e)
             return
+        self._refresh_root_card()
+        self._refresh_installed_list()
+        msg = "设置已写入 config.json"
+        if raw_root:
+            msg += "，新装助手将装到 %s" % _resolve_install_root(raw_root)
         try:
-            InfoBar.success("已保存", "设置已写入 config.json", duration=2500,
+            InfoBar.success("已保存", msg, duration=2500,
                             parent=self, position=InfoBarPosition.TOP_RIGHT)
         except Exception:
-            QMessageBox.information(self, "已保存", "设置已写入 config.json")
+            QMessageBox.information(self, "已保存", msg)
 
 
 def _make_scroll_page(child, max_width=900):
