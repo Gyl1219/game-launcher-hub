@@ -10485,13 +10485,22 @@ def _windows_desc():
 
 
 class RankBoard(QWidget):
-    """一个小榜：标题行（点击展开/收起）+ Top3 或全部行。"""
+    """一个小榜：标题行（点击展开/收起）+ Top3 或全部行。
+
+    内容随栏宽缩放（apply_scale）：全屏时字号/图标/间距一起放大，
+    不再只有卡片外壳变大、里面的字和图标还是默认尺寸（用户实测吐槽点）。
+    """
+
+    # 基准：默认窗口下这块榜的宽度（约 272）对应倍率 1.0
+    BASE_W = 272
+    MAX_SCALE = 1.7
 
     def __init__(self, title, subtitle, apps_by_key, parent=None):
         super().__init__(parent)
         self._apps_by_key = apps_by_key   # key -> (显示名, 图标相对路径)
         self._expanded = False
         self._rows = []                   # [(key, 名称, 图标, 指标文案)]
+        self._s = 1.0
 
         root = QVBoxLayout(self)
         root.setContentsMargins(10, 8, 10, 8)
@@ -10499,11 +10508,10 @@ class RankBoard(QWidget):
 
         head = QHBoxLayout()
         head.setSpacing(4)
-        t = CaptionLabel(title)
-        t.setStyleSheet("font-weight:600;")
-        head.addWidget(t)
-        sub = CaptionLabel(subtitle)
-        head.addWidget(sub)
+        self._title = CaptionLabel(title)
+        head.addWidget(self._title)
+        self._sub = CaptionLabel(subtitle)
+        head.addWidget(self._sub)
         head.addStretch(1)
         root.addLayout(head)
 
@@ -10517,6 +10525,30 @@ class RankBoard(QWidget):
         # 底部弹性：外层给本卡分配的高度大于内容时，富余留在这里，
         # 内容保持顶部对齐（否则 QVBoxLayout 会把行距拉开、三行散开）。
         root.addStretch(1)
+        self._apply_scale_style()
+
+    def apply_scale(self, s):
+        """按倍率 s 放大字号/图标/间距（幂等；行内容需重绘才生效）。"""
+        s = max(1.0, min(self.MAX_SCALE, s))
+        if s == self._s:
+            return
+        self._s = s
+        self._apply_scale_style()
+        self._render()
+
+    def _apply_scale_style(self):
+        s = self._s
+        fs = max(12, int(round(12 * s)))       # 正文/指标字号
+        hs = max(13, int(round(13 * s)))       # 标题字号
+        self._title.setStyleSheet(
+            "font-size:%dpx; font-weight:600;" % hs)
+        self._sub.setStyleSheet("font-size:%dpx;" % fs)
+        self.empty_lbl.setStyleSheet("font-size:%dpx;" % fs)
+        lay = self.layout()
+        m = max(8, int(round(8 * s)))
+        lay.setContentsMargins(m, m, m, m)
+        lay.setSpacing(max(4, int(round(4 * s))))
+        self.rows_box.setSpacing(max(3, int(round(3 * s))))
 
     def set_rows(self, rows, placeholder="暂无数据"):
         """rows: [(key, 指标文案)]，调用方排好序；空列表显示占位文案。"""
@@ -10539,30 +10571,38 @@ class RankBoard(QWidget):
             return
         self.empty_lbl.setVisible(False)
         medals = ("#BA7517", "#888780", "#993C1D")
+        s = self._s
+        iw = max(18, int(round(18 * s)))       # 行图标尺寸随倍率
+        rw = max(12, int(round(12 * s)))       # 名次列宽随倍率
+        fs = max(12, int(round(12 * s)))       # 行文字字号随倍率
         for i, (key, name, icon, metric) in enumerate(shown):
             row = QWidget()
             h = QHBoxLayout(row)
             h.setContentsMargins(0, 0, 0, 0)
-            h.setSpacing(6)
+            h.setSpacing(max(6, int(round(6 * s))))
             rank = QLabel(str(i + 1))
-            rank.setFixedWidth(12)
-            if i < 3:
-                rank.setStyleSheet("color:%s; font-weight:600;" % medals[i])
+            rank.setFixedWidth(rw)
+            rank.setStyleSheet("font-size:%dpx;" % fs + (
+                " color:%s; font-weight:600;" % medals[i] if i < 3 else ""))
             h.addWidget(rank)
             ic = QLabel()
-            ic.setFixedSize(18, 18)
+            ic.setFixedSize(iw, iw)
             ic.setAlignment(Qt.AlignCenter)
             p = icon if os.path.isabs(icon) else (
                 os.path.join(LAUNCHER_DIR, icon) if icon else "")
             try:
                 if p and os.path.exists(p):
                     ic.setPixmap(QPixmap(p).scaled(
-                        18, 18, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                        iw, iw, Qt.KeepAspectRatio, Qt.SmoothTransformation))
             except Exception:
                 pass
             h.addWidget(ic)
-            h.addWidget(CaptionLabel(name), stretch=1)
-            h.addWidget(CaptionLabel(metric))
+            nl = CaptionLabel(name)
+            nl.setStyleSheet("font-size:%dpx;" % fs)
+            ml = CaptionLabel(metric)
+            ml.setStyleSheet("font-size:%dpx;" % fs)
+            h.addWidget(nl, stretch=1)
+            h.addWidget(ml)
             self.rows_box.addWidget(row)
 
     def mouseReleaseEvent(self, e):
@@ -10597,6 +10637,24 @@ class RankRail(QWidget):
             root.addWidget(b, 1)
         self.set_github({})
         self.refresh_usage()
+
+    def resizeEvent(self, e):
+        """栏宽变化 → 按自身宽度算倍率下发给三个榜（字号/图标/间距一起缩放）。
+
+        这是"全屏排行榜字和图标没变大"的根治：以前只把卡片外壳撑高，
+        里面的 18px 图标、12px 字全是写死的。现在以默认栏宽 272 为 1.0 基准，
+        按当前宽度线性放大、封顶 1.7（与侧栏那套同一思路）。
+        """
+        try:
+            w = self.width()
+            if w > 0:
+                s = max(1.0, min(RankBoard.MAX_SCALE,
+                                 w / float(RankBoard.BASE_W)))
+                for b in (self.board_activity, self.board_stars, self.board_usage):
+                    b.apply_scale(s)
+        except Exception:
+            pass
+        super().resizeEvent(e)
 
     def set_github(self, repos):
         """repos: key -> {"stars": n, "commits30d": n}；缺 key / 缺字段都容忍。"""
