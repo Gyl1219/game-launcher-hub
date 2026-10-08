@@ -42,9 +42,11 @@ import urllib.parse
 import zipfile
 import shutil
 import time
+import hashlib
 
-from PySide6.QtCore import Qt, QTimer, QThread, Signal, QUrl, QPoint, QSize, QEvent, QObject
-from PySide6.QtGui import QIcon, QPixmap, QDesktopServices
+from PySide6.QtCore import Qt, QTimer, QThread, Signal, QUrl, QPoint, QSize, QEvent, QObject, QRectF
+from PySide6.QtGui import (QIcon, QPixmap, QDesktopServices, QImage, QPainter,
+                           QLinearGradient, QColor, QPainterPath)
 from PySide6.QtWidgets import (
     QApplication, QWidget, QDialog, QHBoxLayout, QVBoxLayout, QGridLayout,
     QMessageBox, QLabel, QScrollArea, QTextEdit, QProgressBar, QProgressDialog,
@@ -9332,6 +9334,103 @@ def _banner_changelog_headline(card, target_ver):
     return ""
 
 
+# ===== 总览轮播海报 =====
+# 每个 app 可在 config.json 里配 poster（图片 URL 或本地路径），作为轮播该页的背景。
+# 设计原则：
+#   1. 联网只是"锦上添花"——下载失败/没配/图太小，一律回落原来的纯色渐变横幅，
+#      绝不出现空白或拉糊的图；
+#   2. 下载走后台线程，绝不阻塞 UI；落盘到 .cache/posters/<key>.<ext>，二次启动直接用缓存；
+#   3. 只在总览页刷新时按需补下载，同一 URL 不重复拉（按 URL 变了才重下）。
+_POSTER_DIR = None
+_POSTER_OK_KEYS = set()      # 已确认可用（本地有缓存且能解码）的 key
+_POSTER_FAILED = set()       # 本轮已失败的 URL，避免每 5 秒重试刷屏
+_POSTER_MIN_W = 800          # 小于此宽度视为"不是海报"（图标/缩略图），不采用
+
+
+def _poster_dir():
+    global _POSTER_DIR
+    if _POSTER_DIR is None:
+        _POSTER_DIR = os.path.join(_cache_dir(), "posters")
+    return _POSTER_DIR
+
+
+def _poster_cache_path(key, url):
+    """缓存文件名带 URL 摘要：换海报 URL 会自动另存，不会吃到旧图。"""
+    ext = ".img"
+    m = re.search(r"\.(jpe?g|png|webp|bmp)(?:\?|$)", (url or "").lower())
+    if m:
+        ext = "." + ("jpg" if m.group(1).startswith("jp") else m.group(1))
+    try:
+        h = hashlib.md5((url or "").encode("utf-8")).hexdigest()[:8]
+    except Exception:
+        h = "x"
+    return os.path.join(_poster_dir(), "%s-%s%s" % (key, h, ext))
+
+
+def poster_for(key, url):
+    """取该 key 的可用海报本地路径；不可用返回 ""（调用方回落到纯色横幅）。
+
+    只查本地缓存 + 尺寸校验，不发网络请求（网络由 PosterWorker 负责）。
+    """
+    if not url:
+        return ""
+    p = _poster_cache_path(key, url)
+    if not os.path.isfile(p):
+        return ""
+    try:
+        im = QImage(p)
+        if im.isNull() or im.width() < _POSTER_MIN_W:
+            return ""
+    except Exception:
+        return ""
+    _POSTER_OK_KEYS.add(key)
+    return p
+
+
+class PosterWorker(QThread):
+    """后台补齐海报：只为「没缓存」的 key 下载一次，下完通知主线程重画。
+
+    失败静默——海报是装饰，绝不能因为一张图下不来就报错或阻塞。
+    同一 URL 失败后记入 _POSTER_FAILED，本进程内不再重试（避免 5 秒心跳狂刷）。
+    """
+
+    sig_done = Signal(str)  # key
+
+    def __init__(self, items, parent=None):
+        super().__init__(parent)
+        self._items = list(items)  # [(key, url)]
+
+    def run(self):
+        for key, url in self._items:
+            if not url or url in _POSTER_FAILED:
+                continue
+            dst = _poster_cache_path(key, url)
+            if os.path.isfile(dst):
+                continue
+            try:
+                os.makedirs(_poster_dir(), exist_ok=True)
+                req = urllib.request.Request(
+                    url, headers={"User-Agent": "OKLauncher/1.0"})
+                with urllib.request.urlopen(req, timeout=25) as r:
+                    data = r.read()
+                # 只接受"够大"的图：太小的是图标/占位图，不值得当背景
+                im = QImage()
+                if not im.loadFromData(data):
+                    _POSTER_FAILED.add(url)
+                    continue
+                if im.width() < _POSTER_MIN_W:
+                    _POSTER_FAILED.add(url)
+                    continue
+                tmp = dst + ".tmp"
+                with open(tmp, "wb") as f:
+                    f.write(data)
+                os.replace(tmp, dst)
+                self.sig_done.emit(key)
+            except Exception:
+                _POSTER_FAILED.add(url)
+                continue
+
+
 def build_banner_slides(apps, cards, max_slides=6):
     """按本地状态构造轮播条目：可更新 > 未安装 > 启动器自身发版。
 
@@ -9352,10 +9451,13 @@ def build_banner_slides(apps, cards, max_slides=6):
         except Exception:
             continue
         name = app.get("display", key)
+        # 海报：本地缓存可用才带，否则留空（横幅回落纯色渐变）
+        poster = poster_for(key, app.get("poster", ""))
         if snap.get("has_update"):
             ver = _banner_newer_version(snap.get("badge", ""))
             slides.append({
                 "key": key, "name": name, "icon": app.get("icon", ""),
+                "poster": poster,
                 "title": ("可更新到 %s" % ver) if ver else "有新版本可用",
                 "summary": (_banner_changelog_headline(card, ver)
                             or "有更新可用，前往详情页查看完整更新说明。"),
@@ -9364,12 +9466,24 @@ def build_banner_slides(apps, cards, max_slides=6):
         elif not snap.get("installed") and not snap.get("host_ready"):
             slides.append({
                 "key": key, "name": name, "icon": app.get("icon", ""),
+                "poster": poster,
                 "title": "尚未安装",
                 "summary": "可在详情页一键安装，下载支持暂停与取消。",
                 "action": "去安装", "target": key, "url": "",
             })
+        elif poster:
+            # 已装且最新：有海报也进轮播，展示当前版本（这才是「游戏当前版本
+            # 宣传海报」的本意——原来只放待办事项，配了海报的已装助手反而看不见）
+            ver = (snap.get("version") or "").strip()
+            slides.append({
+                "key": key, "name": name, "icon": app.get("icon", ""),
+                "poster": poster,
+                "title": ("当前版本 %s" % ver) if ver else "已安装",
+                "summary": "已是最新版本，点此查看详情或启动。",
+                "action": "去启动", "target": key, "url": "",
+            })
     slides.append({
-        "key": "__self__", "name": "启动器自身", "icon": "",
+        "key": "__self__", "name": "启动器自身", "icon": "", "poster": "",
         "title": "v%s 已发布" % APP_VERSION,
         "summary": "下载支持暂停续传与取消，修复 416 越界；exe 免安装可用。",
         "action": "看 Release", "target": "", "url": _RELEASES_URL,
@@ -9378,14 +9492,28 @@ def build_banner_slides(apps, cards, max_slides=6):
 
 
 class _BannerSlide(QWidget):
-    """单张横幅：图标 + 名称 / 大字标题 / 一句要点 / 操作按钮。整块可点。"""
+    """单张横幅：海报作背景（无图时纯色渐变）+ 图标 / 名称 / 大字标题 / 要点 / 按钮。
+
+    有海报时：整块铺满裁切（Cover），左侧压一层从深到透的渐变蒙版，
+    保证白字在任何图上都能读清——这是所有游戏平台横幅的通用做法。
+    整块可点，与原来一致。
+    """
 
     def __init__(self, data, palette, on_activate):
         super().__init__()
         self._on_activate = on_activate
-        bg, accent = palette
-        self.setStyleSheet("QWidget{background-color:%s;border-radius:8px;}" % bg)
+        self._bg, self._accent = palette
+        self._poster = ""
+        p = data.get("poster", "") or ""
+        if p and os.path.exists(p):
+            pm = QPixmap(p)
+            if not pm.isNull() and pm.width() >= _POSTER_MIN_W:
+                self._poster = p
         self.setCursor(Qt.PointingHandCursor)
+        # 有海报时底色交给 paintEvent 画，不能用样式表铺底色盖住图
+        self.setStyleSheet(
+            "QWidget{background-color:%s;border-radius:8px;}" % self._bg
+            if not self._poster else "QWidget{border-radius:8px;}")
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(18, 14, 18, 14)
@@ -9393,7 +9521,7 @@ class _BannerSlide(QWidget):
 
         head = QHBoxLayout()
         head.setSpacing(10)
-        head.addWidget(self._icon(data, accent))
+        head.addWidget(self._icon(data, self._accent))
         nm = StrongBodyLabel(data.get("name", ""))
         nm.setStyleSheet("font-size:14px; font-weight:600;")
         head.addWidget(nm)
@@ -9438,6 +9566,38 @@ class _BannerSlide(QWidget):
             "font-weight:600;" % accent)
         return lab
 
+    def paintEvent(self, e):
+        """画海报背景（Cover 裁切）+ 左侧渐变蒙版。无海报时走样式表纯色，不进这里。"""
+        if not self._poster:
+            super().paintEvent(e)
+            return
+        pm = QPixmap(self._poster)
+        if pm.isNull():
+            super().paintEvent(e)
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        p.setClipPath(self._rounded())
+        # Cover：按控件比例裁切居中，绝不拉伸变形
+        w, h = self.width(), self.height()
+        sw, sh = pm.width(), pm.height()
+        scale = max(w / float(sw), h / float(sh))
+        tw, th = int(sw * scale), int(sh * scale)
+        scaled = pm.scaled(tw, th, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        p.drawPixmap((w - tw) // 2, (h - th) // 2, scaled)
+        # 渐变蒙版：左深（放文字）右透，保证白字可读
+        g = QLinearGradient(0, 0, w, 0)
+        g.setColorAt(0.0, QColor(0, 0, 0, 205))
+        g.setColorAt(0.55, QColor(0, 0, 0, 120))
+        g.setColorAt(1.0, QColor(0, 0, 0, 40))
+        p.fillRect(0, 0, w, h, g)
+        p.end()
+
+    def _rounded(self):
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(self.rect()), 8, 8)
+        return path
+
     def _activate(self):
         if self._on_activate is not None:
             self._on_activate()
@@ -9471,7 +9631,8 @@ class BannerCarousel(QWidget):
         root.setSpacing(8)
 
         self.stack = QStackedWidget()
-        self.stack.setMinimumHeight(150)
+        # 190：海报横幅按 ~16:9 视觉舒适区留的高度（原 150 是纯色卡片时代的）
+        self.stack.setMinimumHeight(190)
         root.addWidget(self.stack, stretch=1)
 
         bar = QHBoxLayout()
@@ -9498,8 +9659,9 @@ class BannerCarousel(QWidget):
 
     def set_slides(self, slides):
         """设置条目。内容没变则原样返回 False（避免无谓重建）。"""
-        sig = tuple((s.get("key", ""), s.get("title", ""), s.get("summary", ""))
-                    for s in slides)
+        # poster 必须进签名：海报是后台异步补的，若不计入，图下好了也不会重建
+        sig = tuple((s.get("key", ""), s.get("title", ""), s.get("summary", ""),
+                     s.get("poster", "")) for s in slides)
         if sig == self._signature:
             return False
         self._signature = sig
@@ -10737,6 +10899,45 @@ class OverviewPage(QWidget):
         except Exception:
             # 轮播是锦上添花，任何异常都不能拖垮总览页
             pass
+        self._maybe_fetch_posters()
+
+    def _maybe_fetch_posters(self):
+        """为「配了 poster 但本地没缓存」的 app 后台补下一张图。
+
+        只下没缓存的；失败的 URL 记入 _POSTER_FAILED，本进程不再重试，
+        避免 5 秒心跳反复拉一个死链。
+        """
+        try:
+            w0 = getattr(self, "_poster_worker", None)
+            if w0 is not None and w0.isRunning():
+                return
+            items = []
+            for app in self._apps:
+                if app.get("reserved"):
+                    continue
+                url = (app.get("poster") or "").strip()
+                key = app.get("key", "")
+                if not url or not key or url in _POSTER_FAILED:
+                    continue
+                if poster_for(key, url):      # 已有可用缓存
+                    continue
+                items.append((key, url))
+            if not items:
+                return
+            w = PosterWorker(items, parent=self)
+            w.sig_done.connect(self._on_poster_done)
+            self._poster_worker = w
+            w.start()
+        except Exception:
+            pass
+
+    def _on_poster_done(self, key):
+        """海报落盘：重画轮播让它用上新图（poster_for 此时能读到缓存）。"""
+        try:
+            self._poster_worker = None
+        except Exception:
+            pass
+        self._refresh_banner()
 
     def _start_stats_worker(self):
         """先用缓存立即渲染，过期/失败超时才后台拉新——主页加载永远不等网络。"""

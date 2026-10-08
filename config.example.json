@@ -33,6 +33,7 @@
       "working": "ok-ww/data/apps/ok-ww/working",
       "pythonw": "ok-ww/data/apps/ok-ww/python/pythonw.exe",
       "icon": "assets/ok-ww.png",
+      "poster": "https://prod-alicdn-community.kurobbs.com/window/17c02c96d8ea465cbeee77d794e6e1dc20260919.jpg?x-oss-process=image%2Fformat%2Cwebp",
       "website": "https://ok-script.com/ok-ww/"
     },
     {
@@ -54,6 +55,7 @@
       "working": "",
       "pythonw": "",
       "icon": "whimbox.png",
+      "poster": "https://webstatic.papegames.com/5af052bffce5c899/images/bg/QLAcPB3VMIdKZPCg.jpg",
       "website": "https://github.com/nikkigallery/Whimbox"
     },
     {
