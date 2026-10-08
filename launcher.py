@@ -11491,6 +11491,8 @@ class SettingsDialog(QDialog):
         self.resize(780, 720)
         self.setMinimumSize(560, 420)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        # 单例复用（close 只隐藏不销毁），下次打开秒现且保留滚动位置
+        self.setAttribute(Qt.WA_DeleteOnClose, False)
 
         v = QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
@@ -11499,6 +11501,24 @@ class SettingsDialog(QDialog):
         v.addWidget(_make_scroll_page(page, max_width=760))
 
         page.show()  # 页面此前在 stack 里可能处于隐藏态
+
+        # 右下角关闭按钮：标题栏 X 万一被系统 tooltip/命中问题挡住时的兜底出口
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 6, 16, 12)
+        row.addStretch(1)
+        self._close_btn = PushButton("关闭")
+        self._close_btn.setFixedSize(96, 32)
+        self._close_btn.setCursor(Qt.PointingHandCursor)
+        self._close_btn.clicked.connect(self.close)
+        row.addWidget(self._close_btn)
+        v.addLayout(row)
+
+    def keyPressEvent(self, e):
+        # Esc 关闭：QDialog 默认行为被 page 内控件吃掉时的兜底
+        if e.key() == Qt.Key_Escape:
+            self.close()
+            return
+        super().keyPressEvent(e)
 
 
 class Launcher(QWidget):
