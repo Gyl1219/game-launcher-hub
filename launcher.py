@@ -9628,8 +9628,10 @@ class BannerCarousel(QWidget):
         root.setSpacing(8)
 
         self.stack = QStackedWidget()
-        # 190：海报横幅按 ~16:9 视觉舒适区留的高度（原 150 是纯色卡片时代的）
-        self.stack.setMinimumHeight(190)
+        # 高度不再写死：由 _apply_ratio() 按宽度算，锁定横幅宽高比。
+        # 原来写死 190 的后果——窗口变宽时只有宽度涨、高度不动，
+        # 宽高比从 2.8 一路变到 3.7，Cover 裁切把海报主体切没了。
+        self.stack.setMinimumHeight(150)
         root.addWidget(self.stack, stretch=1)
 
         bar = QHBoxLayout()
@@ -9653,6 +9655,33 @@ class BannerCarousel(QWidget):
         self.timer.timeout.connect(self._auto_next)
         self.timer.start(self.INTERVAL_MS)
         self.setVisible(False)
+
+    # 横幅宽高比：宽度 / 高度。取 3.0 —— 总览页横幅是「一条」而非大图，
+    # 太高会挤掉下方卡片；3.0 下常见宽度(640~900)对应 213~300px，比例恒定。
+    RATIO = 3.0
+    # 上下限只防极端（超窄窗口不至于压成一条、超宽不至于吞掉整屏），
+    # 不能设得太紧——否则常见宽度全部撞上限，高度又变成固定值，比例白锁。
+    MIN_H = 150
+    MAX_H = 330
+
+    def _apply_ratio(self):
+        """按当前宽度锁定横幅高度 —— 保证海报 Cover 裁切比例恒定。
+
+        宽度变化时若高度不跟着变，宽高比会漂移，同一张海报在宽窗口下
+        被裁成"中间一条"、主体丢失。这里统一按 RATIO 反推高度并设固定值，
+        让 paintEvent 里的 Cover 计算始终面对同一个比例。
+        """
+        w = self.width()
+        if w <= 0:
+            return
+        h = int(round(w / self.RATIO))
+        h = max(self.MIN_H, min(self.MAX_H, h))
+        if self.stack.height() != h:
+            self.stack.setFixedHeight(h)
+
+    def resizeEvent(self, e):
+        self._apply_ratio()
+        super().resizeEvent(e)
 
     def set_slides(self, slides):
         """设置条目。内容没变则原样返回 False（避免无谓重建）。"""
@@ -9696,6 +9725,7 @@ class BannerCarousel(QWidget):
         self.stack.setCurrentIndex(self._index)
         self._update_dots()
         self.setVisible(True)
+        self._apply_ratio()   # 建完条目立刻按宽度定一次高度
         if not self.timer.isActive():
             self.timer.start(self.INTERVAL_MS)
 
