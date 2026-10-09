@@ -5986,6 +5986,17 @@ class AppCard(CardWidget):
         self.mas_stop_btn.setEnabled(False)
         self.mas_stop_btn.clicked.connect(self._mas_stop)
         row_btn.addWidget(self.mas_stop_btn)
+
+        # 桌面版（Electron 前端）入口：后端只是引擎，完整功能在桌面版界面里
+        self.mas_open_btn = PushButton("打开主界面")
+        self.mas_open_btn.setFixedHeight(32)
+        self.mas_open_btn.setCursor(Qt.PointingHandCursor)
+        self.mas_open_btn.clicked.connect(self._mas_open_desktop)
+        row_btn.addWidget(self.mas_open_btn)
+        self._mas_desktop_found = bool(auto_mas_desktop_exe())
+        if not self._mas_desktop_found:
+            self.mas_open_btn.setToolTip(
+                "未找到 AUTO-MAS 桌面版，可在 config.json 用 auto_mas_desktop 指定路径")
         row_btn.addStretch(1)
         lay.addLayout(row_btn)
 
@@ -5999,6 +6010,11 @@ class AppCard(CardWidget):
     def _mas_set_state(self, state, detail=""):
         """更新状态灯与文案。state: stopped/starting/ready/failed"""
         self._mas_state = state
+        # ready 时把端口带上：用户可在浏览器打开 /api/core/health 自查
+        if state == "ready" and detail:
+            port = getattr(self, "_mas_worker_port", 0)
+            if port:
+                detail += " · 端口 %d" % port
         colors = {"stopped": "#888780", "starting": "#E65100",
                   "ready": "#2E7D32", "failed": "#C62828"}
         texts = {"stopped": "未启动", "starting": "启动中…",
@@ -6040,12 +6056,78 @@ class AppCard(CardWidget):
     def _mas_on_state(self, state, detail):
         if state == "ready":
             self.mas_stop_btn.setEnabled(True)
+            w = getattr(self, "_mas_worker", None)
+            self._mas_worker_port = getattr(w, "_port", 0) if w else 0
         elif state in ("stopped", "failed"):
             self.mas_start_btn.setEnabled(True)
             self.mas_stop_btn.setEnabled(False)
             if state == "failed":
                 self.mas_stop_btn.setEnabled(False)
         self._mas_set_state(state, detail)
+
+    def _mas_open_desktop(self):
+        """「打开主界面」：拉起 AUTO-MAS 桌面版（Electron 前端）。
+
+        冲突处理：桌面版自带 runtime，会自己再拉一个后端（默认端口 36163）。
+        若我们监督的后端还活着，等于两个后端同时读写同一份数据目录
+        （重复跑任务、配置互踩）。所以运行中时必须先确认停掉我们的后端再开；
+        后端未运行则直接拉起桌面版。
+        """
+        exe = auto_mas_desktop_exe()
+        if not exe:
+            QMessageBox.information(
+                self.window(), "打开 AUTO-MAS",
+                "未找到 AUTO-MAS 桌面版（AUTO-MAS.exe）。\n"
+                "安装后会自动识别；也可在 config.json 用 "
+                "auto_mas_desktop 指定路径。")
+            return
+        if getattr(self, "_mas_state", "") in ("starting", "ready"):
+            r = QMessageBox.question(
+                self.window(), "打开 AUTO-MAS",
+                "AUTO-MAS 桌面版会自带并启动它自己的后端。\n"
+                "当前由启动器监督的后端若继续运行，两者会同时读写同一份\n"
+                "数据目录（可能重复跑任务、配置互踩）。\n\n"
+                "先停止启动器监督的后端，再打开桌面版？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            if r != QMessageBox.Yes:
+                return
+            w = getattr(self, "_mas_worker", None)
+            if w is not None:
+                w.request_stop()
+            self.mas_stop_btn.setEnabled(False)
+            # 等后端真正退出再拉起桌面版（close 通常 1~2 秒）
+            self._mas_open_pending = exe
+            self._mas_open_deadline = time.time() + 20
+            QTimer.singleShot(500, self._mas_open_poll)
+            return
+        try:
+            subprocess.Popen([exe], cwd=os.path.dirname(exe))
+        except Exception as e:
+            QMessageBox.warning(self.window(), "打开 AUTO-MAS",
+                                "拉起桌面版失败：%s" % e)
+
+    def _mas_open_poll(self):
+        """轮询等监督后端退出干净后再拉起桌面版（最多 20 秒）。"""
+        exe = getattr(self, "_mas_open_pending", "")
+        if not exe:
+            return
+        w = getattr(self, "_mas_worker", None)
+        if w is not None and w.isRunning():
+            if time.time() > getattr(self, "_mas_open_deadline", 0):
+                self._mas_open_pending = ""
+                QMessageBox.warning(
+                    self.window(), "打开 AUTO-MAS",
+                    "旧后端 20 秒未退出，已取消打开桌面版。")
+                return
+            QTimer.singleShot(400, self._mas_open_poll)
+            return
+        self._mas_open_pending = ""
+        self._mas_open_deadline = 0
+        try:
+            subprocess.Popen([exe], cwd=os.path.dirname(exe))
+        except Exception as e:
+            QMessageBox.warning(self.window(), "打开 AUTO-MAS",
+                                "拉起桌面版失败：%s" % e)
 
     def _rebuild_generic_body(self):
         """generic 模式重建：独立 exe 程序（非 ok-script、非奇想盒形态）。
@@ -9685,6 +9767,31 @@ def _auto_mas_python_candidates(root=None):
     cands.append(r"D:\AUTO-MAS\environment\python\python.exe")
     cands.append(sys.executable)
     return cands
+
+
+def auto_mas_desktop_exe():
+    """定位 AUTO-MAS 桌面版（Electron 主程序），找不到返回 ""。
+
+    顺序：config.json 的 auto_mas_desktop（用户显式指定）>
+    install_root/AUTO-MAS/AUTO-MAS.exe > D:/AUTO-MAS/AUTO-MAS.exe。
+    """
+    cands = []
+    cfg = _load_cfg_safe()
+    own = (cfg.get("auto_mas_desktop") or "").strip()
+    if own:
+        cands.append(own)
+    root = str(cfg.get("install_root") or "").strip()
+    if root:
+        cands.append(os.path.join(root.replace("/", os.sep),
+                                  "AUTO-MAS", "AUTO-MAS.exe"))
+    cands.append(r"D:\AUTO-MAS\AUTO-MAS.exe")
+    for p in cands:
+        try:
+            if p and os.path.isfile(p):
+                return p
+        except Exception:
+            continue
+    return ""
 
 
 def _free_port():
