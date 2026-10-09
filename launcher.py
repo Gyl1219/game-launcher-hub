@@ -5515,6 +5515,10 @@ class AppCard(CardWidget):
             return self._rebuild_lite_body()
         if self.app.get("generic"):
             return self._rebuild_generic_body()
+        # AUTO-MAS：不是「某个助手」，而是多账号任务编排后端服务。
+        # 形态是「服务卡」——启动/停止后端，显示健康状态，不参与版本更新体系。
+        if self.app.get("key") == AUTO_MAS_KEY:
+            return self._rebuild_mas_body()
 
         self.data = load_app_json(self.app["app_json"])
         self.profile = get_current_profile(self.data)
@@ -5904,6 +5908,132 @@ class AppCard(CardWidget):
         else:
             self.status_label.setText("未检测到本地安装")
             self._build_uninstalled_actions()
+
+    def _rebuild_mas_body(self):
+        """AUTO-MAS 服务卡：启动/停止后端 + 健康状态灯。
+
+        与其它卡片形态并列，但**不参与版本更新体系**（没有 app_json/working），
+        只关心后端进程是否活着、health 是否就绪。
+        """
+        self._lite = False
+        self._generic = False
+        self._mas = True
+        self._mas_worker = None
+        self._mas_state = "stopped"
+
+        repo, py = auto_mas_paths()
+        self._mas_repo, self._mas_py = repo, py
+
+        # 复用卡片既有骨架：清空动态区后往 body_box 里加（与 lite/generic 同套路）
+        self.clear_body()
+        lay = self.body_box
+
+        # 头部徽章：这是「服务」不是「助手」，别显示未安装/版本
+        self.ver_tag.setText("服务")
+        self.ver_tag.setStyleSheet(
+            "background-color:#455a64; color:#ffffff; border-radius:6px; "
+            "padding:2px 8px; font-size:11px;")
+        self.badge.setText("AUTO-MAS")
+        self.badge.setStyleSheet(
+            "background-color:#5d4037; color:#ffffff; border-radius:9px; "
+            "padding:3px 12px; font-size:12px; font-weight:600;")
+        self.status_label.setText("多账号任务编排后端")
+        self.profile_tag.clear()
+        self.profile_tag.setVisible(False)
+
+        # 状态行
+        row_st = QHBoxLayout()
+        row_st.setSpacing(8)
+        self.mas_dot = QLabel("●")
+        self.mas_dot.setFixedWidth(14)
+        lay_hint = QLabel("后端服务")
+        row_st.addWidget(self.mas_dot)
+        row_st.addWidget(lay_hint)
+        row_st.addStretch(1)
+        self.mas_state = CaptionLabel("未启动")
+        row_st.addWidget(self.mas_state)
+        lay.addLayout(row_st)
+
+        self.mas_detail = CaptionLabel("")
+        self.mas_detail.setWordWrap(True)
+        self.mas_detail.setStyleSheet("color:#8a8d96; font-size:12px;")
+        lay.addWidget(self.mas_detail)
+
+        # 按钮行
+        row_btn = QHBoxLayout()
+        row_btn.setSpacing(8)
+        self.mas_start_btn = PushButton("启动后端")
+        self.mas_start_btn.setFixedHeight(32)
+        self.mas_start_btn.setCursor(Qt.PointingHandCursor)
+        self.mas_start_btn.clicked.connect(self._mas_start)
+        row_btn.addWidget(self.mas_start_btn)
+
+        self.mas_stop_btn = PushButton("停止后端")
+        self.mas_stop_btn.setFixedHeight(32)
+        self.mas_stop_btn.setCursor(Qt.PointingHandCursor)
+        self.mas_stop_btn.setEnabled(False)
+        self.mas_stop_btn.clicked.connect(self._mas_stop)
+        row_btn.addWidget(self.mas_stop_btn)
+        row_btn.addStretch(1)
+        lay.addLayout(row_btn)
+
+        if not repo:
+            # 依赖缺失：仅本卡降级，其余功能不受影响
+            self._mas_set_state("failed", "未找到 AUTO-MAS 后端（vendor 缺失）")
+            self.mas_start_btn.setEnabled(False)
+        else:
+            self._mas_set_state("stopped", "已就绪，点「启动后端」拉起服务")
+
+    def _mas_set_state(self, state, detail=""):
+        """更新状态灯与文案。state: stopped/starting/ready/failed"""
+        self._mas_state = state
+        colors = {"stopped": "#888780", "starting": "#E65100",
+                  "ready": "#2E7D32", "failed": "#C62828"}
+        texts = {"stopped": "未启动", "starting": "启动中…",
+                 "ready": "运行中", "failed": "不可用"}
+        if hasattr(self, "mas_dot"):
+            self.mas_dot.setStyleSheet("color:%s; font-size:14px;"
+                                       % colors.get(state, "#888780"))
+            self.mas_state.setText(texts.get(state, state))
+            self.mas_detail.setText(detail or "")
+
+    def _mas_start(self):
+        if getattr(self, "_mas_worker", None) is not None \
+                and self._mas_worker.isRunning():
+            return
+        repo, py = getattr(self, "_mas_repo", ""), getattr(self, "_mas_py", "")
+        if not repo:
+            self._mas_set_state("failed", "未找到 AUTO-MAS 后端")
+            return
+        workdir = os.path.join(LAUNCHER_CACHE_DIR, "auto-mas")
+        try:
+            os.makedirs(workdir, exist_ok=True)
+        except Exception:
+            workdir = LAUNCHER_CACHE_DIR
+        w = ServiceWorker(repo, py, workdir, parent=self)
+        w.sig_state.connect(self._mas_on_state)
+        self._mas_worker = w
+        self.mas_start_btn.setEnabled(False)
+        self.mas_stop_btn.setEnabled(True)
+        self._mas_set_state("starting", "正在拉起后端…")
+        w.start()
+
+    def _mas_stop(self):
+        w = getattr(self, "_mas_worker", None)
+        if w is not None:
+            w.request_stop()
+        self.mas_stop_btn.setEnabled(False)
+        self._mas_set_state("stopped", "正在停止…")
+
+    def _mas_on_state(self, state, detail):
+        if state == "ready":
+            self.mas_stop_btn.setEnabled(True)
+        elif state in ("stopped", "failed"):
+            self.mas_start_btn.setEnabled(True)
+            self.mas_stop_btn.setEnabled(False)
+            if state == "failed":
+                self.mas_stop_btn.setEnabled(False)
+        self._mas_set_state(state, detail)
 
     def _rebuild_generic_body(self):
         """generic 模式重建：独立 exe 程序（非 ok-script、非奇想盒形态）。
@@ -9452,23 +9582,51 @@ AUTO_MAS_HEALTH_MAX_BYTES = 64 * 1024      # 响应体上限，超过即视为�
 AUTO_MAS_CLOSE_TIMEOUT_SEC = 15            # close 后等待自然退出的秒数
 
 
+AUTO_MAS_VENDOR = os.path.join(LAUNCHER_DIR, "vendor", "auto-mas")
+
+
 def auto_mas_paths():
     """定位 AUTO-MAS 的后端源码与解释器。
 
     返回 (repo_dir, python_exe)；任一项不存在返回 ("", "")。
-    vendor 引入后应改为指向 launcher 目录下的 vendor 副本（见 NOTICE.md）。
+
+    优先级：
+      1) 本仓库的 vendor 副本（vendor/auto-mas，见其 NOTICE.md）——自包含，
+         不依赖用户另外安装 AUTO-MAS，是集成后的正常路径；
+      2) 本机独立安装的 AUTO-MAS（开发/调试用，vendor 缺失时回退）。
     """
+    # 1) vendor 副本
+    v_main = os.path.join(AUTO_MAS_VENDOR, "main.py")
+    if os.path.isfile(v_main):
+        for py in _auto_mas_python_candidates():
+            if py and os.path.isfile(py):
+                return AUTO_MAS_VENDOR, py
+        return AUTO_MAS_VENDOR, sys.executable
+
+    # 2) 本机独立安装（D:\AUTO-MAS 或 launcher 同级）
     for root in (r"D:\AUTO-MAS", os.path.join(os.path.dirname(LAUNCHER_DIR), "AUTO-MAS")):
         repo = os.path.join(root, "repo")
-        main_py = os.path.join(repo, "main.py")
-        if not os.path.isfile(main_py):
+        if not os.path.isfile(os.path.join(repo, "main.py")):
             continue
-        # 优先用 AUTO-MAS 自带 Python；没有则回退当前解释器
-        for py in (os.path.join(root, "environment", "python", "python.exe"),
-                   sys.executable):
-            if os.path.isfile(py):
+        for py in _auto_mas_python_candidates(root):
+            if py and os.path.isfile(py):
                 return repo, py
+        return repo, sys.executable
     return "", ""
+
+
+def _auto_mas_python_candidates(root=None):
+    """候选解释器：AUTO-MAS 自带的优先（版本锁 3.12.x），其次当前解释器。
+
+    AUTO-MAS 依赖较重且锁 Python 3.12，用它自带解释器最稳；
+    独立安装缺失时才回退到启动器自身的解释器（可能版本不符，会走优雅降级）。
+    """
+    cands = []
+    if root:
+        cands.append(os.path.join(root, "environment", "python", "python.exe"))
+    cands.append(r"D:\AUTO-MAS\environment\python\python.exe")
+    cands.append(sys.executable)
+    return cands
 
 
 def _free_port():

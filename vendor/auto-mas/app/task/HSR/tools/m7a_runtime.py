@@ -1,0 +1,494 @@
+#   AUTO-MAS: A Multi-Script, Multi-Config Management and Automation Software
+#   Copyright © 2024-2025 DLmaster361
+#   Copyright © 2025-2026 AUTO-MAS Team
+
+#   This file is part of AUTO-MAS.
+
+#   AUTO-MAS is free software: you can redistribute it and/or modify
+#   it under the terms of the GNU Affero General Public License as
+#   published by the Free Software Foundation, either version 3 of
+#   the License, or (at your option) any later version.
+
+#   AUTO-MAS is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty
+#   of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See
+#   the GNU Affero General Public License for more details.
+
+#   You should have received a copy of the GNU Affero General Public License
+#   along with AUTO-MAS. If not, see <https://www.gnu.org/licenses/>.
+
+#   Contact: DLmaster_361@163.com
+
+
+import asyncio
+import os
+from collections import deque
+from contextlib import suppress
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from inspect import isawaitable
+from pathlib import Path
+from typing import Awaitable, Callable, Mapping
+
+import psutil
+
+from app.utils import ProcessManager, decode_bytes, get_logger
+
+from .log_detect import (
+    M7A_COMPLETION_MARKERS,
+    can_read_stream_live,
+    emit_process_output,
+    has_failure_output,
+    unescape_backslash_u,
+)
+
+logger = get_logger("HSR M7A 运行器")
+
+# M7A 的四处「按任意键继续」统一由 utils/console.py 的 should_skip_pause() 放行，
+# 它认 MARCH7TH_GUI_STARTED，M7A 自己的图形界面拉起 CLI 时用的就是这个标记。
+# 托管运行没人按键：不带它时任务正文跑完仍会停在 input()，而系统 ANSI 代码页
+# 不是中文时更会直接崩在写不出中文的 stdout 上，把已经做完的模块判成失败。
+#
+# M7A 读配置时环境变量优先于 config.yaml（module/config/config.py 的映射表）。
+# MARCH7TH_AFTER_FINISH 钉成 None：托管与直控都不让 M7A 在任务后退出游戏、
+# 关机或睡眠——这些由 MAS 的队列完成后操作负责。后端环境里其余 MARCH7TH_*
+# 会静默盖过 MAS 写进 config.yaml 的值，起进程前剔掉（见 build_m7a_env）。
+M7A_HEADLESS_ENV: dict[str, str] = {
+    "MARCH7TH_GUI_STARTED": "true",
+    "MARCH7TH_AFTER_FINISH": "None",
+}
+M7A_ENV_PREFIX = "MARCH7TH_"
+# 保留的近期输出行数：M7A 失败前会连打十几条同样的 WARNING，太短会把
+# 真正的 ERROR 挤掉。
+RECENT_OUTPUT_LINES = 40
+
+
+def _env_bool(value: bool) -> str:
+    # 三月七的转换函数是 v.lower() in ("true", "1")，只能写这两个字面量之一。
+    return "true" if value else "false"
+
+
+def build_m7a_platform_env(
+    *, cloud: bool, use_paid_time: bool = False
+) -> dict[str, str]:
+    """按游戏平台钉住三月七的云开关（环境变量优先于 config.yaml）。
+
+    客户端平台钉 ``false``，托管运行时用户在三月七里开过云游戏也不会跑到云上
+    （客户端 + 直控不调用这里，见 ``build_platform_m7a_env``）；云平台再钉浏览器
+    类型与有窗口模式，与 MAS 托管浏览器的
+    连接条件一致（内置 Chrome + 同版本 chromedriver，没有 ``--headless``）。
+    ``browser_debug_port`` 等键没有环境变量，只能写 config.yaml。
+    """
+
+    env = {"MARCH7TH_CLOUD_GAME_ENABLE": _env_bool(cloud)}
+    if cloud:
+        env.update(
+            {
+                "MARCH7TH_BROWSER_TYPE": "integrated",
+                "MARCH7TH_BROWSER_HEADLESS_ENABLE": _env_bool(False),
+                "MARCH7TH_CLOUD_GAME_USE_PAID_TIME": _env_bool(use_paid_time),
+            }
+        )
+    return env
+
+
+def build_m7a_env(overrides: Mapping[str, str] | None = None) -> dict[str, str]:
+    """M7A 子进程环境：继承后端环境，剔除继承的 ``MARCH7TH_*``，再叠上 MAS 自己的。
+
+    ``overrides`` 是本轮的平台钉扎（见 :func:`build_m7a_platform_env`）。
+    """
+
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.upper().startswith(M7A_ENV_PREFIX)
+    }
+    env.update(M7A_HEADLESS_ENV)
+    if overrides:
+        env.update(overrides)
+    return env
+
+
+@dataclass
+class M7ACommandResult:
+    task_name: str
+    exe_path: str
+    success: bool = False
+    output: str = ""
+    error: str = ""
+    returncode: int = 0
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+
+class M7ARunner:
+    """March7th Assistant 命令执行器。"""
+
+    def __init__(
+        self,
+        m7a_dir: Path,
+        log_callback: Callable[[str], None] | None = None,
+        output_line_callback: Callable[[str], Awaitable[None] | None] | None = None,
+        completion_grace_timeout: float = 5.0,
+        env_overrides: Mapping[str, str] | None = None,
+        kill_tree: bool = False,
+    ):
+        self._m7a_dir = Path(m7a_dir)
+        self._m7a_exe = self._m7a_dir / "March7th Assistant.exe"
+        self._process_manager = ProcessManager()
+        self._log_callback = log_callback
+        self._output_line_callback = output_line_callback
+        self._completion_grace_timeout = completion_grace_timeout
+        # 本轮的平台钉扎（MARCH7TH_CLOUD_GAME_ENABLE 等），每条命令起进程时叠加。
+        self.env_overrides: dict[str, str] = dict(env_overrides or {})
+        # 停止、超时、收尾时是否按进程树终止（见 terminate）；由平台决定，调用侧
+        # 统一经 account_switch.configure_m7a_runner 设置。
+        self.kill_tree = kill_tree
+        # 当前这条命令最近的输出，供游戏守卫判断进程消失前 M7A 在做什么。
+        self._recent_output: deque[str] = deque(maxlen=RECENT_OUTPUT_LINES)
+
+    @property
+    def root_path(self) -> Path:
+        return self._m7a_dir
+
+    def set_output_line_callback(
+        self, callback: Callable[[str], Awaitable[None] | None] | None
+    ) -> None:
+        """换成当前用户的逐行输出回调（运行器在同一轮的用户之间复用）。"""
+
+        self._output_line_callback = callback
+
+    @property
+    def recent_output_lines(self) -> list[str]:
+        """当前（或最近一条）M7A 命令末尾的输出行，按时间先后排列。"""
+
+        return list(self._recent_output)
+
+    async def terminate_current_process(self) -> bool:
+        """终止当前 M7A 子进程。"""
+
+        if not await self._process_manager.is_running():
+            return False
+
+        logger.warning("正在终止三月七当前子进程")
+        await self._process_manager.kill()
+        return True
+
+    async def terminate(self) -> bool:
+        """停止、超时、收尾统一走这里：按 ``kill_tree`` 选按树终止或只杀主进程。
+
+        云平台下三月七的子进程只有 chromedriver 与它自建的浏览器，按树杀干净；
+        客户端平台下三月七可能自己拉起了游戏客户端，按树杀会把游戏带走，只杀主进程。
+        """
+
+        if self.kill_tree:
+            return await self.terminate_process_tree()
+        return await self.terminate_current_process()
+
+    async def terminate_process_tree(self) -> bool:
+        """按进程树终止当前 M7A：先冻结主进程，杀光子孙，再终止主进程。
+
+        三月七经 selenium 拉起的 chromedriver 以 ``close_fds=False`` 继承了它的
+        stdout/stderr 管道：只杀主进程时管道仍无 EOF，``run_task`` 会一直挂到命令
+        超时，chromedriver 也成了 MAS 清理不到的孤儿。冻结主进程是为了杀子进程
+        期间它不再派生新的。
+        """
+
+        pid = self._process_manager.main_pid
+        if pid is None or not await self._process_manager.is_running():
+            return False
+
+        def _kill_descendants() -> int:
+            try:
+                root = psutil.Process(pid)
+            except psutil.Error:
+                return 0
+            with suppress(psutil.Error):
+                root.suspend()
+            try:
+                children = root.children(recursive=True)
+            except psutil.Error:
+                children = []
+            for child in children:
+                with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                    child.kill()
+            psutil.wait_procs(children, timeout=3)
+            return len(children)
+
+        count = await asyncio.to_thread(_kill_descendants)
+        logger.warning(f"正在按进程树终止三月七（子进程 {count} 个）")
+        await self._process_manager.kill()
+        return True
+
+    def _emit_process_output(self, title: str, text: str) -> None:
+        emit_process_output(self._log_callback, title, text)
+
+    async def _read_stream_live(
+        self,
+        stream,
+        title: str,
+        lines: list[str],
+        completion_event: asyncio.Event | None = None,
+    ) -> None:
+        """逐行读取子进程输出并立即转发到日志。"""
+
+        while True:
+            raw = await stream.readline()
+            if not raw:
+                break
+            if isinstance(raw, str):
+                text = raw
+            else:
+                text = decode_bytes(bytes(raw))
+            for line in unescape_backslash_u(text).rstrip("\r\n").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                lines.append(line)
+                self._recent_output.append(line)
+                self._emit_process_output(title, line)
+                if self._output_line_callback is not None:
+                    result = self._output_line_callback(line)
+                    if isawaitable(result):
+                        await result
+                if completion_event is not None and self._is_completion_line(line):
+                    completion_event.set()
+
+    @staticmethod
+    def _is_completion_line(line: str) -> bool:
+        return any(marker in line for marker in M7A_COMPLETION_MARKERS)
+
+    @classmethod
+    def _has_completion_marker(cls, text: str) -> bool:
+        return any(cls._is_completion_line(line) for line in text.splitlines())
+
+    async def _send_enter_to_process(self, proc: asyncio.subprocess.Process) -> bool:
+        """向已完成但等待交互关闭的 M7A 进程发送回车。"""
+
+        stdin = getattr(proc, "stdin", None)
+        if stdin is None:
+            return False
+
+        try:
+            stdin.write(b"\n")
+            await stdin.drain()
+        except (BrokenPipeError, ConnectionResetError, RuntimeError, OSError) as e:
+            logger.debug(f"M7A 子进程 stdin 已不可写，跳过发送回车：{e}")
+            return False
+        return True
+
+    async def _communicate_with_live_output(
+        self,
+        proc: asyncio.subprocess.Process,
+        timeout: int,
+    ) -> tuple[str, str, bool]:
+        """读取 M7A 输出并检测完成/失败标记。"""
+
+        stdout_stream = getattr(proc, "stdout", None)
+        stderr_stream = getattr(proc, "stderr", None)
+        if not (
+            can_read_stream_live(stdout_stream) or can_read_stream_live(stderr_stream)
+        ):
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout
+            )
+            stdout = unescape_backslash_u(decode_bytes(stdout_bytes)).strip()
+            stderr = unescape_backslash_u(decode_bytes(stderr_bytes)).strip()
+            self._emit_process_output("三月七", stdout)
+            self._emit_process_output("三月七 stderr", stderr)
+            for text in (stdout, stderr):
+                for line in text.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    self._recent_output.append(line)
+                    if self._output_line_callback is None:
+                        continue
+                    result = self._output_line_callback(line)
+                    if isawaitable(result):
+                        await result
+            completed = self._has_completion_marker(
+                stdout
+            ) or self._has_completion_marker(stderr)
+            return stdout, stderr, completed
+
+        stdout_lines: list[str] = []
+        stderr_lines: list[str] = []
+        read_tasks: list[asyncio.Task] = []
+        completion_event = asyncio.Event()
+        if can_read_stream_live(stdout_stream):
+            read_tasks.append(
+                asyncio.create_task(
+                    self._read_stream_live(
+                        stdout_stream,
+                        "三月七",
+                        stdout_lines,
+                        completion_event,
+                    )
+                )
+            )
+        if can_read_stream_live(stderr_stream):
+            read_tasks.append(
+                asyncio.create_task(
+                    self._read_stream_live(
+                        stderr_stream,
+                        "三月七 stderr",
+                        stderr_lines,
+                        completion_event,
+                    )
+                )
+            )
+
+        wait_group = asyncio.gather(proc.wait(), *read_tasks)
+        completion_wait = asyncio.create_task(completion_event.wait())
+        completed_by_marker = False
+        wait_group_cancelled = False
+        try:
+            done, _ = await asyncio.wait(
+                {wait_group, completion_wait},
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                raise asyncio.TimeoutError
+
+            completed_by_marker = completion_event.is_set()
+            if completed_by_marker and not wait_group.done():
+                if await self._send_enter_to_process(proc):
+                    logger.info(
+                        "三月七已输出停止运行标记，已发送回车并等待进程自然退出"
+                    )
+                else:
+                    logger.info("三月七已输出停止运行标记，等待进程自然退出")
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(wait_group),
+                        timeout=self._completion_grace_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "三月七命令已完成但进程未退出，终止子进程以继续后续任务"
+                    )
+                    await self.terminate()
+                    try:
+                        await asyncio.wait_for(wait_group, timeout=2.0)
+                    except asyncio.TimeoutError:
+                        wait_group.cancel()
+                        wait_group_cancelled = True
+                        with suppress(BaseException):
+                            await asyncio.gather(wait_group, return_exceptions=True)
+
+            if wait_group.done() and not wait_group_cancelled:
+                await wait_group
+        except Exception:
+            wait_group.cancel()
+            completion_wait.cancel()
+            for task in read_tasks:
+                task.cancel()
+            with suppress(BaseException):
+                await asyncio.gather(
+                    wait_group,
+                    completion_wait,
+                    return_exceptions=True,
+                )
+            raise
+        finally:
+            completion_wait.cancel()
+            with suppress(BaseException):
+                await asyncio.gather(
+                    completion_wait,
+                    return_exceptions=True,
+                )
+
+        return (
+            "\n".join(stdout_lines).strip(),
+            "\n".join(stderr_lines).strip(),
+            completed_by_marker,
+        )
+
+    async def run_task(self, task_name: str, timeout: int = 600) -> M7ACommandResult:
+        """执行一条 M7A 命令。"""
+
+        started_at = datetime.now(timezone.utc)
+        self._recent_output.clear()
+
+        if not self._m7a_exe.exists():
+            msg = f"March7th Assistant.exe does not exist: {self._m7a_exe}"
+            logger.warning(msg)
+            return M7ACommandResult(
+                task_name=task_name,
+                exe_path=str(self._m7a_exe),
+                success=False,
+                error=msg,
+                started_at=started_at,
+                finished_at=datetime.now(timezone.utc),
+            )
+
+        try:
+            await self._process_manager.open_process(
+                str(self._m7a_exe),
+                task_name,
+                cwd=self._m7a_dir,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=build_m7a_env(self.env_overrides),
+            )
+            proc = self._process_manager.main_process
+            if not isinstance(proc, asyncio.subprocess.Process):
+                raise RuntimeError("三月七子进程启动后未能被 ProcessManager 跟踪")
+            (
+                stdout,
+                stderr,
+                completed_by_marker,
+            ) = await self._communicate_with_live_output(proc, timeout)
+            # rc=0 且没有任何输出不算成功：M7A 未提权时会另起提权进程后原进程
+            # 直接 exit(0)，真正干活的进程脱离了 MAS 的视野。
+            success = (
+                completed_by_marker or (proc.returncode == 0 and bool(stdout or stderr))
+            ) and not has_failure_output(stdout, stderr)
+
+            logger.info(
+                f"三月七 {task_name} → {'success' if success else 'failed'}"
+                f" (rc={proc.returncode})"
+            )
+            return M7ACommandResult(
+                task_name=task_name,
+                exe_path=str(self._m7a_exe),
+                success=success,
+                output=stdout,
+                error=stderr,
+                returncode=proc.returncode or 0,
+                started_at=started_at,
+                finished_at=datetime.now(timezone.utc),
+            )
+
+        except asyncio.TimeoutError:
+            logger.warning(f"三月七 {task_name} timed out after {timeout}s")
+            await self.terminate()
+            return M7ACommandResult(
+                task_name=task_name,
+                exe_path=str(self._m7a_exe),
+                success=False,
+                error=f"command timed out after {timeout}s",
+                started_at=started_at,
+                finished_at=datetime.now(timezone.utc),
+            )
+
+        except asyncio.CancelledError:
+            logger.warning(f"三月七 {task_name} 收到取消请求，准备终止子进程")
+            await self.terminate()
+            raise
+
+        except Exception as e:
+            logger.opt(exception=True).warning(f"三月七 {task_name} error: {e}")
+            return M7ACommandResult(
+                task_name=task_name,
+                exe_path=str(self._m7a_exe),
+                success=False,
+                error=str(e),
+                started_at=started_at,
+                finished_at=datetime.now(timezone.utc),
+            )
+        finally:
+            await self._process_manager.clear()

@@ -1,0 +1,1209 @@
+#   AUTO-MAS: A Multi-Script, Multi-Config Management and Automation Software
+#   Copyright © 2024-2025 DLmaster361
+#   Copyright © 2025-2026 AUTO-MAS Team
+
+#   This file is part of AUTO-MAS.
+
+#   AUTO-MAS is free software: you can redistribute it and/or modify
+#   it under the terms of the GNU Affero General Public License as
+#   published by the Free Software Foundation, either version 3 of
+#   the License, or (at your option) any later version.
+
+#   AUTO-MAS is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty
+#   of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See
+#   the GNU Affero General Public License for more details.
+
+#   You should have received a copy of the GNU Affero General Public License
+#   along with AUTO-MAS. If not, see <https://www.gnu.org/licenses/>.
+
+#   Contact: DLmaster_361@163.com
+
+
+import asyncio
+import json
+import os
+from contextlib import suppress
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from inspect import isawaitable
+from pathlib import Path
+from typing import Any, Awaitable, Callable
+
+from app.utils import ProcessManager, decode_bytes, get_logger
+from app.utils.io import atomic_write, migrate_legacy_dir
+from app.utils.platform import is_admin
+
+from .log_detect import (
+    HSR_ECHO_OF_WAR_WEEKLY_REWARD_LIMIT,
+    can_read_stream_live,
+    emit_process_output,
+    has_failure_output,
+)
+from .managed_fields import (
+    SRA_REWARD_NAMED_KEYS,
+    managed_field_keys,
+    select_sra_reward_keys,
+)
+from .managed_overlay import (
+    DroppedOverride,
+    log_dropped_overrides,
+    overlay_managed_options,
+)
+from .stage_runtime import (
+    get_sra_native_stage,
+    read_native_main_stage,
+    read_native_stage,
+)
+
+logger = get_logger("HSR SRA 运行器")
+
+SRA_GAME_CHANNEL_CLIENT = 0
+SRA_TRAILBLAZE_POWER_AUTO_DETECT = True
+
+SRA_DIVERGENT_UNIVERSE_RUNTIMES = 20
+SRA_DIVERGENT_UNIVERSE_USE_TECHNIQUE = False
+SRA_DIVERGENT_UNIVERSE_POINT_REWARDS = True
+
+SRA_CURRENCY_WARS_STRATEGY = "template"
+SRA_CURRENCY_WARS_RUNTIMES = 2
+SRA_CURRENCY_WARS_STRATEGY_KEYWORDS = ("阿格莱雅", "aglaea")
+SRA_SETTINGS_SYSTEM_NOTIFY_KEY = "system.enabled"
+# SRA 2.22.0 起领取奖励从数组 rewards[0..6] 改成具名开关 rewards.<name>（与
+# replenish.enabled 一样是平铺在 receiveRewards 下的点号键）；旧 profile 仍是数组。
+# SRA 读取时具名键优先、数组只作旧版兼容，写临时配置时按原生 profile 的形态镜像。
+SRA_REWARD_REDEEM_CODE_KEY = "rewards.redeemCode"
+SRA_REWARD_REDEEM_CODE_LEGACY_KEY = "rewards.6"
+
+
+def _managed_options(user_config: Any, module_key: str) -> dict[str, Any]:
+    """读取 ConfigBase JSONValidator 的 Managed.Options（字符串或对象）。"""
+
+    try:
+        raw = user_config.get("Managed", "Options")
+    except (AttributeError, KeyError, TypeError):
+        raw = {}
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            raw = {}
+    if not isinstance(raw, dict):
+        return {}
+    engine = raw.get("SRA")
+    if not isinstance(engine, dict):
+        return {}
+    module = engine.get(module_key)
+    return dict(module) if isinstance(module, dict) else {}
+
+
+def load_sra_native_config(script_config: Any) -> tuple[Path, dict[str, Any]]:
+    """Load the selected SRA profile used by forms and runtime overlays."""
+
+    _selected_id, path = resolve_sra_profile(script_config)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except OSError as exc:
+        raise FileNotFoundError(f"SRA 原生配置不存在：{path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"SRA 原生配置不是有效 JSON：{path}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"SRA 原生配置顶层必须是对象：{path}")
+    return path, payload
+
+
+def discover_sra_managed_options(
+    module_key: str,
+    script_config: Any,
+) -> tuple[dict[str, Any], str]:
+    """Discover native fields for one HSR module without applying overrides.
+
+    只返回 :data:`SRA_MANAGED_FIELDS` 里列出、且原生 profile 里确实存在的键，
+    顺序同字段表：表单露出什么，运行时就套用什么。
+    """
+
+    if module_key == "Daily":
+        section_name = "trailblazePower"
+    elif module_key == "ReceiveRewards":
+        section_name = "receiveRewards"
+    else:
+        section_name = "cosmicStrife"
+    _source, payload = load_sra_native_config(script_config)
+    section = payload.get(section_name)
+    if not isinstance(section, dict):
+        return {}, section_name
+    available = {str(key): value for key, value in section.items()}
+    if module_key == "ReceiveRewards":
+        rewards = available.pop("rewards", None)
+        if isinstance(rewards, list):
+            for index, value in enumerate(rewards):
+                available.setdefault(f"rewards.{index}", value)
+    keys = select_sra_reward_keys(
+        frozenset(managed_field_keys("SRA", module_key)) & available.keys()
+    )
+    options = {
+        key: available[key]
+        for key in managed_field_keys("SRA", module_key)
+        if key in keys
+    }
+    return options, section_name
+
+
+def overlay_sra_managed_options(
+    module_key: str,
+    script_config: Any,
+    user_config: Any,
+) -> tuple[dict[str, Any], tuple[DroppedOverride, ...]]:
+    """Overlay a user's Managed.Options on native SRA values.
+
+    原生配置里已不存在或类型对不上的覆盖键逐个丢弃、回退到原生值，并作为
+    第二个返回值交给表单与运行日志，不再整体抛错。
+    """
+
+    native, _section_name = discover_sra_managed_options(module_key, script_config)
+    overrides = _managed_options(user_config, module_key)
+    return overlay_managed_options(native, overrides)
+
+
+def resolve_sra_managed_options(
+    module_key: str,
+    script_config: Any,
+    user_config: Any,
+) -> dict[str, Any]:
+    """Return native SRA values overlaid with a user's Managed.Options."""
+
+    effective, _dropped = overlay_sra_managed_options(
+        module_key, script_config, user_config
+    )
+    return effective
+
+
+def _native_redeem_codes(script_config: Any) -> str:
+    """原生 profile 的 ``receiveRewards.redeemCodes``；缺失或不是字符串时为空串。"""
+
+    _source, payload = load_sra_native_config(script_config)
+    section = payload.get("receiveRewards")
+    codes = section.get("redeemCodes") if isinstance(section, dict) else None
+    return codes if isinstance(codes, str) else ""
+
+
+def _reward_list_index(key: str) -> int | None:
+    """``rewards.<下标>`` 返回数组下标；具名开关 ``rewards.<name>`` 与其它键返回 None。"""
+
+    prefix, _sep, suffix = key.partition(".")
+    if prefix != "rewards" or not suffix.isdigit():
+        return None
+    return int(suffix)
+
+
+def _apply_managed_options(
+    config: dict[str, Any],
+    module_key: str,
+    script_config: Any,
+    user_config: Any,
+) -> None:
+    _native, section_name = discover_sra_managed_options(module_key, script_config)
+    effective, dropped = overlay_sra_managed_options(
+        module_key, script_config, user_config
+    )
+    log_dropped_overrides(logger, "SRA", module_key, dropped)
+    section = config.get(section_name)
+    if not isinstance(section, dict):
+        raise ValueError(f"SRA 临时配置缺少 {section_name} 对象")
+    for key, value in effective.items():
+        index = _reward_list_index(key)
+        if index is None:
+            section[key] = value
+            continue
+        rewards = section.setdefault("rewards", [])
+        if not isinstance(rewards, list):
+            raise ValueError("SRA receiveRewards.rewards 必须是数组")
+        while len(rewards) <= index:
+            rewards.append(False)
+        rewards[index] = value
+
+
+def write_sra_temp_config(
+    config: dict,
+    script_uid: str,
+    user_uid: str,
+    module_key: str,
+) -> Path:
+    """写出 SRA 运行 JSON，避免 SRA CLI 按 ANSI 读取时编码炸裂。"""
+
+    target_path = _sra_temp_path(script_uid, user_uid, module_key)
+    atomic_write(
+        target_path,
+        json.dumps(config, ensure_ascii=True, indent=4).encode("utf-8"),
+    )
+    logger.debug(f"SRA temp config written: {target_path}")
+    return target_path
+
+
+def cleanup_sra_temp_config(path: Path) -> None:
+    if path.exists():
+        try:
+            path.unlink()
+            logger.debug(f"SRA temp config cleaned: {path}")
+        except OSError as e:
+            logger.warning(f"Failed to clean SRA temp config: {path} - {e}")
+
+    parent = path.parent
+    try:
+        if parent.exists() and not any(parent.iterdir()):
+            parent.rmdir()
+            grand = parent.parent
+            if grand.exists() and not any(grand.iterdir()):
+                grand.rmdir()
+    except OSError:
+        pass
+
+
+def build_sra_tasklist_description(tasklist: list[dict]) -> str:
+    if not tasklist:
+        return "no trailblaze power task"
+    return "; ".join(
+        (
+            f"{item.get('levelName') or item.get('name') or item.get('id')} 自动检测"
+            if item.get("autoDetect")
+            else (
+                f"{item.get('levelName') or item.get('name') or item.get('id')} "
+                f"x{item.get('runtimes')}"
+            )
+        )
+        for item in tasklist
+    )
+
+
+def build_sra_start_game_config(
+    script_config,
+    user_config,
+    name: str = "_mas_temp_start",
+    mode: str = "switch",
+) -> dict:
+    """构造只启用 SRA StartGameTask 的配置。"""
+
+    if mode not in ("switch", "remembered"):
+        raise ValueError(
+            f"不支持的 SRA StartGame 模式：{mode!r}，仅支持 switch / remembered"
+        )
+
+    config = _build_sra_base_config(name)
+    config["startGame"]["enabled"] = True
+    config["startGame"]["game.channel"] = SRA_GAME_CHANNEL_CLIENT
+    config["startGame"]["game.path"] = str(script_config.get("Game", "Path"))
+    config["startGame"]["game.useGlobalPath"] = False
+
+    if mode == "remembered":
+        config["startGame"]["relogin"] = False
+        config["startGame"]["autologin"] = False
+        return config
+
+    def _cipher(key: str) -> str:
+        try:
+            item = user_config._config_item_index["Info"][key]
+        except (AttributeError, KeyError):
+            return ""
+        return str(item.getValue(if_decrypt=False) or "")
+
+    username_cipher = _cipher("Id")
+    password_cipher = _cipher("Password")
+    config["startGame"]["relogin"] = True
+    config["startGame"]["autologin"] = True
+    config["startGame"]["username"] = str(username_cipher)
+    config["startGame"]["password"] = str(password_cipher)
+    return config
+
+
+def build_sra_module_config(
+    module,
+    script_config,
+    user_config,
+    name: str = "",
+    daily_eow_enabled: bool = False,
+    redeem_codes_enabled: bool = True,
+    plan=None,
+) -> dict:
+    """构造只启用一个目标模块的 SRA TasksConfig。
+
+    副本与托管覆盖读 ``plan``（该用户生效的任务计划，缺省即 ``user_config``），
+    货币战争的开拓者名称读 ``user_config``。
+    """
+
+    if plan is None:
+        plan = user_config
+    config = _build_sra_base_config(name or f"_mas_temp_{module.key}")
+    if module.sra_task is None:
+        return config
+
+    if module.sra_overrides:
+        for top_key, overrides in module.sra_overrides.items():
+            section = config.get(top_key)
+            if not isinstance(section, dict):
+                continue
+            for key, value in overrides.items():
+                if key in section:
+                    section[key] = value
+                    continue
+                keys = str(key).split(".")
+                target = section
+                for nested_key in keys[:-1]:
+                    child = target.get(nested_key)
+                    if not isinstance(child, dict):
+                        child = {}
+                        target[nested_key] = child
+                    target = child
+                target[keys[-1]] = value
+
+    # Daily 的 tasklist 与各模块的 enabled 在 _apply_managed_options 之后统一写。
+    if module.key == "ReceiveRewards":
+        # 领取项来自当前 SRA profile；Managed.Options 只覆盖已发现字段。
+        # 具名键存在时表单只露出具名键，数组按具名值镜像，两种形态保持一致。
+        native_options = resolve_sra_managed_options(module.key, script_config, plan)
+        config["receiveRewards"]["rewards"] = [
+            bool(
+                native_options.get(
+                    named_key, native_options.get(f"rewards.{index}", True)
+                )
+            )
+            for index, named_key in enumerate(SRA_REWARD_NAMED_KEYS)
+        ]
+
+    elif module.key == "DivergentUniverse":
+        native_options = resolve_sra_managed_options(module.key, script_config, plan)
+        config["cosmicStrife"]["divergentUniverse.runtimes"] = int(
+            native_options.get(
+                "divergentUniverse.runtimes", SRA_DIVERGENT_UNIVERSE_RUNTIMES
+            )
+        )
+        config["cosmicStrife"]["divergentUniverse.useTechnique"] = bool(
+            native_options.get(
+                "divergentUniverse.useTechnique", SRA_DIVERGENT_UNIVERSE_USE_TECHNIQUE
+            )
+        )
+        config["cosmicStrife"]["pointRewards.enabled"] = bool(
+            native_options.get(
+                "pointRewards.enabled", SRA_DIVERGENT_UNIVERSE_POINT_REWARDS
+            )
+        )
+
+    elif module.key == "CurrencyWars":
+        native_options = resolve_sra_managed_options(module.key, script_config, plan)
+        config["cosmicStrife"]["currencyWars.strategy"] = native_options.get(
+            "currencyWars.strategy", _resolve_sra_currency_wars_strategy(script_config)
+        )
+        config["cosmicStrife"]["currencyWars.runtimes"] = int(
+            native_options.get("currencyWars.runtimes", SRA_CURRENCY_WARS_RUNTIMES)
+        )
+
+    _apply_managed_options(config, module.key, script_config, plan)
+    if module.key == "Daily":
+        trailblaze = config["trailblazePower"]
+        trailblaze["enabled"] = True
+        if bool(trailblaze.get("useBuildTarget")):
+            trailblaze["tasklist"] = []
+        else:
+            trailblaze["tasklist"] = _build_sra_trailblaze_tasklist(
+                plan,
+                eow_enabled=daily_eow_enabled,
+            )
+    elif module.key == "ReceiveRewards":
+        section = config["receiveRewards"]
+        section["enabled"] = True
+        rewards = section.setdefault("rewards", [])
+        while len(rewards) <= 6:
+            rewards.append(False)
+        rewards[6] = bool(rewards[6]) and bool(redeem_codes_enabled)
+        redeem_enabled = rewards[6]
+        if SRA_REWARD_REDEEM_CODE_KEY in section:
+            # 具名开关存在时 SRA 以它为准，闸门要同时落在这里
+            section[SRA_REWARD_REDEEM_CODE_KEY] = bool(
+                section[SRA_REWARD_REDEEM_CODE_KEY]
+            ) and bool(redeem_codes_enabled)
+            redeem_enabled = section[SRA_REWARD_REDEEM_CODE_KEY]
+        # 兑换码在 SRA 里维护、不进托管表单；开关生效时把原生码原样送进临时配置
+        # （模板里是空串），与 redeem_code_fingerprint 按原生码算的指纹一致。
+        section["redeemCodes"] = (
+            _native_redeem_codes(script_config) if redeem_enabled else ""
+        )
+    elif module.key == "DivergentUniverse":
+        config["cosmicStrife"]["enabled"] = True
+        config["cosmicStrife"]["divergentUniverse.enabled"] = True
+        config["cosmicStrife"]["currencyWars.enabled"] = False
+    elif module.key == "CurrencyWars":
+        config["cosmicStrife"]["enabled"] = True
+        config["cosmicStrife"]["divergentUniverse.enabled"] = False
+        config["cosmicStrife"]["currencyWars.enabled"] = True
+        # SRA 靠开拓者名称认出自己的角色。必须在套用原生值之后写，否则多账号
+        # 全用原生 profile 里同一个名字；用户在托管表单里显式填了的以它为准。
+        username = str(user_config.get("Info", "Name") or "").strip()
+        if username and not _managed_options(plan, module.key).get(
+            "currencyWars.username"
+        ):
+            config["cosmicStrife"]["currencyWars.username"] = username
+
+    return config
+
+
+def get_sra_app_data_dir() -> Path:
+    """定位 SRA 与前端共用的用户配置目录。"""
+
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        return Path(appdata) / "SRA"
+    return Path.home() / ".config" / "SRA"
+
+
+def _script_sra_profile_setting(script_config: Any) -> str:
+    """读脚本 ``Info.SRAProfile``；兼容 ConfigBase 与测试里的普通字典。"""
+
+    if script_config is None:
+        return ""
+    if isinstance(script_config, dict):
+        section = script_config.get("Info")
+        value = section.get("SRAProfile") if isinstance(section, dict) else None
+    else:
+        try:
+            value = script_config.get("Info", "SRAProfile")
+        except (AttributeError, KeyError, TypeError):
+            value = None
+    return str(value or "").strip()
+
+
+def list_sra_profiles(config_root: Path | None = None) -> list[Path]:
+    """``configs`` 目录下全部档案文件，按文件名稳定排序；目录不存在时为空。"""
+
+    root = (
+        Path(config_root)
+        if config_root is not None
+        else get_sra_app_data_dir() / "configs"
+    )
+    if not root.is_dir():
+        return []
+    return sorted(
+        (item for item in root.glob("*.json") if item.is_file()),
+        key=lambda item: item.name.casefold(),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class SRAProfileSelection:
+    """一次 SRA 档案选择的完整结果。
+
+    ``resolve_sra_profile`` 只交回 ``(selected_id, path)``；需要向用户解释
+    「配置的档案不存在、已回退」的调用方（能力快照、托管表单、档案列表端点、
+    运行前检查）改用本结构，``fallback`` 为真时 ``fallback_reason`` 是现成的
+    一句人话。
+    """
+
+    root: Path
+    requested_id: str
+    selected_id: str
+    path: Path
+    fallback: bool = False
+    fallback_reason: str | None = None
+
+
+def _auto_sra_profile(root: Path) -> tuple[str, Path]:
+    """原有的自动选择：优先 ``Default.json``，否则按文件名排序取第一份。"""
+
+    default_path = root / "Default.json"
+    if default_path.is_file():
+        return "Default", default_path
+    candidates = list_sra_profiles(root)
+    if candidates:
+        selected = candidates[0]
+        return selected.stem, selected
+    return "Default", default_path
+
+
+def resolve_sra_profile_selection(
+    script_config: Any,
+    *,
+    config_root: Path | None = None,
+) -> SRAProfileSelection:
+    """按脚本 ``Info.SRAProfile`` 选档案；配了但文件不存在时回退并记下原因。"""
+
+    root = (
+        Path(config_root)
+        if config_root is not None
+        else get_sra_app_data_dir() / "configs"
+    )
+    requested = _script_sra_profile_setting(script_config)
+    if requested:
+        requested_path = root / f"{requested}.json"
+        if requested_path.is_file():
+            return SRAProfileSelection(root, requested, requested, requested_path)
+        auto_id, auto_path = _auto_sra_profile(root)
+        return SRAProfileSelection(
+            root,
+            requested,
+            auto_id,
+            auto_path,
+            fallback=True,
+            fallback_reason=(
+                f"脚本配置的 SRA 配置档案「{requested}」不存在（{requested_path}），"
+                f"已改用「{auto_id}」"
+            ),
+        )
+    auto_id, auto_path = _auto_sra_profile(root)
+    return SRAProfileSelection(root, "", auto_id, auto_path)
+
+
+def resolve_sra_profile(
+    script_config: Any,
+    *,
+    config_root: Path | None = None,
+) -> tuple[str, Path]:
+    """Resolve the one SRA native profile shared by inspect, forms and runtime.
+
+    The script's ``Info.SRAProfile`` wins when that file exists.  Otherwise the
+    conventional ``Default.json`` is preferred when present, else the first
+    profile in stable filename order is selected.  Callers that need to tell
+    the user about a fallback use :func:`resolve_sra_profile_selection`.
+    """
+
+    selection = resolve_sra_profile_selection(script_config, config_root=config_root)
+    return selection.selected_id, selection.path
+
+
+def disable_sra_windows_notifications() -> Path:
+    """临时关闭 SRA 本体的 Windows 系统通知。
+
+    开关是 ``settings.json`` 的 ``notification.system.enabled``（SRA
+    ``SRACore/models/app_settings.py`` 的 ``isSystemEnabled``，缺省为关）。该文件
+    在运行期备份清单里，任务结束按备份还原。SRA-cli 按系统 ANSI 读它，写回时
+    必须 ``ensure_ascii=True``。
+
+    Returns:
+        ``settings.json`` 路径；文件不存在或开关本来就关着时不写入。
+    """
+
+    settings_path = get_sra_app_data_dir() / "settings.json"
+    if not settings_path.is_file():
+        return settings_path
+    settings = json.loads(settings_path.read_text(encoding="utf-8-sig"))
+    if not isinstance(settings, dict):
+        raise ValueError(f"SRA settings.json 顶层不是对象：{settings_path}")
+    notification = settings.get("notification")
+    if not isinstance(notification, dict) or not notification.get(
+        SRA_SETTINGS_SYSTEM_NOTIFY_KEY
+    ):
+        return settings_path
+
+    notification[SRA_SETTINGS_SYSTEM_NOTIFY_KEY] = False
+    atomic_write(
+        settings_path,
+        json.dumps(settings, ensure_ascii=True, indent=2).encode("utf-8"),
+    )
+    logger.info(f"SRA settings.json 已临时关闭系统通知：{settings_path}")
+    return settings_path
+
+
+def sra_cloud_game_enabled() -> bool:
+    """SRA ``settings.json`` 的 ``general.cloudGame.enabled``；读不到按关闭算。
+
+    云游戏开关只在这里（任务配置 TasksConfig 没有 ``general`` 段），MAS 不改它。
+    """
+
+    settings_path = get_sra_app_data_dir() / "settings.json"
+    try:
+        settings = json.loads(settings_path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return False
+    general = settings.get("general") if isinstance(settings, dict) else None
+    return isinstance(general, dict) and bool(general.get("cloudGame.enabled"))
+
+
+@dataclass
+class SRACommandResult:
+    task_class: str
+    config_path: str
+    module_key: str = ""
+    success: bool = False
+    output: str = ""
+    error: str = ""
+    returncode: int = 0
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+
+# SRA-cli 的 stdout 被管道接走时按系统 ANSI 代码页编码，非中文区域（如 cp1252）
+# 下第一行中文就抛 UnicodeEncodeError：启动期崩掉退出码为 1，进了 cmd2 则被
+# 吞成一行提示、退出码仍为 0，任务一步没做。SRA-cli 是 Nuitka 打包，认
+# PYTHONIOENCODING（PyInstaller 打包的三月七不认，见 m7a_runtime）；PYTHONUTF8 无效。
+SRA_CHILD_ENV: dict[str, str] = {"PYTHONIOENCODING": "utf-8"}
+
+
+def build_sra_env() -> dict[str, str]:
+    """SRA 子进程环境：继承后端环境，叠上 ``SRA_CHILD_ENV``。"""
+
+    env = dict(os.environ)
+    env.update(SRA_CHILD_ENV)
+    return env
+
+
+class SRAProcessRegistry:
+    """记录 SRA 当前子进程，供任务停止时终止。"""
+
+    def __init__(self):
+        self._process_manager = ProcessManager()
+
+    async def open_process(
+        self,
+        program: str,
+        *args: str,
+        cwd: Path,
+    ) -> asyncio.subprocess.Process:
+        await self._process_manager.open_process(
+            program,
+            *args,
+            cwd=cwd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=build_sra_env(),
+        )
+        proc = self._process_manager.main_process
+        if not isinstance(proc, asyncio.subprocess.Process):
+            raise RuntimeError("SRA 子进程启动后未能被 ProcessManager 跟踪")
+        return proc
+
+    async def clear(self) -> None:
+        await self._process_manager.clear()
+
+    async def terminate_current_process(self) -> bool:
+        if not await self._process_manager.is_running():
+            return False
+
+        logger.warning("正在终止 SRA 当前子进程")
+        await self._process_manager.kill()
+        return True
+
+
+def _sra_cli_args(command_text: str) -> tuple[str, ...]:
+    """SRA-cli 的命令行参数。
+
+    SRA-cli 未提权时默认用 ``runas`` 另起一个提权进程、原进程 ``exit(0)``，
+    真正干活的进程脱离 MAS 视野；``--no-admin`` 让它打一行警告后原地继续。
+    SRA 只在未提权时从 argv 里摘掉这个参数（``SRACore/__main__.py``），
+    已提权时它会原样落进 cmd2 的启动命令、报「不是一个有效命令」，所以只在
+    后端未提权时传（子进程继承后端的令牌，两边判断一致）。
+    """
+
+    args = ("--inline", command_text, "quit")
+    return args if is_admin() else ("--no-admin", *args)
+
+
+def _sra_run_succeeded(returncode: int | None, stdout: str, stderr: str) -> bool:
+    """SRA 不把任务成败写进退出码，成败只看输出；没有任何输出不算成功。"""
+
+    return (
+        returncode == 0
+        and bool(stdout or stderr)
+        and not has_failure_output(stdout, stderr)
+    )
+
+
+async def run_sra_single_task(
+    sra_exe_path: Path,
+    task_class: str,
+    config_path: Path,
+    timeout: int = 600,
+    process_registry: SRAProcessRegistry | None = None,
+    log_callback: Callable[[str], None] | None = None,
+    output_line_callback: Callable[[str], Awaitable[None] | None] | None = None,
+    module_key: str = "",
+) -> SRACommandResult:
+    """通过 SRA inline 模式运行单个任务并退出。"""
+
+    command_text = f'single {task_class} --config "{config_path}"'
+    started_at = datetime.now(timezone.utc)
+
+    if not sra_exe_path.exists():
+        return SRACommandResult(
+            task_class=task_class,
+            config_path=str(config_path),
+            module_key=module_key,
+            success=False,
+            error=f"SRA-cli.exe does not exist: {sra_exe_path}",
+            started_at=started_at,
+            finished_at=datetime.now(timezone.utc),
+        )
+
+    try:
+        process_registry = process_registry or SRAProcessRegistry()
+        proc = await process_registry.open_process(
+            str(sra_exe_path),
+            *_sra_cli_args(command_text),
+            cwd=sra_exe_path.parent,
+        )
+        stdout, stderr = await _communicate_sra_with_live_output(
+            proc,
+            timeout,
+            log_callback,
+            output_line_callback=output_line_callback,
+        )
+        success = _sra_run_succeeded(proc.returncode, stdout, stderr)
+
+        return SRACommandResult(
+            task_class=task_class,
+            config_path=str(config_path),
+            module_key=module_key,
+            success=success,
+            output=stdout,
+            error=stderr,
+            returncode=proc.returncode or 0,
+            started_at=started_at,
+            finished_at=datetime.now(timezone.utc),
+        )
+
+    except asyncio.TimeoutError:
+        if process_registry is not None:
+            await process_registry.terminate_current_process()
+        return SRACommandResult(
+            task_class=task_class,
+            config_path=str(config_path),
+            module_key=module_key,
+            success=False,
+            error=f"command timeout: {timeout}s",
+            started_at=started_at,
+            finished_at=datetime.now(timezone.utc),
+        )
+
+    except asyncio.CancelledError:
+        logger.warning(f"SRA 单任务 {task_class} 收到取消请求，准备终止子进程")
+        if process_registry is not None:
+            await process_registry.terminate_current_process()
+        raise
+
+    except Exception as e:
+        logger.opt(exception=True).warning(f"SRA 单任务 {task_class} 执行失败：{e}")
+        return SRACommandResult(
+            task_class=task_class,
+            config_path=str(config_path),
+            module_key=module_key,
+            success=False,
+            error=str(e),
+            started_at=started_at,
+            finished_at=datetime.now(timezone.utc),
+        )
+    finally:
+        if process_registry is not None:
+            await process_registry.clear()
+
+
+async def run_sra_config(
+    sra_exe_path: Path,
+    config_path: Path,
+    timeout: int = 7200,
+    process_registry: SRAProcessRegistry | None = None,
+    log_callback: Callable[[str], None] | None = None,
+) -> SRACommandResult:
+    """运行 SRA 原生配置中的完整任务计划。
+
+    这是旧 dev 对插件版 ``run_sra_config`` 的等价入口；命令仍走 SRA
+    ``--inline run``，并复用既有实时日志/进程终止逻辑。
+    """
+
+    started_at = datetime.now(timezone.utc)
+    module_key = "DirectControl"
+    if not sra_exe_path.exists():
+        return SRACommandResult(
+            task_class="run",
+            config_path=str(config_path),
+            module_key=module_key,
+            success=False,
+            error=f"SRA-cli.exe does not exist: {sra_exe_path}",
+            started_at=started_at,
+            finished_at=datetime.now(timezone.utc),
+        )
+
+    registry = process_registry or SRAProcessRegistry()
+    try:
+        proc = await registry.open_process(
+            str(sra_exe_path),
+            *_sra_cli_args(f'run "{config_path}"'),
+            cwd=sra_exe_path.parent,
+        )
+        stdout, stderr = await _communicate_sra_with_live_output(
+            proc,
+            timeout,
+            log_callback,
+        )
+        success = _sra_run_succeeded(proc.returncode, stdout, stderr)
+        return SRACommandResult(
+            task_class="run",
+            config_path=str(config_path),
+            module_key=module_key,
+            success=success,
+            output=stdout,
+            error=stderr,
+            returncode=proc.returncode or 0,
+            started_at=started_at,
+            finished_at=datetime.now(timezone.utc),
+        )
+    except asyncio.TimeoutError:
+        await registry.terminate_current_process()
+        return SRACommandResult(
+            task_class="run",
+            config_path=str(config_path),
+            module_key=module_key,
+            success=False,
+            error=f"command timeout: {timeout}s",
+            started_at=started_at,
+            finished_at=datetime.now(timezone.utc),
+        )
+    except asyncio.CancelledError:
+        await registry.terminate_current_process()
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.opt(exception=True).warning(f"SRA 原生配置执行失败：{exc}")
+        return SRACommandResult(
+            task_class="run",
+            config_path=str(config_path),
+            module_key=module_key,
+            success=False,
+            error=str(exc),
+            started_at=started_at,
+            finished_at=datetime.now(timezone.utc),
+        )
+    finally:
+        await registry.clear()
+
+
+def _sra_temp_path(script_uid: str, user_uid: str, module_key: str) -> Path:
+    """HSR SRA 临时配置文件路径。
+
+    落在受保护的 ``data/`` 下，避免与 AUTO-MAS-Runtime 监督器接管的
+    ``runtime/`` 撞名；首次访问时把用户机器上已有的旧
+    ``runtime/hsr/sra-config`` 整体迁移过来。
+    """
+
+    from app.core import Config
+
+    app_root = Config.config_path.parent
+    sra_config_dir = app_root / "data" / "hsr" / "sra-config"
+    migrate_legacy_dir(app_root / "runtime" / "hsr" / "sra-config", sra_config_dir)
+    return sra_config_dir / script_uid / user_uid / f"{module_key}.json"
+
+
+def _build_sra_base_config(name: str) -> dict:
+    """构造一个默认关闭所有任务的 SRA TasksConfig。"""
+
+    return {
+        "name": name,
+        "version": 0,
+        "startGame": {
+            "enabled": False,
+            "game.channel": SRA_GAME_CHANNEL_CLIENT,
+            "game.path": "",
+            "game.useGlobalPath": False,
+            "autologin": True,
+            "relogin": True,
+            "username": "",
+            "password": "",
+        },
+        "trailblazePower": {
+            "enabled": False,
+            "replenish.enabled": False,
+            "replenish.times": 0,
+            "replenish.way": 0,
+            "useAssistant": False,
+            "useBuildTarget": False,
+            "tasklist": [],
+            "activity.enabled": False,
+        },
+        "receiveRewards": {
+            "enabled": False,
+            "redeemCodes": "",
+            "rewards": [],
+        },
+        "cosmicStrife": {
+            "enabled": False,
+            "pointRewards.enabled": False,
+            "divergentUniverse.enabled": False,
+            "divergentUniverse.mode": 0,
+            "divergentUniverse.runtimes": 0,
+            "divergentUniverse.useTechnique": False,
+            "currencyWars.enabled": False,
+            "currencyWars.mode": 0,
+            "currencyWars.difficulty": 0,
+            "currencyWars.runtimes": 0,
+            "currencyWars.strategy": "template",
+            "currencyWars.strategyIndex": 0,
+            "currencyWars.username": "",
+        },
+        "missionAccomplished": {
+            "enabled": False,
+            "logout": False,
+            "exitGame": False,
+            "shutdown": False,
+            "sleep": False,
+            "exitApp": False,
+        },
+    }
+
+
+def _native_stage_to_sra_tp_item(
+    user_config,
+    field: str,
+    run_times: int,
+    count: int = 1,
+    auto_detect: bool = SRA_TRAILBLAZE_POWER_AUTO_DETECT,
+) -> dict | None:
+    """把 Stage.ScriptStage / ScriptEchoOfWar 转成 SRA tasklist item。"""
+
+    stage_data = (
+        read_native_main_stage(user_config, "SRA")
+        if field == "ScriptStage"
+        else read_native_stage(user_config, field, "SRA")
+    )
+    native = get_sra_native_stage(stage_data)
+    if native is None:
+        return None
+
+    label = native["label"] or f"{native['id']}#{native['level']}"
+    category_label = native["categoryLabel"] or label
+    return {
+        "name": category_label,
+        "id": native["id"],
+        "level": native["level"],
+        "levelName": label,
+        "count": count,
+        "runtimes": run_times,
+        "autoDetect": auto_detect,
+    }
+
+
+def _build_sra_trailblaze_tasklist(
+    user_config,
+    eow_enabled: bool = False,
+) -> list[dict]:
+    """按 HSR 用户配置构造 SRA trailblazePower.tasklist。"""
+
+    tasklist: list[dict] = []
+    main_item: dict | None = None
+    eow_item: dict | None = None
+
+    native_item = _native_stage_to_sra_tp_item(user_config, "ScriptStage", 1)
+    if native_item is not None:
+        main_item = native_item
+
+    if eow_enabled:
+        # SRA autoDetect 路径不读取 RunTimes，这里只保留结构占位。
+        eow_item = _require_sra_echo_of_war_item(
+            user_config,
+            auto_detect=SRA_TRAILBLAZE_POWER_AUTO_DETECT,
+            count=1,
+        )
+
+    if eow_item is not None:
+        tasklist.append(eow_item)
+    if main_item is not None:
+        tasklist.append(main_item)
+    return tasklist
+
+
+def _require_sra_echo_of_war_item(
+    user_config,
+    *,
+    auto_detect: bool,
+    count: int,
+) -> dict:
+    """取历战余响的 SRA tasklist item；缺少原生字段时直接报错。"""
+
+    item = _native_stage_to_sra_tp_item(
+        user_config,
+        "ScriptEchoOfWar",
+        1,
+        count=count,
+        auto_detect=auto_detect,
+    )
+    if item is None:
+        raise RuntimeError(
+            "本周需要执行历战余响，但 Stage.ScriptEchoOfWar 缺少 SRA 原生"
+            "历战余响字段；请在体力配置中重新选择历战余响"
+        )
+    return item
+
+
+def build_sra_echo_of_war_config(
+    script_config,
+    user_config,
+    name: str = "_mas_temp_EchoOfWar",
+) -> dict:
+    """构造只跑历战余响的 SRA TrailblazePowerTask 配置。
+
+    培养目标模式下 SRA 由原生识别决定副本，只有培养目标材料正好出自历战余响
+    才会排上周本；2.20.0 之前的 SRA 在该模式下还完全不读 tasklist。周本因此
+    单独跑一次手动副本，不依赖培养目标内容与 SRA 版本。
+
+    Args:
+        script_config: HSR 脚本配置，用于沿用用户的原生体力选项。
+        user_config: HSR 用户配置，提供历战余响关卡。
+        name: 写入 SRA 临时配置的配置名。
+
+    Returns:
+        只启用 trailblazePower、tasklist 仅含历战余响的 SRA TasksConfig。
+
+    Raises:
+        RuntimeError: 用户未配置 SRA 原生历战余响关卡。
+    """
+
+    eow_item = _require_sra_echo_of_war_item(
+        user_config,
+        auto_detect=False,
+        count=HSR_ECHO_OF_WAR_WEEKLY_REWARD_LIMIT,
+    )
+    config = _build_sra_base_config(name)
+    _apply_managed_options(config, "Daily", script_config, user_config)
+    trailblaze = config["trailblazePower"]
+    trailblaze["enabled"] = True
+    # 本次只为周本而跑：关掉培养目标识别与活动检测，避免顺带消耗体力；
+    # 历战余响单独运行时关闭补充开拓力，体力模块则跟随托管值。
+    trailblaze["useBuildTarget"] = False
+    trailblaze["activity.enabled"] = False
+    trailblaze["replenish.enabled"] = False
+    trailblaze["replenish.way"] = 0
+    trailblaze["replenish.times"] = 0
+    trailblaze["tasklist"] = [eow_item]
+    return config
+
+
+def _resolve_sra_currency_wars_strategy(script_config) -> str:
+    """优先使用 SRA 本地货币战争攻略 json。"""
+
+    raw_path = str(script_config.get("Info", "SRAPath") or "").strip()
+    if not raw_path:
+        return SRA_CURRENCY_WARS_STRATEGY
+    path = Path(raw_path)
+    root = path.parent if path.suffix.lower() == ".exe" else path
+    strategy_dirs = [
+        root / "tasks" / "currency_wars" / "strategies",
+        root / "tasks" / "currency_wars",
+        root.parent / "tasks" / "currency_wars" / "strategies",
+        root.parent / "tasks" / "currency_wars",
+    ]
+
+    strategy_files: list[Path] = []
+    seen: set[Path] = set()
+    for strategy_dir in strategy_dirs:
+        if not strategy_dir.is_dir():
+            continue
+        for file in strategy_dir.glob("*.json"):
+            resolved = file.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            strategy_files.append(resolved)
+
+    if not strategy_files:
+        return SRA_CURRENCY_WARS_STRATEGY
+
+    strategy_files.sort(key=lambda p: p.name.lower())
+    for keyword in SRA_CURRENCY_WARS_STRATEGY_KEYWORDS:
+        keyword_lower = keyword.lower()
+        for file in strategy_files:
+            if keyword_lower in file.name.lower():
+                return str(file)
+    return str(strategy_files[0])
+
+
+async def _read_sra_stream_live(
+    stream,
+    title: str,
+    lines: list[str],
+    log_callback: Callable[[str], None] | None,
+    output_line_callback: Callable[[str], Awaitable[None] | None] | None,
+) -> None:
+    """逐行读取 SRA 输出并立即转发到调度台。"""
+
+    while True:
+        raw = await stream.readline()
+        if not raw:
+            break
+        if isinstance(raw, str):
+            text = raw
+        else:
+            text = decode_bytes(bytes(raw))
+        for line in text.rstrip("\r\n").splitlines():
+            line = line.strip()
+            if line:
+                lines.append(line)
+                emit_process_output(log_callback, title, line)
+                if output_line_callback is not None:
+                    result = output_line_callback(line)
+                    if isawaitable(result):
+                        await result
+
+
+async def _communicate_sra_with_live_output(
+    proc: asyncio.subprocess.Process,
+    timeout: int,
+    log_callback: Callable[[str], None] | None,
+    *,
+    output_line_callback: Callable[[str], Awaitable[None] | None] | None = None,
+) -> tuple[str, str]:
+    """读取 SRA 输出；可实时读取时逐行转发到调度台。"""
+
+    stdout_stream = getattr(proc, "stdout", None)
+    stderr_stream = getattr(proc, "stderr", None)
+    if not (can_read_stream_live(stdout_stream) or can_read_stream_live(stderr_stream)):
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout
+        )
+        stdout = decode_bytes(stdout_bytes).strip()
+        stderr = decode_bytes(stderr_bytes).strip()
+        emit_process_output(log_callback, "SRA", stdout)
+        emit_process_output(log_callback, "SRA stderr", stderr)
+        if output_line_callback is not None:
+            for text in (stdout, stderr):
+                for line in text.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    result = output_line_callback(line)
+                    if isawaitable(result):
+                        await result
+        return stdout, stderr
+
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    read_tasks: list[asyncio.Task] = []
+    if can_read_stream_live(stdout_stream):
+        read_tasks.append(
+            asyncio.create_task(
+                _read_sra_stream_live(
+                    stdout_stream,
+                    "SRA",
+                    stdout_lines,
+                    log_callback,
+                    output_line_callback,
+                )
+            )
+        )
+    if can_read_stream_live(stderr_stream):
+        read_tasks.append(
+            asyncio.create_task(
+                _read_sra_stream_live(
+                    stderr_stream,
+                    "SRA stderr",
+                    stderr_lines,
+                    log_callback,
+                    output_line_callback,
+                )
+            )
+        )
+
+    wait_group = asyncio.gather(proc.wait(), *read_tasks)
+    try:
+        await asyncio.wait_for(wait_group, timeout=timeout)
+    except Exception:
+        wait_group.cancel()
+        for task in read_tasks:
+            task.cancel()
+        with suppress(Exception):
+            await asyncio.gather(wait_group, *read_tasks, return_exceptions=True)
+        raise
+
+    return "\n".join(stdout_lines).strip(), "\n".join(stderr_lines).strip()

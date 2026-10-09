@@ -1,0 +1,151 @@
+#   AUTO-MAS: A Multi-Script, Multi-Config Management and Automation Software
+#   Copyright © 2024-2025 DLmaster361
+#   Copyright © 2025 MoeSnowyFox
+#   Copyright © 2025-2026 AUTO-MAS Team
+
+#   This file is part of AUTO-MAS.
+
+#   AUTO-MAS is free software: you can redistribute it and/or modify
+#   it under the terms of the GNU Affero General Public License as
+#   published by the Free Software Foundation, either version 3 of
+#   the License, or (at your option) any later version.
+
+#   AUTO-MAS is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty
+#   of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See
+#   the GNU Affero General Public License for more details.
+
+#   You should have received a copy of the GNU Affero General Public License
+#   along with AUTO-MAS. If not, see <https://www.gnu.org/licenses/>.
+
+#   Contact: DLmaster_361@163.com
+
+
+from fastapi import APIRouter, Body
+
+from app.core import Config
+from app.models.config import PLAN_BOOK
+from app.models.schema import *
+from app.utils import get_logger
+
+router = APIRouter(prefix="/api/plan", tags=["计划管理"])
+logger = get_logger("计划管理 API")
+
+
+@router.post(
+    "/add",
+    tags=["Add"],
+    summary="添加计划表",
+    response_model=PlanCreateOut,
+    status_code=200,
+)
+async def add_plan(plan: PlanCreateIn = Body(...)) -> PlanCreateOut:
+
+    try:
+        uid, config = await Config.add_plan(plan.type)
+        data = PLAN_BOOK[type(config).__name__]["schema_class"](
+            **(await config.toDict())
+        )
+    except Exception as e:
+        logger.opt(exception=True).warning(f"add_plan失败: {type(e).__name__}: {e}")
+        plan_schema_class = next(
+            item["schema_class"]
+            for item in PLAN_BOOK.values()
+            if item["create_type"] == plan.type
+        )
+        return PlanCreateOut(
+            code=500,
+            status="error",
+            message=f"{type(e).__name__}: {str(e)}",
+            planId="",
+            data=plan_schema_class(**{}),
+        )
+    return PlanCreateOut(planId=str(uid), data=data)
+
+
+@router.post(
+    "/get",
+    tags=["Get"],
+    summary="查询计划表",
+    response_model=PlanGetOut,
+    status_code=200,
+)
+async def get_plan(plan: PlanGetIn = Body(...)) -> PlanGetOut:
+
+    try:
+        raw_index, raw_data = await Config.get_plan(plan.planId)
+        index = [PlanIndexItem(**_) for _ in raw_index]
+        data: dict[str, PlanConfigData] = {}
+
+        for item in raw_index:
+            uid = item["uid"]
+            plan_type = item["type"]
+
+            data[uid] = PLAN_BOOK[plan_type]["schema_class"](**raw_data[uid])
+    except Exception as e:
+        logger.opt(exception=True).warning(f"get_plan失败: {type(e).__name__}: {e}")
+        return PlanGetOut(
+            code=500,
+            status="error",
+            message=f"{type(e).__name__}: {str(e)}",
+            index=[],
+            data={},
+        )
+    return PlanGetOut(index=index, data=data)
+
+
+@router.post(
+    "/update",
+    tags=["Update"],
+    summary="更新计划表配置信息",
+    response_model=OutBase,
+    status_code=200,
+)
+async def update_plan(plan: PlanUpdateIn = Body(...)) -> OutBase:
+
+    try:
+        await Config.update_plan(plan.planId, plan.data.model_dump(exclude_unset=True))
+    except Exception as e:
+        logger.opt(exception=True).warning(f"update_plan失败: {type(e).__name__}: {e}")
+        return OutBase(
+            code=500, status="error", message=f"{type(e).__name__}: {str(e)}"
+        )
+    return OutBase()
+
+
+@router.post(
+    "/delete",
+    tags=["Delete"],
+    summary="删除计划表",
+    response_model=OutBase,
+    status_code=200,
+)
+async def delete_plan(plan: PlanDeleteIn = Body(...)) -> OutBase:
+
+    try:
+        await Config.del_plan(plan.planId)
+    except Exception as e:
+        logger.opt(exception=True).warning(f"delete_plan失败: {type(e).__name__}: {e}")
+        return OutBase(
+            code=500, status="error", message=f"{type(e).__name__}: {str(e)}"
+        )
+    return OutBase()
+
+
+@router.post(
+    "/order",
+    tags=["Update"],
+    summary="重新排序计划表",
+    response_model=OutBase,
+    status_code=200,
+)
+async def reorder_plan(plan: PlanReorderIn = Body(...)) -> OutBase:
+
+    try:
+        await Config.reorder_plan(plan.indexList)
+    except Exception as e:
+        logger.opt(exception=True).warning(f"reorder_plan失败: {type(e).__name__}: {e}")
+        return OutBase(
+            code=500, status="error", message=f"{type(e).__name__}: {str(e)}"
+        )
+    return OutBase()

@@ -86,6 +86,16 @@
       "icon": "maa-end.png",
       "poster": "https://img-tc.tapimg.com/market/images/52fe8d20c93586192326a8589bae7fbc.jpg/_tap_screenshot.jpg",
       "website": "https://maaend.com/"
+    },
+    {
+      "key": "auto-mas",
+      "display": "AUTO-MAS 任务编排",
+      "exe": "",
+      "app_json": "",
+      "working": "",
+      "pythonw": "",
+      "icon": "auto-mas.png",
+      "website": "https://github.com/AUTO-MAS-Project/AUTO-MAS"
     }
   ]
 }

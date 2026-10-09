@@ -1,0 +1,3608 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import queue
+import re
+import shlex
+import shutil
+import subprocess
+import threading
+import time
+import uuid
+from contextlib import suppress
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Callable, Mapping
+
+import psutil
+
+from app.core import Config
+from app.core.ws import Publisher, protocol
+from app.models.emulator import DeviceBase, DeviceInfo
+from app.models.schema import WSTaskNoticeData
+from app.models.task import LogRecord, ScriptItem, TaskExecuteBase
+from app.services import Notify
+from app.task.emulator_core import close_emulator
+from app.task.general.tools import execute_script_task
+from app.task.MaaFW.tools.core.controller_win32.service import (
+    MaaFWWin32ControllerService,
+    controller_has_window_rules,
+)
+from app.task.MaaFW.tools.core.interface.models import (
+    MaaFWController,
+    MaaFWInterface,
+)
+from app.task.MaaFW.tools.core.interface.preview import (
+    build_adb_emulator_extra_capabilities,
+    interface_display_name,
+)
+from app.task.MaaFW.tools.core.interface.service import (
+    MaaFWInterfaceService,
+)
+from app.task.MaaFW.tools.core.interface.task_config import find_missing_task_names
+from app.task.MaaFW.tools.core.runner.environment import (
+    ARCHITECTURE_MISMATCH_MARKERS,
+    MaaFWRunnerEnvironment,
+    describe_project_runtime_architecture_mismatch,
+)
+from app.task.MaaFW.tools.core.runner.models import (
+    MaaFWDeviceConfig,
+    MaaFWRunPlan,
+    MaaFWRunResult,
+    MaaFWSkippedTaskPlan,
+)
+from app.task.MaaFW.tools.core.runner.run_plan import (
+    NO_RUNNABLE_TASKS_MESSAGE,
+    MaaFWRunPlanError,
+    resolve_run_selection,
+    select_snapshot_tasks,
+)
+from app.task.MaaFW.tools.core.runner.service import MaaFWRunnerService
+from app.task.MaaFW.tools.core.runtime_pool.host_environment import (
+    subprocess_proxy_scope,
+)
+from app.task.MaaFW.tools.notify import push_notification
+from app.task.notify_core import (
+    NOTIFY_SCREENSHOT_LIMIT,
+    load_screenshot_images,
+    screenshot_entries,
+)
+from app.utils import ProcessInfo, ProcessManager, get_logger
+from app.utils.constants import UTC4
+from app.utils.io import migrate_legacy_dir
+from app.utils.paths import SOURCE_ROOT
+
+from .embedded_project import resolve_maafw_project_root
+from .flavor import resolve_flavor, resolve_game_update_hook
+from .game_package import resolve_game_package
+from .game_resolution import UnityGameResolutionOverride, parse_resolution_option
+from .option_secrets import (
+    collect_plan_password_values,
+    collect_script_password_values,
+    log_redaction_notice,
+    open_task_snapshot,
+    redact_secret_text,
+    secret_byte_pairs,
+    secret_log_variants,
+)
+from .project_logs import copy_project_log_delta, snapshot_project_logs
+from .project_path import release_project_path, try_reserve_project_path
+from .signal_notice import (
+    MAINTENANCE_LAST_STATUS,
+    MAINTENANCE_SKIP_MESSAGE,
+    SERVER_MAINTENANCE,
+    SIGNAL_USER_MESSAGES,
+    MaaFWSignalTracker,
+)
+from .update_credentials import resolve_update_proxy_url
+
+logger = get_logger("MaaFW 插件自动代理")
+
+
+# MaaFW 的 ADB 截图/输入方法枚举（EmulatorExtras 硬件加速相关）在此镜像为整型常量，
+# 而非 `from maa.controller import MaaAdb*Enum`。本模块受导入边界约束
+# （tests/plugins/test_maafw_import_boundaries.py 禁止导入时把 maa 载入 sys.modules），
+# 直接 import maa 会加载原生绑定，故改为对齐 plugins/pypi/site-packages/maa/define.py
+# 的取值：
+#   screencap Default = All & ~RawByNetcat & ~MinicapDirect & ~MinicapStream = -57
+#   screencap EmulatorExtras = 1 << 6 (64)
+#   input Default = All & ~EmulatorExtras = -9；input All = ~0 = -1；EmulatorExtras = 1 << 3 (8)
+# 任务取消后等环境准备线程收尾的最长时间。Runtime 关机只给后端约 5 秒，
+# 安装线程若还在等 uv 子进程退出，超过这个值就不再等它。
+_PREPARE_ENVIRONMENT_CANCEL_GRACE_SECONDS = 2.0
+# 放弃等待后仍让收尾任务在后台跑完（准备恰好成功时要释放租约），
+# 这里持有强引用，免得任务对象被回收。
+_ABANDONED_PREPARATION_CLEANUPS: set[asyncio.Task[None]] = set()
+
+_ADB_SCREENCAP_DEFAULT = -57
+_ADB_SCREENCAP_EMULATOR_EXTRAS = 1 << 6
+_ADB_INPUT_DEFAULT = -9
+_ADB_INPUT_ALL = -1
+_ADB_INPUT_EMULATOR_EXTRAS = 1 << 3
+# 雷电专用：MinitouchAndAdbKey(2) | AdbShell(1)，故意不带 Maatouch(4)。
+#
+# MaaFW 的 ADB 文本输入只有两条实现：Maatouch 走 MaaTouch 的 `t` 命令，
+# AdbShell / MinitouchAndAdbKey 走 adb config 里可替换的 `InputText` 命令
+# （默认 `input text`）。前者按键盘映射逐字符注入，`input text` 也只认 ASCII，
+# 两条都打不进中文——2026-09-12 生产实测 M9A 兑换码「魔精小A邀泥收看1999泡面番」
+# 被 Maatouch 重打 265 次、输入框始终为空，整次运行撞硬超时。
+# 雷电自己的 `ldconsole action --key call.input --value <文本>` 能把任意文本
+# 提交到当前焦点的输入框（实测中文 35 ms 落地），所以在雷电上把 Maatouch 从
+# 候选里摘掉，让文本走 MinitouchAndAdbKey 的 `InputText` 命令并替换成 ldconsole。
+# 触控仍是 minitouch 协议，雷电 adbd 本身是 root，minitouch 可用（实测 init 508 ms）。
+_ADB_INPUT_LDPLAYER_CONSOLE_TEXT = (1 << 1) | 1
+# 名字与取值照抄 MaaFramework 绑定库 ``maa/define.py``（main 分支）。Foreground /
+# Background 是组合名：原生层在组合里按顺序择一可用的方式，FOS、MaaNTE、mpa 的默认
+# Win32 控制器写的就是 Background。运行时绑定库 / 原生库认不认得某个值由 worker 再判一次
+# （runner._supported_win32_method），这里只负责把名字翻成数。
+_WIN32_SCREENCAP_METHODS = {
+    "GDI": 1,
+    "FramePool": 1 << 1,
+    "DXGI_DesktopDup": 1 << 2,
+    "DXGI_DesktopDup_Window": 1 << 3,
+    "PrintWindow": 1 << 4,
+    "ScreenDC": 1 << 5,
+    "Foreground": (1 << 3) | (1 << 5),
+    "Background": (1 << 1) | (1 << 4),
+}
+_WIN32_INPUT_METHODS = {
+    "Seize": 1,
+    "SendMessage": 1 << 1,
+    "PostMessage": 1 << 2,
+    "LegacyEvent": 1 << 3,
+    "PostThreadMessage": 1 << 4,
+    "SendMessageWithCursorPos": 1 << 5,
+    "PostMessageWithCursorPos": 1 << 6,
+    "SendMessageWithWindowPos": 1 << 7,
+    "PostMessageWithWindowPos": 1 << 8,
+    "Interception": 1 << 9,
+    "AnchoredTouch": 1 << 10,
+}
+_SUBPROCESS_OUTPUT_ENCODINGS = ("utf-8", "gbk", "shift_jis", "utf-16")
+_RUN_OVERVIEW_LOG_VALUE_LIMIT = 1200
+_FRAMEWORK_UI_LOG_MAX_CHARS = 1200
+# worker 输出转发每处理这么多行就让出一次事件循环。取 50 是因为原生诊断
+# 的洪峰约每秒几十行，这个粒度下让出频率约每秒一次，开销可忽略。
+_RELAY_YIELD_EVERY_LINES = 50
+# 启动/附着游戏后定位其窗口的等待秒数
+WINDOW_SEARCH_TIMEOUT_SECONDS = 5.0
+# 脚本页没有填窗口句柄的入口，提示不能让用户去找一个不存在的设置。
+_WIN32_NO_WINDOW_RULES_MESSAGE = (
+    "该项目的这个 Win32 控制器没有声明窗口匹配规则（interface 里的 class_regex / "
+    "window_regex），MAS 无法确定要控制哪个窗口，为避免控制错窗口不运行；请换用项目的"
+    "其他控制器，或请项目方在 interface 里补上窗口匹配规则"
+)
+
+# 环境级失败：解释器自身坏了、依赖没装上。重试只会原样再失败一遍，而每次重试
+# 还要重启一遍模拟器/游戏——默认 RunTimesLimit=3，白等好几分钟才告诉用户同一件事。
+# 判据取消息标记而不是异常类型：这些错误跨了 runtime_pool 与 runner 两个包，
+# 而 runner_task 有意不在模块层导入 runtime_pool（那会让所有请求都付出导入成本）。
+_UNRETRYABLE_ENVIRONMENT_MARKERS = (
+    "MaaFW runtime Python 自检失败",
+    "MaaFW runtime ABI 探测失败",
+    "runtime Python identity could not be verified",
+    "MaaFW Runner 环境准备失败",
+    "MaaFW Runner 环境准备超时",
+    # 项目自带的 MaaFramework 与本机架构不符：换哪次尝试都是同一份库。运行前自检一般已
+    # 拦下，这里兜住 worker 侧才发现的情况（异常与任务失败两条路都认）。
+    *ARCHITECTURE_MISMATCH_MARKERS,
+)
+# worker 到点自己停任务、截图、回传结果需要一点时间；宿主的硬超时在此之后才到，
+# 只兜 worker 没能停下来的情况（原生层卡死、agent 自定义动作不返回）。
+_RUN_DEADLINE_GRACE_SECONDS = 90.0
+# worker 把结果发回来之后还要收尾（断开 agent、结束 agent 进程）才退出。agent 卡死时
+# 这一步可能拖很久，而结果已经在手里了：给有限时间，到点强杀，别让宽限期把已经
+# 拿到的截图和进度一起作废。
+_WORKER_EXIT_AFTER_RESULT_SECONDS = 30.0
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+_VERBOSE_FRAMEWORK_LOG_MARKERS = (
+    "Transceiver::send] send canceled",
+    "Transceiver::send_and_recv] failed to send req",
+    "AgentClient::connect] failed to send_and_recv",
+    "after convert, x_point:",
+)
+_NATIVE_FRAMEWORK_LOG_MARKERS = (
+    "MaaNS::",
+    "PipelineParser.cpp",
+    "Context.cpp",
+    "Tasker.cpp",
+    "Node.cpp",
+    "Transceiver.cpp",
+    "AgentClient.cpp",
+)
+_FRAMEWORK_DEBUG_PAYLOAD_MARKERS = (
+    "override_pipeline",
+    "task_ptr->entry()",
+    '"expected":',
+    '"pipeline_override":',
+)
+
+# 这三条都是内部原样回显：Python 异常原文、框架通知里的入口名回声。runner
+# 另发一条整理过的「任务失败: <任务>: <最后停在哪>」，那条要实时进任务日志——
+# 否则失败任务在日志里就像凭空消失，要等收尾摘要才知道出了事。
+_RAW_FAILURE_UI_LOG_MARKERS = (
+    "MaaFW 任务执行失败:",
+    "[MaaFW Tasker] 失败:",
+    "任务执行失败: <entry=",
+)
+# 只进 *.worker.log、不进界面的 runner 行：
+# - 「[MaaFW 详情] 」前缀：完整任务配置（options / override_nodes）、超过每任务
+#   上限后的 focus 文案；
+# - 「[MaaFW Tasker] 开始/成功: <entry>」：英文入口名，和它前面的
+#   「正在运行任务: <标签>」/「任务完成: <标签>」重复。
+# 「任务失败:」「MaaFW 任务完成:」「正在运行任务:」不在这里，宿主与 runner 的
+# 入口跟踪按它们匹配。
+_WORKER_LOG_ONLY_MARKERS = (
+    "[MaaFW 详情] ",
+    "[MaaFW Tasker] 开始:",
+    "[MaaFW Tasker] 成功:",
+)
+_NATIVE_FRAMEWORK_STATUS_RE = re.compile(
+    r"(?:\*\*)?\[\d{4}-\d{2}-\d{2}[^\]]*\]\[(?:ERR|WARN|INFO|DEBUG)\]",
+    re.IGNORECASE,
+)
+_FRAMEWORK_COORDINATE_RE = re.compile(
+    r"(?:^|\]\s*)x:\s*-?\d+,\s*y:\s*-?\d+,\s*width:\s*\d+,\s*height:\s*\d+",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class MaaFWAdbControlProfile:
+    """描述某模拟器实例的 ADB EmulatorExtras 能力与 controller extras 配置。"""
+
+    emulator_type: str | None
+    screencap_extra: bool
+    input_extra: bool
+    config: dict[str, Any]
+
+
+async def _abandon_environment_preparation(
+    prepare_task: "asyncio.Future[Any]",
+    *,
+    release: Any,
+    grace_seconds: float,
+    send_log: Any = None,
+) -> None:
+    """任务取消后有界等待环境准备收尾。
+
+    调用方已把取消令牌置位。准备若在 ``grace_seconds`` 内以异常结束（安装被
+    终止），直接返回；若恰好成功，释放拿到的租约。超过限期就不再等：收尾任务
+    继续在后台跑，准备线程随 uv 子进程被杀而尽快结束。
+    """
+
+    async def release_after_prepare() -> None:
+        try:
+            prepared_after_cancel = await prepare_task
+        except BaseException:
+            return
+        with suppress(Exception):
+            await asyncio.to_thread(release, prepared_after_cancel)
+
+    cleanup_task = asyncio.create_task(release_after_prepare())
+    try:
+        await asyncio.wait_for(asyncio.shield(cleanup_task), timeout=grace_seconds)
+    except asyncio.TimeoutError:
+        _ABANDONED_PREPARATION_CLEANUPS.add(cleanup_task)
+        cleanup_task.add_done_callback(_ABANDONED_PREPARATION_CLEANUPS.discard)
+        if send_log is not None:
+            send_log(
+                "[MaaFW Runner] 环境准备未能在 "
+                f"{grace_seconds:g} 秒内响应取消，已放弃等待"
+            )
+    except asyncio.CancelledError:
+        # 再次被取消：同样不再等，收尾留给后台任务。
+        _ABANDONED_PREPARATION_CLEANUPS.add(cleanup_task)
+        cleanup_task.add_done_callback(_ABANDONED_PREPARATION_CLEANUPS.discard)
+
+
+class _MaaFWRunTimeoutError(RuntimeError):
+    """worker 在宽限期内也没停下，宿主强杀了它。"""
+
+
+class _MaaFWGameUpdateRequired(RuntimeError):
+    """特调的游戏更新钩子判定客户端要手动更新：本用户本次判失败，不重试。"""
+
+
+class _FrameworkLogWriter:
+    """在专用线程中按提交顺序写入一次运行的框架日志。"""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._queue: queue.Queue[tuple[str, str, str] | None] = queue.Queue()
+        self._ready = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._open_error: Exception | None = None
+        self._write_error: Exception | None = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self._run,
+            name="maafw-framework-log-writer",
+            daemon=True,
+        )
+        self._thread.start()
+        self._ready.wait()
+        if self._open_error is not None:
+            self.close()
+            raise self._open_error
+
+    def write(self, source: str, message: str) -> None:
+        if self._thread is None:
+            return
+        timestamp = datetime.now().astimezone().strftime("%H:%M:%S.%f")[:-3]
+        try:
+            self._queue.put((timestamp, source, str(message or "")))
+        except Exception:
+            return
+
+    def close(self) -> None:
+        thread = self._thread
+        if thread is None:
+            return
+        self._queue.join()
+        self._queue.put(None)
+        thread.join()
+        self._thread = None
+        if self._write_error is not None:
+            raise RuntimeError(
+                f"MaaFW 框架日志写入不完整: {self._write_error}"
+            ) from self._write_error
+
+    def _run(self) -> None:
+        log_file: Any | None = None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            log_file = self.path.open(
+                "a",
+                encoding="utf-8",
+                buffering=1,
+            )
+        except Exception as exc:
+            self._open_error = exc
+            self._ready.set()
+            return
+
+        self._ready.set()
+        try:
+            while True:
+                item = self._queue.get()
+                try:
+                    if item is None:
+                        return
+                    timestamp, source, message = item
+                    cleaned = _clean_framework_output(message)
+                    for line in cleaned.splitlines() or [""]:
+                        try:
+                            log_file.write(f"[{timestamp}] [{source}] {line}\n")
+                        except Exception as exc:
+                            if self._write_error is None:
+                                self._write_error = exc
+                            continue
+                except Exception as exc:
+                    if self._write_error is None:
+                        self._write_error = exc
+                finally:
+                    self._queue.task_done()
+        finally:
+            try:
+                log_file.close()
+            except Exception as exc:
+                if self._write_error is None:
+                    self._write_error = exc
+
+
+class MaaFWPluginAutoProxyTask(TaskExecuteBase):
+    """MaaFW 插件版 AutoProxy 执行器。"""
+
+    def __init__(
+        self,
+        script_info: ScriptItem,
+        script_config: Any,
+        user_config: Mapping[uuid.UUID, Any],
+        emulator_manager: DeviceBase | None,
+        project_update_logs: list[str] | None = None,
+        signal_tracker: MaaFWSignalTracker | None = None,
+    ):
+        super().__init__()
+
+        if script_info.task_info is None:
+            raise RuntimeError("ScriptItem 未绑定 TaskItem")
+
+        self.task_info = script_info.task_info
+        self.script_info = script_info
+        self.script_config = script_config
+        self.user_config = user_config
+        self.emulator_manager = emulator_manager
+        self.project_update_logs = list(project_update_logs or [])
+        self.cur_user_item = self.script_info.user_list[self.script_info.current_index]
+        self.cur_user_uid = uuid.UUID(self.cur_user_item.user_id)
+        self.cur_user_config = self.user_config[self.cur_user_uid]
+        self.project_path = resolve_maafw_project_root(
+            str(self.script_info.script_id), self.script_config
+        ).resolve()
+        self.interface_model: MaaFWInterface | None = None
+        self.base_run_plan: MaaFWRunPlan | None = None
+        self.run_plan: MaaFWRunPlan | None = None
+        self.cur_user_log: LogRecord | None = None
+        # 运行前检查时本用户的日志还没建（特调钩子建计划时的提示就在这时候到），
+        # 先攒在这里，prepare() 建好日志时并进去
+        self._pending_user_log: list[str] = []
+        # 与 MAA 等专项同口径：user_start_time 是本用户这一轮的开始（统计通知用），
+        # cur_user_log_started_at 是当前这次尝试的开始（日志记录与 history 文件名用）
+        self.user_start_time: datetime | None = None
+        self.cur_user_log_started_at: datetime | None = None
+        # 每次尝试的结构化结果，供用户级统计的「任务详情」用。MaaFW 不像
+        # M9A 那样只能正则解析日志文本——这里本来就有 completedTasks 与
+        # 失败摘要，直接记下来即可。
+        self._attempt_reports: list[dict[str, Any]] = []
+        self.check_result = "-"
+        self.curdate = datetime.now(tz=UTC4).strftime("%Y-%m-%d")
+        self.run_complete = False
+        self.opened_emulator = False
+        self.opened_game = False
+        self.game_process_manager = ProcessManager()
+        # 启动游戏前临时改写的 Unity 注册表分辨率，游戏关闭后恢复；None 表示没改
+        self.game_resolution_override: UnityGameResolutionOverride | None = None
+        # 本轮游戏窗口出现的单调时钟时刻，只在游戏是刚启动的（MAS 拉起、或接管时
+        # 等到窗口冒出来）才记；据此算首个任务的最早下发时刻。None 表示游戏早就在跑。
+        self.game_window_ready_at: float | None = None
+        self.project_lock_key: str | None = None
+        self.runner_process: asyncio.subprocess.Process | None = None
+        self.pretask_process: asyncio.subprocess.Process | None = None
+        self._cached_adb_address: str | None = None
+        self._cached_device_info: DeviceInfo | None = None
+        self._cached_adb_path: str | None = None
+        self._cached_adb_profile: MaaFWAdbControlProfile | None = None
+        # 随模拟器拉起的游戏包名（空串表示没拉起），交给特调的游戏更新钩子
+        self._launched_package_name = ""
+        # 游戏更新钩子每个用户每次运行只调一次，重试重新开模拟器时不再查
+        self._game_update_checked = False
+        self.maafw_runtime_pool_root: Path | None = None
+        self.maafw_runtime_pool_id: str | None = None
+        # 本轮（整个脚本）的信号账：同一资源已确认维护时后续用户直接跳过，收尾时由
+        # 管理器按「信号 + 资源」各发一条通知。管理器传入共享的一份。
+        self.signal_tracker = signal_tracker or MaaFWSignalTracker()
+        # 本用户这次运行命中的信号（worker 回报），决定收尾怎么结算。
+        self.run_signal: str | None = None
+        # 运行前检查发现同一资源本轮已确认在维护、本用户没启动就跳过。
+        self.maintenance_skipped = False
+        # 队列里 interface 已没有的任务名（项目更新改了 name），建计划时填，进任务报告
+        self.missing_task_names: list[str] = []
+
+    async def check(self) -> str:
+        proxy_times = (
+            self.cur_user_config.get("Data", "ProxyTimes")
+            if self.cur_user_config.get("Data", "LastProxyDate") == self.curdate
+            else 0
+        )
+        if self.script_config.get(
+            "Run", "ProxyTimesLimit"
+        ) != 0 and proxy_times >= self.script_config.get("Run", "ProxyTimesLimit"):
+            self.cur_user_item.status = "跳过"
+            return "今日代理次数已达上限，跳过该用户"
+
+        if not await self._try_enter_project_path():
+            self.cur_user_item.status = "跳过"
+            return "同一路径 MaaFW 脚本正在运行或更新，已跳过本次启动"
+
+        keep_reservation = False
+        try:
+            loop = asyncio.get_running_loop()
+
+            def send_plan_log(message: str) -> None:
+                # 运行计划在工作线程里构建，特调钩子的用户日志要回到事件循环线程
+                # 再写 script_info.log（与 send_runner_log 同一做法），否则撞上
+                # 「no running event loop」，整份计划都算构建失败。
+                loop.call_soon_threadsafe(self._append_log, message)
+
+            try:
+                (
+                    self.interface_model,
+                    self.base_run_plan,
+                    self.run_plan,
+                    game_path_error,
+                ) = await asyncio.to_thread(
+                    self._load_run_state_for_check, send_plan_log
+                )
+            except Exception as exc:
+                self.cur_user_item.status = "异常"
+                return f"无法构建 MaaFW 运行计划，请检查项目和任务配置: {exc}"
+
+            if not self.run_plan.tasks:
+                self.cur_user_item.status = "跳过"
+                return "MaaFW 周期任务已在本周或本月完成，跳过本次运行"
+
+            # 本轮前面的用户已经撞上同一资源的停服维护：不再拉起游戏 / 模拟器，
+            # 并进那条维护通知的用户列表。代理次数、上次状态都不动。
+            maintenance = self.signal_tracker.maintenance(self.run_plan.resourceName)
+            if maintenance is not None:
+                maintenance.add_user(str(self.cur_user_uid), self.cur_user_item.name)
+                self.cur_user_item.status = "跳过"
+                self.maintenance_skipped = True
+                return MAINTENANCE_SKIP_MESSAGE
+
+            if self.run_plan.controllerType == "Adb":
+                emulator_id = self.script_config.get("Emulator", "Id")
+                emulator_index = self.script_config.get("Emulator", "Index")
+                configured_address, _ = self._configured_adb_address()
+                if not configured_address and (
+                    emulator_id == "-" or emulator_index in ("", "-")
+                ):
+                    self.cur_user_item.status = "异常"
+                    return "当前 MaaFW controller 需要 ADB，请在脚本管理页选择模拟器和实例，或填写 ADB 地址"
+            elif game_path_error is not None:
+                self.cur_user_item.status = "异常"
+                return game_path_error
+
+            # 项目自带的 MaaFramework 与本机架构不符时 worker 里必然加载失败；在这里先说清楚
+            # （还没拉起游戏 / 模拟器），并按导入来源 Info.Path 判断重新导入能不能解决。
+            architecture_error = await asyncio.to_thread(
+                self._describe_runtime_architecture_mismatch
+            )
+            if architecture_error:
+                self.cur_user_item.status = "异常"
+                return architecture_error
+
+            keep_reservation = True
+            return "Pass"
+        finally:
+            if not keep_reservation:
+                await self._release_project_path()
+
+    def _describe_runtime_architecture_mismatch(self) -> str | None:
+        source = str(self.script_config.get("Info", "Path") or "").strip()
+        return describe_project_runtime_architecture_mismatch(
+            self.project_path, source_path=Path(source) if source else None
+        )
+
+    async def prepare(self) -> None:
+        start_time = datetime.now()
+        self.user_start_time = start_time
+        self.cur_user_log_started_at = start_time
+        self.cur_user_item.log_record[start_time] = self.cur_user_log = LogRecord()
+        content = self.cur_user_log.content
+        content.extend(self.project_update_logs)
+        content.extend(self._pending_user_log)
+        self._pending_user_log.clear()
+        if content:
+            self.script_info.log = "".join(content[-80:])
+        # 窗口在这里重建，行号也得跟着回到这份日志的开头；更新日志本身就超过 80 行时，
+        # 与 _append_log 用同一套算法把滑出去的行数补上。
+        self.script_info.log_first_line = (
+            sum(chunk.count("\n") for chunk in content[:-80]) + 1
+        )
+
+    async def main_task(self) -> None:
+        self.curdate = datetime.now(tz=UTC4).strftime("%Y-%m-%d")
+        self.check_result = await self.check()
+        if self.check_result != "Pass":
+            # 也记一行后端日志：否则只有 WS 通知，事后日志里只见「任务开始」紧接「任务结束」。
+            # 「异常」是失败，按 WARNING 记；「跳过」（次数用完、周期已完成）是正常分支。
+            (logger.warning if self.cur_user_item.status == "异常" else logger.info)(
+                f"MFW 用户运行前检查未通过（{self.cur_user_item.name}，{self.cur_user_item.status}）：{self.check_result}"
+            )
+            if self.cur_user_item.status == "异常":
+                await Publisher.send(
+                    id=self.task_info.task_id,
+                    type=protocol.TASK_NOTICE,
+                    data=WSTaskNoticeData(
+                        level="error",
+                        message=(
+                            f"用户 {self.cur_user_item.name} 检查未通过: "
+                            f"{self.check_result}"
+                        ),
+                    ),
+                )
+            if self.maintenance_skipped:
+                # 同一资源已确认在维护：记一份本用户的日志，让代理结果汇总、统计信息与
+                # history 都写明原因（其他跳过原因照旧不记）。
+                # 窗口与行号由 _append_log 按本用户日志算好（前面可能还有更新日志与
+                # 检查阶段的特调提示），不再改写成只剩这一行
+                await self.prepare()
+                self._append_log(self.check_result)
+                if self.cur_user_log is not None:
+                    self.cur_user_log.status = self.check_result
+            else:
+                # 没有本用户的日志：窗口只剩检查结果这一行，行号回到 1，
+                # 不接着上一个用户的行号往下数
+                self.script_info.log_first_line = 1
+                self.script_info.log = self.check_result
+            return
+
+        await self._mark_run_started()
+        await self.prepare()
+        self.cur_user_item.status = "运行"
+        logger.info(f"开始代理 MaaFW 用户: {self.cur_user_uid}")
+        if self.run_plan is not None:
+            selected_preset = str(
+                self.cur_user_config.get("Task", "SelectedPreset") or ""
+            ).strip()
+            self._append_log(
+                _format_run_overview_log(
+                    self.run_plan,
+                    selected_preset=selected_preset,
+                )
+            )
+            for warning in self.run_plan.warnings:
+                self._append_log(f"MaaFW 运行计划提示: {warning}")
+
+        try:
+            # 执行任务前脚本（每用户仅一次，重试不重复跑）。
+            # 和下面 finally 里的后脚本放进同一个 try，两者严格配对：
+            # 跑过前脚本就一定会跑后脚本。
+            if self.cur_user_config.get("Info", "IfScriptBeforeTask"):
+                await execute_script_task(
+                    Path(self.cur_user_config.get("Info", "ScriptBeforeTask")),
+                    "脚本前任务",
+                )
+
+            await self._run_pretasks()
+            for index in range(self.script_config.get("Run", "RunTimesLimit")):
+                if self.run_complete:
+                    break
+
+                # 每次尝试单独一份日志（界面与 history 都分开）：第一次沿用 prepare()
+                # 建的那份，开头有更新检查与运行总览；之后每次另起。
+                if index > 0:
+                    self._start_attempt_log()
+
+                self._append_log(
+                    f"用户 {self.cur_user_item.name} - 尝试次数: "
+                    f"{index + 1}/{self.script_config.get('Run', 'RunTimesLimit')}"
+                )
+
+                try:
+                    if self.run_plan is None or self.interface_model is None:
+                        raise RuntimeError("MaaFW 运行计划尚未初始化")
+                    await self._ensure_desktop_game_started()
+                    device_config = await self._build_device_config(
+                        self.run_plan,
+                        self.interface_model,
+                    )
+                    result = await self._run_maafw(device_config)
+                except _MaaFWGameUpdateRequired as exc:
+                    # 游戏客户端要手动更新：重试多少次都一样，本用户本次直接判失败。
+                    # 说明已由 _ensure_game_updated 写进运行日志，这里不再重复。
+                    message = str(exc)
+                    self._record_attempt(index + 1, [], message)
+                    if self.cur_user_log is not None:
+                        self.cur_user_log.status = message
+                    await Publisher.send(
+                        id=self.task_info.task_id,
+                        type=protocol.TASK_NOTICE,
+                        data=WSTaskNoticeData(level="error", message=message),
+                    )
+                    with suppress(Exception):
+                        await Notify.push_plyer(
+                            "游戏需要手动更新！",
+                            message,
+                            f"{self.cur_user_item.name}的游戏需要手动更新",
+                            3,
+                        )
+                    break
+                except Exception as exc:
+                    message = f"MaaFW 运行异常: {exc}"
+                    self._append_log(message, warning=True)
+                    self._record_attempt(index + 1, [], message)
+                    unretryable = _is_unretryable_failure(message)
+                    if unretryable:
+                        self._append_log(
+                            "运行环境不可用，重试也不会有别的结果，已停止本轮",
+                            warning=True,
+                        )
+                    if self.cur_user_log is not None:
+                        self.cur_user_log.status = message
+                    await Publisher.send(
+                        id=self.task_info.task_id,
+                        type=protocol.TASK_NOTICE,
+                        data=WSTaskNoticeData(level="error", message=message),
+                    )
+                    if unretryable:
+                        break
+                    await self._restart_client_before_retry(index + 1)
+                    continue
+
+                await self._mark_period_tasks_completed(result.completedTasks)
+                if result.signal is not None:
+                    # 项目声明的信号节点命中：停服维护 = 本次跳过，需要更新客户端 = 失败；
+                    # 两种都是重试多少次都一样，不重启游戏 / 模拟器，直接收尾。
+                    await self._finish_on_signal(index + 1, result)
+                    break
+                if result.success:
+                    self.run_complete = True
+                    if self.cur_user_log is not None:
+                        self.cur_user_log.status = "Success!"
+                    completed_task_labels = _format_completed_task_labels(
+                        self.run_plan,
+                        result.completedTasks,
+                    )
+                    self._append_log(
+                        "MaaFW 任务完成: " + ", ".join(completed_task_labels)
+                    )
+                    self._record_attempt(index + 1, completed_task_labels, None)
+                else:
+                    if result.timedOut:
+                        message = self._timed_out_user_summary(result)
+                    else:
+                        message = _failed_task_user_summary(result, self.run_plan)
+                    if self.cur_user_log is not None:
+                        self.cur_user_log.status = message
+                    self._append_log(message, warning=True)
+                    self._record_attempt(
+                        index + 1,
+                        _format_completed_task_labels(
+                            self.run_plan, result.completedTasks
+                        ),
+                        message,
+                        screenshots=[
+                            (
+                                _format_completed_task_labels(
+                                    self.run_plan, [shot.task]
+                                )[0],
+                                Path(shot.path),
+                            )
+                            for shot in result.failureScreenshots
+                        ],
+                    )
+                    if _is_unretryable_failure(message):
+                        # worker 在任务里报的环境级失败（如原生库架构不符）：每轮都一样，
+                        # 不再为它起停模拟器 / 游戏重试。
+                        self._append_log(
+                            "运行环境不可用，重试也不会有别的结果，已停止本轮",
+                            warning=True,
+                        )
+                        break
+                    await self._refresh_run_plan_after_period_update()
+                    if self.run_plan is not None and not self.run_plan.tasks:
+                        self.run_complete = True
+                        self._append_log("MaaFW 剩余周期任务已完成，停止本轮重试")
+                    else:
+                        await self._restart_client_before_retry(index + 1)
+        finally:
+            # 执行任务后脚本（每用户仅一次）。放在 finally 里是有意的：成功、重试全败、
+            # 用户中途取消，对这个用户来说都是「跑完了」，收尾脚本都该跑到。
+            # 位置在清理之前，与 MAA 一致——收尾脚本可能还要用模拟器里的东西。
+            if self.cur_user_config.get("Info", "IfScriptAfterTask"):
+                await execute_script_task(
+                    Path(self.cur_user_config.get("Info", "ScriptAfterTask")),
+                    "脚本后任务",
+                )
+
+            await self._shutdown_runner()
+            await self._close_emulator()
+            await self._close_game()
+            await self._release_project_path()
+
+    async def final_task(self) -> None:
+        await self._shutdown_runner()
+        if self.check_result != "Pass":
+            if self.maintenance_skipped:
+                # 维护连带跳过：同样是跳过不是失败，代理次数不动；上次状态、history
+                # 与统计信息都写明原因。
+                await self.cur_user_config.set(
+                    "Data", "LastProxyStatus", MAINTENANCE_LAST_STATUS
+                )
+                statistic_paths = await self._save_user_logs()
+                await self._push_user_statistics(statistic_paths)
+            await self._release_project_path()
+            return
+
+        await self._close_emulator()
+        await self._close_game()
+        statistic_paths = await self._save_user_logs()
+        if self.run_complete:
+            if (
+                self.cur_user_config.get("Data", "ProxyTimes") == 0
+                and self.cur_user_config.get("Info", "RemainedDay") != -1
+            ):
+                await self.cur_user_config.set(
+                    "Info",
+                    "RemainedDay",
+                    self.cur_user_config.get("Info", "RemainedDay") - 1,
+                )
+            await self.cur_user_config.set(
+                "Data",
+                "ProxyTimes",
+                self.cur_user_config.get("Data", "ProxyTimes") + 1,
+            )
+            await self.cur_user_config.set("Data", "LastProxyStatus", "成功")
+            self.cur_user_item.status = "完成"
+            await self._send_success_notify()
+        elif self.run_signal == SERVER_MAINTENANCE:
+            # 维护是跳过不是失败：代理次数、剩余天数不动，下次定时照常再跑
+            await self.cur_user_config.set(
+                "Data", "LastProxyStatus", MAINTENANCE_LAST_STATUS
+            )
+            self.cur_user_item.status = "跳过"
+        else:
+            await self.cur_user_config.set("Data", "LastProxyStatus", "失败")
+            if self.cur_user_item.status == "运行":
+                self.cur_user_item.status = "异常"
+
+        await self._push_user_statistics(statistic_paths)
+        await self._release_project_path()
+
+    async def on_crash(self, e: Exception) -> None:
+        self.cur_user_item.status = "异常"
+        logger.exception(f"MaaFW 插件自动代理任务出现异常: {e}")
+        if self.cur_user_log is not None:
+            self.cur_user_log.status = f"MaaFW 插件自动代理任务出现异常: {e}"
+        try:
+            await Publisher.send(
+                id=self.task_info.task_id,
+                type=protocol.TASK_NOTICE,
+                data=WSTaskNoticeData(
+                    level="error",
+                    message=f"MaaFW 内置运行任务出现异常: {e}",
+                ),
+            )
+        except Exception:
+            pass
+        await self._shutdown_runner()
+        await self._close_emulator()
+        await self._close_game()
+        if self.cur_user_log is not None:
+            with suppress(Exception):
+                await self._save_user_logs()
+        await self._release_project_path()
+
+    def _mas_manages_game_launch(self) -> bool:
+        """MAS 是否负责启动/关闭游戏。
+
+        只有两种模式：DirectExe（默认；MAS 启动，结束后一律由 MAS 关闭）与
+        AttachOnly（脚本或用户自己启停，MAS 只接管窗口、不启动也不关闭）。
+        此前这里根本没读过 LaunchMode，Win32 controller 无论哪种模式都强制索要 exe。
+        旧配置里的 LaunchMode 一定有值（ConfigBase.load 会把默认值写回），这里的兜底
+        只是防御性的。
+        """
+
+        mode = str(self.script_config.get("Game", "LaunchMode") or "DirectExe").strip()
+        return mode != "AttachOnly"
+
+    def _resolve_game_launch_path(self) -> Path | None:
+        """DirectExe 模式下 MAS 要启动的客户端 exe。"""
+
+        raw = str(self.script_config.get("Game", "LaunchPath") or "").strip()
+        return Path(raw) if raw else None
+
+    def _load_run_state_for_check(
+        self,
+        send_log: Callable[[str], None] | None = None,
+    ) -> tuple[MaaFWInterface, MaaFWRunPlan, MaaFWRunPlan, str | None]:
+        interface_model = MaaFWInterfaceService().load(self.project_path)
+        base_run_plan = self._build_run_plan(interface_model, send_log=send_log)
+        run_plan = self._filter_period_once_tasks(base_run_plan)
+
+        game_path_error: str | None = None
+        if (
+            run_plan.tasks
+            and run_plan.controllerType == "Win32"
+            and not _optional_int(self.script_config.get("Device", "HWnd"))
+            and not controller_has_window_rules(
+                _find_controller(interface_model, run_plan.controllerName)
+            )
+        ):
+            # 控制器一条窗口匹配规则都没写，又没指定句柄：以前会随便抓桌面上第一个窗口。
+            # 在拉起游戏之前就报。
+            game_path_error = _WIN32_NO_WINDOW_RULES_MESSAGE
+        elif (
+            run_plan.tasks
+            and run_plan.controllerType == "Win32"
+            and self._mas_manages_game_launch()
+        ):
+            game_path = self._resolve_game_launch_path()
+            if game_path is None or not game_path.is_file():
+                game_path_error = "当前 MaaFW controller 需要由 MAS 启动游戏，请在脚本管理页选择实际游戏 exe"
+        return interface_model, base_run_plan, run_plan, game_path_error
+
+    def _build_run_plan(
+        self,
+        interface_model: MaaFWInterface,
+        *,
+        send_log: Callable[[str], None] | None = None,
+    ) -> MaaFWRunPlan:
+        # 不看 Info.IfQuickConfig：MaaFW 没有可退回的原生配置，用户页上配的任务队列就是
+        # 唯一的任务来源。开关在界面上已经不提供，这里若还读它，被隐藏的旧值会让页面上
+        # 能改、运行时却不生效。
+        task_snapshot = _load_json_dict(
+            self.cur_user_config.get("Task", "TaskSnapshot")
+        )
+        selected_preset = str(
+            self.cur_user_config.get("Task", "SelectedPreset") or ""
+        ).strip()
+        controller_name, resource_name = self._select_run_selection(interface_model)
+        effective_preset = (
+            selected_preset if selected_preset and not task_snapshot else None
+        )
+        # 特调类型（脚本配置类声明了 FLAVOR）：先把快照归一化成实例 id 列表，交给
+        # 钩子装饰（首尾任务、切号绑定之类），再按装饰后的列表建计划。通用 MaaFW
+        # 没有钩子，仍按快照直接建计划，行为不变。
+        flavor = resolve_flavor(self.script_config)
+        # 脚本级键位（Game.Hotkeys）：坏 JSON / 不是对象当空，字段级的校验在建计划时做。
+        script_hotkeys = _load_script_hotkeys(self.script_config.get("Game", "Hotkeys"))
+        missing_skips: list[MaaFWSkippedTaskPlan] = []
+        try:
+            # 密码字段（PI v2.10.0）在配置里是密文，只在这份内存副本里解开交给计划；
+            # 用户配置本身不动，运行后的整表写回也就写不出明文。
+            task_snapshot = open_task_snapshot(task_snapshot, interface_model)
+            # 项目更新改了任务 name 后，队列里的旧 id 在归一化时就被滤掉了，运行日志里
+            # 一点痕迹都没有。先按原始快照把它们找出来，建完计划记成跳过。
+            missing_names = find_missing_task_names(task_snapshot, interface_model)
+            missing_skips = [
+                MaaFWSkippedTaskPlan(name=name, reason="interface 内已无该任务")
+                for name in missing_names
+            ]
+            self.missing_task_names = list(dict.fromkeys(missing_names))
+            if flavor is None:
+                plan = MaaFWRunnerService().build_plan(
+                    self.project_path,
+                    interface_model,
+                    controller_name=controller_name,
+                    resource_name=resource_name,
+                    selected_preset=effective_preset,
+                    task_snapshot=task_snapshot or None,
+                    script_hotkeys=script_hotkeys,
+                )
+                return _with_skipped_tasks(plan, missing_skips)
+            task_ids, task_options = select_snapshot_tasks(
+                interface_model,
+                selected_preset=effective_preset,
+                task_snapshot=task_snapshot or None,
+            )
+            task_ids, task_options = flavor.decorate_selection(
+                interface_model,
+                task_ids,
+                task_options,
+                script_config=self.script_config,
+                user_config=self.cur_user_config,
+                resource_name=resource_name,
+                # 本方法在工作线程里跑：没给线程安全的回调就只进后端日志。
+                send_log=send_log if send_log is not None else logger.info,
+            )
+            plan = MaaFWRunnerService().build_plan(
+                self.project_path,
+                interface_model,
+                controller_name=controller_name,
+                resource_name=resource_name,
+                task_ids=task_ids,
+                task_options=task_options,
+                script_hotkeys=script_hotkeys,
+            )
+            plan = _mark_abort_round_tasks(plan, flavor)
+            return _with_skipped_tasks(plan, missing_skips)
+        except Exception as exc:
+            message = str(exc)
+            if missing_skips and NO_RUNNABLE_TASKS_MESSAGE in message:
+                # 队列里只剩虚影时「没有可执行任务」说不清原因，把对不上的任务名带上；
+                # 别的报错（拆用户、找不到 controller……）与虚影无关，不附加
+                names = "、".join(dict.fromkeys(item.name for item in missing_skips))
+                message = f"{message}（interface 内已无：{names}）"
+            raise MaaFWRunPlanError(message) from exc
+
+    def _select_run_selection(
+        self, interface_model: MaaFWInterface
+    ) -> tuple[str | None, str | None]:
+        """``(交给建计划的 controller 名, 实际生效的 resource 名)``，口径见 ``resolve_run_selection``。
+
+        用户在脚本页显式选的 controller 优先。这里曾把「配了模拟器」排在前面，于是先在 ADB
+        模式下选过模拟器、之后把控制方式改成 Win32 的用户会被静默改回 ADB：Emulator.Id 还留着
+        旧值（Win32 分支下模拟器下拉被隐藏，用户没有入口清它），运行时回落到第一个 Adb
+        controller，按 Win32 编排的任务被 run_plan 过滤掉，或者直接报「当前 controller/resource
+        下没有可执行任务」。特调在保存与启动期整理用户配置时用同一个函数判资源。
+        """
+
+        return resolve_run_selection(
+            interface_model,
+            configured_controller=str(
+                self.script_config.get("Info", "Controller") or ""
+            ),
+            emulator_selected=self.script_config.get("Emulator", "Id") != "-",
+            configured_resource=str(self.script_config.get("Info", "Resource") or ""),
+        )
+
+    async def _build_device_config(
+        self,
+        plan: MaaFWRunPlan,
+        interface_model: MaaFWInterface,
+    ) -> MaaFWDeviceConfig:
+        if plan.controllerType == "Adb":
+            address, device_info = await self._resolve_adb_address()
+            adb_path = await self._resolve_adb_path(address, device_info)
+            await self._ensure_game_updated(address, adb_path)
+            adb_profile = await self._build_adb_control_profile()
+            return MaaFWDeviceConfig(
+                type="Adb",
+                adbPath=adb_path,
+                address=address,
+                screencapMethods=self._resolve_adb_screencap_methods(adb_profile),
+                inputMethods=self._resolve_adb_input_methods(adb_profile),
+                config=adb_profile.config,
+                adbReadyTimeout=self._resolve_adb_ready_timeout(),
+            )
+
+        if plan.controllerType == "Win32":
+            controller = _find_controller(interface_model, plan.controllerName)
+            win32_config = controller.win32
+            mouse = win32_config.mouse if win32_config else None
+            keyboard = win32_config.keyboard if win32_config else None
+            if mouse is None and keyboard is None and win32_config is not None:
+                # MFAA 的写法：只写 input 时鼠标、键盘都用它
+                mouse = keyboard = win32_config.input
+            return MaaFWDeviceConfig(
+                type="Win32",
+                hWnd=await self._resolve_window_handle(controller),
+                screencapMethod=_resolve_win32_method(
+                    self.script_config.get("Device", "Win32ScreencapMethod"),
+                    win32_config.screencap if win32_config else None,
+                    _WIN32_SCREENCAP_METHODS,
+                    "DXGI_DesktopDup",
+                    label=f"controller {controller.name} 的 Win32 截图方式",
+                    warn=self._append_log,
+                    combinable=True,
+                ),
+                mouseMethod=_resolve_win32_method(
+                    self.script_config.get("Device", "Win32MouseMethod"),
+                    mouse,
+                    _WIN32_INPUT_METHODS,
+                    "Seize",
+                    label=f"controller {controller.name} 的 Win32 鼠标输入方式",
+                    warn=self._append_log,
+                ),
+                keyboardMethod=_resolve_win32_method(
+                    self.script_config.get("Device", "Win32KeyboardMethod"),
+                    keyboard,
+                    _WIN32_INPUT_METHODS,
+                    "Seize",
+                    label=f"controller {controller.name} 的 Win32 键盘输入方式",
+                    warn=self._append_log,
+                ),
+            )
+
+        raise RuntimeError(f"当前仅支持 Adb/Win32 controller: {plan.controllerType}")
+
+    async def _resolve_game_package(self) -> str:
+        """这次要不要顺带把游戏拉起来，拉哪个包。返回空串表示只开模拟器。
+
+        脚本配置里填了就以它为准：从项目里认包名是启发式的（``StartApp`` 只是约定，
+        不是 interface 规格里的字段），用户必须有办法推翻它。
+
+        认不出来不是错误——很多项目本来就自己在 pipeline 里开游戏。但要让用户看得见
+        为什么没启动，否则「填了没反应」和「没填也没反应」在界面上长得一模一样。
+        """
+        manual = str(self.script_config.get("Game", "PackageName") or "").strip()
+        if manual:
+            self._append_log(f"游戏包名: {manual}（脚本配置）")
+            return manual
+
+        if self.run_plan is None:
+            return ""
+
+        resolution = await asyncio.to_thread(
+            resolve_game_package,
+            [
+                Path(item.resolved)
+                for item in self.run_plan.resource.paths
+                if item.exists and item.isDir
+            ],
+            [
+                task.pipelineOverride
+                for task in self.run_plan.tasks
+                if task.pipelineOverride
+            ],
+        )
+
+        if resolution.reason == "resolved":
+            self._append_log(f"游戏包名: {resolution.package}（从项目识别）")
+            return resolution.package
+
+        if resolution.reason == "ambiguous":
+            self._append_log(
+                f"项目里识别到多个游戏包名（{'、'.join(resolution.candidates)}），"
+                "无法确定用哪个，本次不随模拟器启动游戏；"
+                "需要的话在脚本管理页填写游戏包名"
+            )
+        else:
+            self._append_log(
+                "未能从项目里识别出游戏包名，本次不随模拟器启动游戏；"
+                "需要的话在脚本管理页填写游戏包名"
+            )
+        return ""
+
+    def _configured_adb_address(self) -> tuple[str, str]:
+        """脚本里手填的 ADB 地址，返回 ``(地址, 来源)``；都没填就是 ``("", "")``。
+
+        用户级 ``Device.AdbAddress`` 覆盖脚本级，两个字段默认都是空串。填了地址就直接连它，
+        不去启动模拟器，自然也没接管：没接管的设备 MAS 不管开关（#205）。
+        """
+        user_address = str(
+            self.cur_user_config.get("Device", "AdbAddress") or ""
+        ).strip()
+        if user_address:
+            return user_address, "用户配置"
+        script_address = str(
+            self.script_config.get("Device", "AdbAddress") or ""
+        ).strip()
+        return script_address, "脚本配置" if script_address else ""
+
+    async def _emulator_serves_address(self, emulator_index: str, address: str) -> bool:
+        """手填的 ADB 地址是不是所选模拟器这个实例的。
+
+        模拟器增强（雷电截图与 ldconsole 文本输入、MuMu 截图与输入）按实例号直接取画面、
+        发输入，不经过 ADB 地址。地址指向别的设备时还按所选模拟器建增强，画面和点击都会落到那台模拟器上，
+        雷电没开时还会因为拿不到进程号连不上；所以只有地址正是这个实例时才用增强。
+        """
+        if self.emulator_manager is None:
+            return False
+        try:
+            info = (await self.emulator_manager.getInfo(emulator_index)).get(
+                str(emulator_index)
+            )
+        except Exception as exc:
+            self._append_log(
+                f"读取所选模拟器的 ADB 地址失败，{address} 按普通 ADB 设备连接: {exc}"
+            )
+            return False
+        if info is not None and _same_adb_device(info.adb_address, address):
+            return True
+        instance_address = info.adb_address if info is not None else "未找到该实例"
+        self._append_log(
+            f"ADB 地址 {address} 不是所选模拟器实例的地址（{instance_address}），"
+            "按普通 ADB 设备连接，不使用模拟器增强"
+        )
+        return False
+
+    async def _resolve_adb_address(self) -> tuple[str, DeviceInfo | None]:
+        if self._cached_adb_address is not None:
+            return self._cached_adb_address, self._cached_device_info
+
+        configured_address, source = self._configured_adb_address()
+        if configured_address:
+            self._cached_adb_address = configured_address
+            self._append_log(f"使用{source}的 ADB 地址: {configured_address}")
+            return configured_address, None
+
+        if self.emulator_manager is None:
+            raise RuntimeError(
+                "当前 controller 需要 ADB，请在脚本管理页选择模拟器，或填写 ADB 地址"
+            )
+
+        emulator_index = self.script_config.get("Emulator", "Index")
+        if emulator_index in ("", "-"):
+            raise RuntimeError(
+                "当前 controller 需要 ADB，请在脚本管理页选择模拟器实例，或填写 ADB 地址"
+            )
+
+        package_name = await self._resolve_game_package()
+        self._launched_package_name = package_name
+        self._append_log(f"正在启动模拟器: {emulator_index}")
+        self.opened_emulator = True
+        device_info = await self.emulator_manager.open(emulator_index, package_name)
+        if Config.get("Function", "IfSilence"):
+            with suppress(Exception):
+                await self.emulator_manager.setVisible(emulator_index, False)
+        if not device_info.adb_address or device_info.adb_address == "Unknown":
+            raise RuntimeError("模拟器未返回可用 ADB 地址")
+
+        self._cached_adb_address = device_info.adb_address
+        self._cached_device_info = device_info
+        self._append_log(f"模拟器启动完成，ADB 地址: {device_info.adb_address}")
+        return device_info.adb_address, device_info
+
+    async def _resolve_adb_path(
+        self,
+        address: str,
+        device_info: DeviceInfo | None,
+    ) -> str | None:
+        if self._cached_adb_path is not None:
+            return self._cached_adb_path
+        configured_path = str(self.script_config.get("Device", "AdbPath") or "").strip()
+        if configured_path and Path(configured_path).exists():
+            self._cached_adb_path = configured_path
+            self._append_log(f"ADB 路径选择: 脚本配置; 路径={configured_path}")
+            return configured_path
+        if configured_path:
+            self._append_log(
+                f"脚本配置的 ADB 路径不存在，继续自动解析: {configured_path}"
+            )
+
+        manager = self.emulator_manager
+        get_adb_path = getattr(manager, "get_adb_path", None)
+        if callable(get_adb_path):
+            with suppress(Exception):
+                manager_adb_path = get_adb_path()
+                if manager_adb_path is not None:
+                    manager_adb_path = Path(manager_adb_path)
+                    if manager_adb_path.exists():
+                        self._cached_adb_path = str(manager_adb_path)
+                        self._append_log(
+                            "ADB 路径选择: MAS 模拟器管理器; "
+                            f"路径={self._cached_adb_path}"
+                        )
+                        return self._cached_adb_path
+
+        derived_path = self._derive_adb_path_from_emulator_config()
+        if derived_path is not None and derived_path.exists():
+            self._cached_adb_path = str(derived_path)
+            self._append_log(
+                f"ADB 路径选择: 模拟器安装目录; 路径={self._cached_adb_path}"
+            )
+            return self._cached_adb_path
+
+        title = f"（{device_info.title}）" if device_info else ""
+        self._append_log(
+            f"主程序未解析到 ADB 路径{title}，将由 MaaFW Runner 按设备地址发现"
+        )
+        return None
+
+    async def _ensure_game_updated(self, address: str, adb_path: str | None) -> None:
+        """模拟器启动后、第一个任务下发前，调特调的游戏更新钩子（契约见 flavor.py）。
+
+        每个用户每次运行只调一次。钩子判定要手动更新时抛 ``_MaaFWGameUpdateRequired``，
+        由 main_task 判失败且不重试；钩子自己出错只记警告，照常运行。
+        """
+
+        if self._game_update_checked:
+            return
+        self._game_update_checked = True
+        mode = str(self.script_config.get("Run", "GameUpdateMode") or "Off")
+        hook = resolve_game_update_hook(self.script_config)
+        if mode == "Off" or hook is None or self.run_plan is None:
+            return
+
+        async def report(text: str) -> None:
+            self._append_log(text)
+
+        self._append_log("正在检查游戏客户端更新")
+        try:
+            result = await hook(
+                script_config=self.script_config,
+                resource_name=self.run_plan.resourceName,
+                package_name=self._launched_package_name,
+                adb_path=adb_path,
+                adb_address=address,
+                if_auto_install=mode == "AutoInstall",
+                progress=report,
+            )
+        except Exception as exc:
+            logger.opt(exception=True).warning(f"游戏更新检查异常: {exc}")
+            self._append_log(f"游戏更新检查出错，本次照常运行: {exc}")
+            return
+
+        self._append_log(result.message)
+        if result.status == "NeedManualUpdate":
+            raise _MaaFWGameUpdateRequired(result.message)
+
+    def _derive_adb_path_from_emulator_config(self) -> Path | None:
+        emulator_id = self.script_config.get("Emulator", "Id")
+        if emulator_id == "-":
+            return None
+
+        # 一条配置可以纳管多个模拟器安装, 那种情况下持久化的 Info.Path 是空的,
+        # 得先问管理器这个设备号落在哪条安装上。
+        emulator_index = self.script_config.get("Emulator", "Index")
+        with suppress(Exception):
+            resolve_device = getattr(self.emulator_manager, "resolve_device", None)
+            if resolve_device is not None and emulator_index not in ("", "-"):
+                device_ref = resolve_device(emulator_index)
+                if device_ref is not None and device_ref.manager_path:
+                    return Path(device_ref.manager_path).parent / "adb.exe"
+
+        with suppress(Exception):
+            emulator_config = Config.EmulatorConfig[uuid.UUID(emulator_id)]
+            emulator_path = Path(emulator_config.get("Info", "Path"))
+            return emulator_path.parent / "adb.exe"
+        return None
+
+    async def _build_adb_control_profile(self) -> MaaFWAdbControlProfile:
+        """解析当前模拟器的 EmulatorExtras 能力，并构造 MuMu/雷电 controller extras 配置。"""
+        if self._cached_adb_profile is not None:
+            return self._cached_adb_profile
+
+        emulator_id = self.script_config.get("Emulator", "Id")
+        emulator_index = self.script_config.get("Emulator", "Index")
+        if emulator_id == "-" or emulator_index in ("", "-"):
+            self._cached_adb_profile = MaaFWAdbControlProfile(None, False, False, {})
+            return self._cached_adb_profile
+
+        try:
+            # 先问管理器这个设备号的真实归属。持久化的 Info.Type 在纳管多个安装时
+            # 不等于设备的真实类型, 直接读它会让雷电专用截图被跳过——而雷电上普通
+            # ADB 截图取不到游戏的 GPU 渲染层, 识别会全程无命中。
+            native_index = emulator_index
+            resolve_device = getattr(self.emulator_manager, "resolve_device", None)
+            device_ref = resolve_device(emulator_index) if resolve_device else None
+            if device_ref is not None:
+                emulator_type = device_ref.emulator_type
+                emulator_path = Path(device_ref.manager_path)
+                native_index = device_ref.native_index
+            else:
+                emulator_config = Config.EmulatorConfig[uuid.UUID(emulator_id)]
+                emulator_type = str(emulator_config.get("Info", "Type") or "")
+                emulator_path = Path(emulator_config.get("Info", "Path"))
+            # 雷电 / MuMu 下面要按实例号建增强；填了 ADB 地址时先确认地址就是这个实例
+            configured_address, _ = self._configured_adb_address()
+            if (
+                emulator_type in {"ldplayer", "mumu"}
+                and configured_address
+                and not await self._emulator_serves_address(
+                    emulator_index, configured_address
+                )
+            ):
+                self._cached_adb_profile = MaaFWAdbControlProfile(
+                    None, False, False, {}
+                )
+                return self._cached_adb_profile
+            # build_adb_emulator_extra_capabilities 通过 find_spec 探测运行时 maa，
+            # 不会把 maa 载入 sys.modules，满足导入边界约束；返回 {type: {screencap,input}}。
+            capabilities = build_adb_emulator_extra_capabilities()
+            capability = capabilities.get(emulator_type, {})
+            screencap_extra = bool(capability.get("screencap", False))
+            input_extra = bool(capability.get("input", False))
+            if emulator_type == "ldplayer":
+                # 没有截图增强也要进来：文本输入改走 ldconsole 与截图增强无关
+                config = await self._build_ldplayer_adb_controller_config(
+                    emulator_path,
+                    emulator_index,
+                    native_index,
+                    with_extras=screencap_extra,
+                )
+                self._cached_adb_profile = MaaFWAdbControlProfile(
+                    emulator_type,
+                    screencap_extra,
+                    input_extra,
+                    config,
+                )
+                return self._cached_adb_profile
+            if emulator_type == "mumu" and (screencap_extra or input_extra):
+                config = self._build_mumu_adb_controller_config(
+                    emulator_path,
+                    emulator_index,
+                    native_index,
+                )
+                self._cached_adb_profile = MaaFWAdbControlProfile(
+                    emulator_type,
+                    screencap_extra,
+                    input_extra,
+                    config,
+                )
+                return self._cached_adb_profile
+            self._cached_adb_profile = MaaFWAdbControlProfile(
+                emulator_type,
+                screencap_extra,
+                input_extra,
+                {},
+            )
+            return self._cached_adb_profile
+        except Exception as exc:
+            logger.warning(f"构造 MaaFW ADB extra 配置失败，使用默认配置: {exc}")
+
+        self._cached_adb_profile = MaaFWAdbControlProfile(None, False, False, {})
+        return self._cached_adb_profile
+
+    def _resolve_adb_ready_timeout(self) -> int | None:
+        """按该模拟器自己的 Info.MaxWaitTime 决定等 adb 的耐心。
+
+        LDPlayer.open() 在 in_android==1 之后只 sleep 3 秒就返回「启动完成」
+        （不传 package_name 时不走 30 秒分支），此时 Android 里的 adbd 常常还
+        没起来。第一层把等待交给项目外壳，内置运行这条等待是唯一的缓冲，
+        插件版固定 30 秒在冷启动的雷电上不够用。
+
+        取不到模拟器配置时返回 None，由 runner 用自己的常量兜底。
+        """
+
+        manager = self.emulator_manager
+        config = getattr(manager, "config", None) if manager is not None else None
+        if config is None:
+            return None
+        try:
+            value = int(config.get("Info", "MaxWaitTime"))
+        except Exception:  # noqa: BLE001 - 取不到就交给 runner 兜底
+            return None
+        return value if value > 0 else None
+
+    def _resolve_adb_screencap_methods(self, profile: MaaFWAdbControlProfile) -> int:
+        extra_method = _ADB_SCREENCAP_EMULATOR_EXTRAS
+        if profile.emulator_type in {"ldplayer", "mumu"}:
+            default_methods = _ADB_SCREENCAP_DEFAULT
+            if profile.screencap_extra:
+                # 只给模拟器增强这一种，与第一层写死的 ScreencapMethods=64 一致。
+                #
+                # 此前返回的是 default_methods | extra_method，而 -57 本身已含
+                # 1<<6，等于把全部方法交给 MaaFW 测速。雷电上 ADB 系截图
+                # （RawWithGzip 等）拿不到游戏的 GPU 渲染层：图有正常的
+                # 1280x720，内容却是空的，于是识别全程无命中、一次点击都发不出，
+                # 每个任务空转到超时。测速只比快慢、不比对不对，必然选错。
+                return extra_method
+            return _remove_method(default_methods, extra_method, default_methods)
+        return _remove_method(
+            int(self.script_config.get("Device", "AdbScreencapMethods")),
+            extra_method,
+            _remove_method(
+                _ADB_SCREENCAP_DEFAULT,
+                extra_method,
+                _ADB_SCREENCAP_DEFAULT,
+            ),
+        )
+
+    def _resolve_adb_input_methods(self, profile: MaaFWAdbControlProfile) -> int:
+        extra_input_method = _ADB_INPUT_EMULATOR_EXTRAS
+        if profile.emulator_type == "mumu" and profile.input_extra:
+            return _ADB_INPUT_ALL
+        if profile.emulator_type == "ldplayer" and _has_input_text_command(
+            profile.config
+        ):
+            # 文本已改走 ldconsole，见 _ADB_INPUT_LDPLAYER_CONSOLE_TEXT
+            return _ADB_INPUT_LDPLAYER_CONSOLE_TEXT
+        if profile.emulator_type in {"ldplayer", "mumu"}:
+            return _ADB_INPUT_DEFAULT
+
+        configured = int(self.script_config.get("Device", "AdbInputMethods"))
+        if not profile.input_extra:
+            return _remove_method(
+                configured,
+                extra_input_method,
+                _ADB_INPUT_DEFAULT,
+            )
+        return configured
+
+    async def _build_ldplayer_adb_controller_config(
+        self,
+        emulator_path: Path,
+        emulator_index: str,
+        native_index: str | None = None,
+        *,
+        with_extras: bool = True,
+    ) -> dict[str, Any]:
+        """雷电的 ADB controller config：截图增强 extras + 走 ldconsole 的文本输入。
+
+        ``with_extras`` 为 False（运行时 maa 没有雷电截图增强）时不写 ``extras``，
+        但文本输入命令照写：它只依赖安装目录里的 ``ldconsole.exe``。
+        """
+        emulator_root = emulator_path.parent
+        # 兜底必须用原生索引: 雷电 extras 的 index 与 ADB 序列号都按它算,
+        # 纳管多个安装时设备号与原生索引不是一回事。
+        index = int(native_index if native_index is not None else emulator_index)
+        pid = 0
+
+        # get_device_info 仅存在于部分模拟器管理器（雷电有，MuMu 无），
+        # 且 list2 可能超时/异常，故整体兜底为实例索引 + pid=0。
+        if self.emulator_manager is not None:
+            try:
+                devices = await self.emulator_manager.get_device_info(emulator_index)
+                device = devices.get(emulator_index)
+                if device is not None:
+                    index = device.idx
+                    pid = device.pid
+            except Exception as exc:
+                logger.warning(
+                    f"获取雷电模拟器 extra 信息失败，使用实例索引兜底: {exc}"
+                )
+
+        ld_config: dict[str, Any] = {
+            "enable": True,
+            "index": index,
+            "path": str(emulator_root).replace("\\", "/"),
+            "pid": pid,
+        }
+        ld_library = emulator_root / "ldopengl64.dll"
+        if ld_library.exists():
+            ld_config["lib"] = str(ld_library).replace("\\", "/")
+
+        config: dict[str, Any] = {}
+        if with_extras:
+            config["extras"] = {"ld": ld_config}
+        command = _ldplayer_input_text_command(emulator_root, index)
+        if command is not None:
+            config["command"] = {"InputText": command}
+        return config
+
+    @staticmethod
+    def _build_mumu_adb_controller_config(
+        emulator_path: Path,
+        emulator_index: str,
+        native_index: str | None = None,
+    ) -> dict[str, Any]:
+        emulator_root = emulator_path.parent.parent
+        # 与雷电分支同口径: MuMu extras 的 index 也按原生索引算,
+        # 纳管多个安装时设备号与原生索引不是一回事。
+        mumu_config: dict[str, Any] = {
+            "enable": True,
+            "index": int(native_index if native_index is not None else emulator_index),
+            "path": str(emulator_root).replace("\\", "/"),
+        }
+        for library in (
+            emulator_root / "nx_main" / "sdk" / "external_renderer_ipc.dll",
+            emulator_root / "shell" / "sdk" / "external_renderer_ipc.dll",
+        ):
+            if library.exists():
+                mumu_config["lib"] = str(library).replace("\\", "/")
+                break
+
+        return {
+            "extras": {
+                "mumu": mumu_config,
+            },
+        }
+
+    async def _resolve_window_handle(self, controller: MaaFWController) -> int:
+        configured_hwnd = self.script_config.get("Device", "HWnd")
+        parsed_hwnd = _optional_int(configured_hwnd)
+        if parsed_hwnd:
+            return parsed_hwnd
+        if not controller_has_window_rules(controller):
+            raise RuntimeError(_WIN32_NO_WINDOW_RULES_MESSAGE)
+        matches = await asyncio.to_thread(_match_controller_windows, controller)
+        if not matches:
+            raise RuntimeError("未找到匹配 MaaFW Win32 controller 的窗口")
+        if len(matches) > 1:
+            # 仍取第一个（行为不变），但让用户看得见：多开、同名的启动器 / 浏览器
+            # 标签页都会命中同一条正则，接错窗口时日志里要能找到原因。
+            candidates = "; ".join(
+                f"hWnd={item.hWnd}, class={item.className}, title={item.windowName}"
+                for item in matches
+            )
+            self._append_log(
+                f"控制器 {controller.name} 的窗口规则匹配到 {len(matches)} 个窗口，"
+                f"本次使用第一个（hWnd={matches[0].hWnd}）。候选: {candidates}。"
+                "接错窗口时请先关掉多余的同名窗口再运行"
+            )
+        return int(matches[0].hWnd)
+
+    async def _run_maafw(self, device_config: MaaFWDeviceConfig) -> MaaFWRunResult:
+        if self.run_plan is None:
+            raise RuntimeError("MaaFW 运行计划尚未初始化")
+        limit_minutes = self.script_config.get("Run", "RunTimeLimit")
+        timeout = limit_minutes * 60
+        task_limit_seconds, task_limit_overrides = task_time_limits_from_config(
+            self.script_config
+        )
+        # 截止时刻交给 worker：到点它自己停任务、截图、把已完成的任务带回来。
+        # 宿主这层只在 worker 没停下时才强杀，那时既没有截图也没有进度。
+        run_deadline_at = time.time() + timeout
+        try:
+            return await asyncio.wait_for(
+                self._run_maafw_worker(
+                    device_config,
+                    run_deadline_at=run_deadline_at,
+                    task_time_limit_seconds=task_limit_seconds,
+                    task_time_limit_overrides=task_limit_overrides,
+                ),
+                timeout=timeout + _RUN_DEADLINE_GRACE_SECONDS,
+            )
+        except asyncio.TimeoutError as exc:
+            await self._terminate_runner_process()
+            raise _MaaFWRunTimeoutError(
+                f"MaaFW 任务运行超时（限制 {limit_minutes} 分钟，worker 未能自行停止，已强制结束）"
+            ) from exc
+        except asyncio.CancelledError:
+            await self._terminate_runner_process()
+            raise
+
+    async def _run_maafw_worker(
+        self,
+        device_config: MaaFWDeviceConfig,
+        *,
+        run_deadline_at: float | None = None,
+        task_time_limit_seconds: int = 0,
+        task_time_limit_overrides: dict[str, int] | None = None,
+    ) -> MaaFWRunResult:
+        if self.run_plan is None:
+            raise RuntimeError("MaaFW 运行计划尚未初始化")
+
+        service = MaaFWRunnerService()
+        loop = asyncio.get_running_loop()
+        runtime_pool_root = self.maafw_runtime_pool_root
+        runtime_pool_id = str(self.maafw_runtime_pool_id or "").strip()
+        if runtime_pool_root is None or not runtime_pool_id:
+            raise RuntimeError(
+                "MaaFW 运行任务缺少由 maafw.runtime_pool.v1 注入的 root/poolId"
+            )
+        native_debug_log_path = self.project_path / "debug" / "maafw.log"
+        (
+            native_debug_log_offset,
+            native_debug_log_rotations,
+        ) = await asyncio.to_thread(
+            _snapshot_native_debug_log_state, native_debug_log_path
+        )
+        # 项目 agent 自己写的日志（debug/custom、go-service …）同样记下起点，收尾时只另存本次新写的。
+        try:
+            project_log_marks = await asyncio.to_thread(
+                snapshot_project_logs, self.project_path
+            )
+        except Exception as exc:
+            project_log_marks = {}
+            self._append_log(f"MaaFW 项目日志起点记录失败，本次按全部新写处理: {exc}")
+
+        def send_runner_log(message: str) -> None:
+            loop.call_soon_threadsafe(self._append_log, message)
+
+        # 密码字段（PI v2.10.0）的原文会随 override 进原生日志与 worker 输出：复制、转发、
+        # 摘录失败原因前都换成占位（协议要求不得把原文写进日志）。
+        secrets = self._secret_log_variants()
+        prepare_cancel_event = threading.Event()
+        # 与运行前更新 / 预检同一份解析：脚本级 Update.ProxyAddress 优先，留空跟随
+        # 全局。运行时装依赖也走它，否则「更新能走代理、真跑时装不上」。
+        proxy_url = resolve_update_proxy_url(self.script_config)
+
+        def _prepare_environment_with_proxy() -> MaaFWRunnerEnvironment:
+            # 代理作用域按线程登记，要在 to_thread 的目标函数体内进入：池的 uv /
+            # pip 子进程、以及这里派生出的 worker 环境（worker 内的 agent pip 与
+            # 项目 agent 再从它继承）都从 strip_host_python_environment 拿到代理变量。
+            with subprocess_proxy_scope(proxy_url):
+                return service.prepare_environment(
+                    self.project_path,
+                    runtime_pool_root=runtime_pool_root,
+                    runtime_pool_id=runtime_pool_id,
+                    lease_owner=f"automas-script-maafw:{self.script_info.script_id}",
+                    lease_ttl_seconds=max(
+                        600,
+                        int(self.script_config.get("Run", "RunTimeLimit") or 120) * 60
+                        + 600,
+                    ),
+                    # worker 跑在 runtime pool 的隔离 venv 里，代码要靠 PYTHONPATH
+                    # 找到本仓。这里必须是源码根而不是 Path.cwd()：受 Runtime 监督时
+                    # 工作目录是 <app-root>、源码在 <app-root>/repo/，cwd 下没有 app/ 包。
+                    # 只给代码路径、不给宿主 venv 的 site-packages，隔离 venv 里的
+                    # maafw 因此仍然优先。
+                    import_paths=[SOURCE_ROOT],
+                    send_log=send_runner_log,
+                    cancel_event=prepare_cancel_event,
+                )
+
+        prepare_environment_task = asyncio.create_task(
+            asyncio.to_thread(_prepare_environment_with_proxy)
+        )
+        try:
+            runner_environment = await asyncio.shield(prepare_environment_task)
+        except asyncio.CancelledError:
+            # 取消要传进安装线程：置位令牌后正在跑的 uv/pip 子进程会被终止。
+            # 然后只等有限时间——后端关机时 Runtime 只给几秒，等不到就放弃，
+            # 租约释放交给后台任务或 TTL。
+            prepare_cancel_event.set()
+            await _abandon_environment_preparation(
+                prepare_environment_task,
+                release=service.release_environment,
+                grace_seconds=_PREPARE_ENVIRONMENT_CANCEL_GRACE_SECONDS,
+                send_log=self._append_log,
+            )
+            raise
+        started_at = self.cur_user_log_started_at or datetime.now()
+        local_started_at = started_at.astimezone(UTC4)
+        history_dir = (
+            Path.cwd()
+            / "history"
+            / local_started_at.strftime("%Y-%m-%d")
+            / self.cur_user_item.name
+        )
+        history_stamp = local_started_at.strftime("%H-%M-%S")
+        job_path: Path | None = None
+        worker_id: str | None = None
+        try:
+            runner_plan = self.run_plan
+            if runner_environment.maafw_version:
+                runner_plan = self.run_plan.model_copy(deep=True)
+                runner_plan.piEnv["PI_CLIENT_MAAFW_VERSION"] = (
+                    f"v{runner_environment.maafw_version.lstrip('v')}"
+                )
+            payload = service.create_job_payload(
+                runner_plan,
+                device_config,
+                # 失败截图和本次尝试的 .log / .maafw.log 放一起。
+                failure_screenshot_dir=history_dir,
+                failure_screenshot_prefix=history_stamp,
+                task_start_not_before=self._task_start_not_before(),
+                run_deadline_at=run_deadline_at,
+                task_time_limit_seconds=task_time_limit_seconds,
+                task_time_limit_overrides=task_time_limit_overrides,
+            )
+            work_dir = _maafw_runner_jobs_dir()
+            job_path = await asyncio.to_thread(
+                service.write_job_file, payload, work_dir
+            )
+            process = await asyncio.create_subprocess_exec(
+                str(runner_environment.python_executable),
+                "-m",
+                "app.task.MaaFW.tools.core.runner.worker",
+                str(job_path),
+                cwd=str(Path.cwd()),
+                env=runner_environment.env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            worker_id = service.register_worker(process)
+        except BaseException:
+            if job_path is not None:
+                with suppress(Exception):
+                    await asyncio.to_thread(job_path.unlink)
+            with suppress(Exception):
+                await asyncio.to_thread(service.release_environment, runner_environment)
+            service.unregister_worker(worker_id)
+            raise
+        self.runner_process = process
+        result_payload: dict[str, Any] | None = None
+        result_received = asyncio.Event()
+        stderr_lines: list[str] = []
+        # 两份文件：``.worker.log`` 是 MAS 自己这一侧（runner 事件、worker 的
+        # stdout/stderr），``.maafw.log`` 是项目 ``debug/maafw.log`` 本次运行部分的
+        # 原样副本——不加前缀、不改编码，和脚本作者自己用 MFAA 跑出来的一模一样，
+        # 出问题可以直接转交。以前两者混在一个文件里、原生每行还带一个抄写时刻，
+        # 脚本作者拿到手第一反应是"这日志不对"。
+        worker_log_path = history_dir / f"{history_stamp}.worker.log"
+        native_log_path = history_dir / f"{history_stamp}.maafw.log"
+        framework_log_writer: _FrameworkLogWriter | None = None
+
+        try:
+            writer = _FrameworkLogWriter(worker_log_path)
+            await asyncio.to_thread(writer.start)
+            framework_log_writer = writer
+            self._append_log(f"MaaFW worker 日志写入中: {worker_log_path}")
+        except Exception as exc:
+            if framework_log_writer is not None:
+                with suppress(Exception):
+                    await asyncio.to_thread(framework_log_writer.close)
+                framework_log_writer = None
+            self._append_log(f"MaaFW worker 日志创建失败: {exc}")
+
+        def write_framework_log(source: str, message: str) -> None:
+            if framework_log_writer is None:
+                return
+            framework_log_writer.write(source, message)
+
+        # 项目有 password 输入框时第一行写打码说明：问题包导出凭它判断这份日志能不能往外发
+        redaction_notice = self._log_redaction_notice()
+        if redaction_notice:
+            write_framework_log("runner", redaction_notice)
+
+        async def read_stdout() -> None:
+            nonlocal result_payload
+            if process.stdout is None:
+                return
+            processed = 0
+            async for raw_line in process.stdout:
+                # StreamReader 缓冲里有数据时 `async for` 不会挂起，会一路取到
+                # 缓冲耗尽为止。MaaFramework 的原生诊断动辄每秒几十行、单次运行
+                # 几千行，这个循环于是能连续独占事件循环数十秒——真机上表现为
+                # 界面日志停更、API 不响应、点了停止没反应，等这波处理完才一起
+                # 恢复。定期显式让出，代价可以忽略。
+                processed += 1
+                if processed % _RELAY_YIELD_EVERY_LINES == 0:
+                    await asyncio.sleep(0)
+                # Worker protocol events are UTF-8 JSON, while MaaFramework
+                # native diagnostics may be written directly to stdout using
+                # the Windows ACP/GBK code page.  Decode protocol lines
+                # strictly first and use the existing multi-codec fallback
+                # for native text so Chinese diagnostics are not persisted as
+                # replacement characters.
+                try:
+                    line = raw_line.decode("utf-8", errors="strict").strip()
+                except UnicodeDecodeError:
+                    line = _decode_subprocess_output(raw_line).strip()
+                if not line:
+                    continue
+                event = _parse_worker_protocol_line(line, secrets)
+                if event is None:
+                    line = redact_secret_text(line, secrets)
+                    write_framework_log("worker-stdout", line)
+                    if _should_forward_framework_log(line):
+                        self._append_log(_framework_ui_message(line))
+                    continue
+
+                event_type = event.get("type")
+                if event_type == "log":
+                    message = str(event.get("message") or "")
+                    write_framework_log("runner", message)
+                    if _should_forward_framework_log(message):
+                        self._append_log(_framework_ui_message(message))
+                elif event_type == "result" and isinstance(event.get("data"), dict):
+                    result_payload = event["data"]
+                    result_received.set()
+                elif event_type == "error":
+                    message = str(event.get("message") or "")
+                    write_framework_log("runner-error", message)
+                    # Keep the complete error in the per-run framework log,
+                    # but apply the same native-noise filter as ordinary
+                    # framework diagnostics.  Worker error events can contain
+                    # an entire native parser/backtrace blob and must not
+                    # flood the user-facing task log.
+                    if _should_forward_framework_log(message):
+                        self._append_log(_framework_ui_message(message))
+
+        async def read_stderr() -> None:
+            if process.stderr is None:
+                return
+            processed = 0
+            async for raw_line in process.stderr:
+                processed += 1
+                if processed % _RELAY_YIELD_EVERY_LINES == 0:
+                    await asyncio.sleep(0)  # 同 read_stdout：别独占事件循环
+                line = _clean_framework_output(
+                    _decode_subprocess_output(raw_line)
+                ).strip()
+                if not line:
+                    continue
+                line = redact_secret_text(line, secrets)
+                write_framework_log("worker-stderr", line)
+                stderr_lines.append(line)
+                del stderr_lines[:-20]
+
+        stdout_task = asyncio.create_task(read_stdout())
+        stderr_task = asyncio.create_task(read_stderr())
+
+        async def drain_readers(*, propagate_errors: bool) -> None:
+            _, pending_readers = await asyncio.wait(
+                (stdout_task, stderr_task),
+                timeout=5.0,
+            )
+            for task in pending_readers:
+                task.cancel()
+            reader_results = await asyncio.gather(
+                stdout_task,
+                stderr_task,
+                return_exceptions=True,
+            )
+            if propagate_errors:
+                for result in reader_results:
+                    if isinstance(result, Exception):
+                        raise result
+
+        try:
+            returncode = await self._wait_worker_exit(process, result_received)
+            await drain_readers(propagate_errors=True)
+        finally:
+            if process.returncode is None:
+                await self._terminate_runner_process()
+            elif self.runner_process is process:
+                self.runner_process = None
+            await drain_readers(propagate_errors=False)
+            if framework_log_writer is not None:
+                try:
+                    await asyncio.to_thread(framework_log_writer.close)
+                except Exception as exc:
+                    self._append_log(f"MaaFW worker 日志保存不完整: {exc}")
+            try:
+                copied = await asyncio.to_thread(
+                    _copy_native_debug_log_delta,
+                    native_debug_log_path,
+                    native_debug_log_offset,
+                    native_debug_log_rotations,
+                    native_log_path,
+                    secrets,
+                )
+            except Exception as exc:
+                self._append_log(f"MaaFW 原生日志复制失败: {exc}")
+            else:
+                if copied:
+                    self._append_log(f"MaaFW 原生日志已保存: {native_log_path}")
+            # 项目自己写的日志本次新增的部分：与 .maafw.log 同目录同前缀，按脚本全部用户的密码打码。
+            project_log_path = history_dir / f"{history_stamp}.project.log"
+            try:
+                project_logs = await asyncio.to_thread(
+                    copy_project_log_delta,
+                    self.project_path,
+                    project_log_marks,
+                    project_log_path,
+                    secrets=self._project_log_secret_variants(secrets),
+                )
+            except Exception as exc:
+                self._append_log(f"MaaFW 项目日志保存失败: {exc}")
+            else:
+                if project_logs.segments:
+                    self._append_log(
+                        f"MaaFW 项目日志已保存: {project_log_path}"
+                        f"（{len(project_logs.segments)} 个文件，"
+                        f"{project_logs.written_bytes} 字节）"
+                    )
+            with suppress(Exception):
+                await asyncio.to_thread(job_path.unlink)
+            with suppress(Exception):
+                await asyncio.to_thread(service.release_environment, runner_environment)
+            service.unregister_worker(worker_id)
+
+        if result_payload is not None:
+            return MaaFWRunResult.model_validate(result_payload)
+        message = f"MaaFW runner worker exited without result: {returncode}"
+        detail = "\n".join(stderr_lines[-5:]).strip()
+        if detail and _should_forward_framework_log(detail):
+            message += f": {_framework_ui_message(detail)}"
+        elif detail:
+            # Native stderr is already preserved in the per-run framework log.
+            # Do not copy parser/backtrace blobs into the normal task log when
+            # the worker exits without a protocol result.
+            message += ": MaaFW worker 未返回任务结果，完整原生日志已保存到本次运行的 .maafw.log"
+        raise RuntimeError(message)
+
+    def _secret_log_variants(self) -> list[str]:
+        """本次运行计划里 password 字段的值在日志里可能出现的写法（见 option_secrets）。"""
+
+        if self.run_plan is None or self.interface_model is None:
+            return []
+        return secret_log_variants(
+            collect_plan_password_values(self.run_plan, self.interface_model)
+        )
+
+    def _project_log_secret_variants(self, plan_variants: list[str]) -> list[str]:
+        """项目日志不一定是本次运行的用户写的（上一个用户留下的片段也可能落在本次新增里），
+        所以按脚本全部用户的密码打码，再并上本次运行计划里的。"""
+
+        try:
+            values = collect_script_password_values(
+                self.script_config, self.interface_model
+            )
+        except Exception as exc:  # noqa: BLE001 - 取不到时退回本次运行计划里的
+            logger.debug(f"收集脚本全部用户的密码失败，只按本次运行的打码: {exc}")
+            return plan_variants
+        return sorted(
+            set(plan_variants) | set(secret_log_variants(values)),
+            key=len,
+            reverse=True,
+        )
+
+    def _log_redaction_notice(self) -> str | None:
+        """项目有 password 输入框时写进 ``.worker.log`` 开头的打码说明（见 option_secrets）。"""
+
+        if self.run_plan is None or self.interface_model is None:
+            return None
+        return log_redaction_notice(
+            self.interface_model,
+            collect_plan_password_values(self.run_plan, self.interface_model),
+        )
+
+    async def _wait_worker_exit(
+        self,
+        process: asyncio.subprocess.Process,
+        result_received: asyncio.Event,
+    ) -> int | None:
+        """等 worker 退出；结果已经回传的话只再等有限时间。"""
+
+        exit_task = asyncio.ensure_future(process.wait())
+        result_task = asyncio.ensure_future(result_received.wait())
+        try:
+            await asyncio.wait(
+                {exit_task, result_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if exit_task.done():
+                return exit_task.result()
+            try:
+                return await asyncio.wait_for(
+                    asyncio.shield(exit_task),
+                    timeout=_WORKER_EXIT_AFTER_RESULT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                self._append_log(
+                    "MaaFW worker 已回传结果但迟迟不退出，强制结束以免拖过时限"
+                )
+                await self._terminate_runner_process()
+                return process.returncode
+        finally:
+            for task in (exit_task, result_task):
+                if not task.done():
+                    task.cancel()
+
+    async def _shutdown_runner(self) -> None:
+        await self._terminate_pretask_process()
+        await self._terminate_runner_process()
+
+    async def _run_pretasks(self) -> None:
+        if self.run_plan is None:
+            raise RuntimeError("MaaFW 运行计划尚未初始化")
+
+        env = os.environ.copy()
+        # 与 agent 同口径（runner._build_agent_env）：pretask 多是项目自带 Python 跑的
+        # 脚本，输出与读文件都按 UTF-8；对非 Python 程序这两个变量无害。
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+        env.update(self.run_plan.piEnv)
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        for pretask in self.run_plan.pretasks:
+            display_name = _task_display_name(pretask)
+            self._append_log(f"开始应用运行前设置: {display_name}")
+            process = await asyncio.create_subprocess_exec(
+                pretask.executable,
+                *pretask.args,
+                cwd=self.run_plan.path,
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                creationflags=creationflags,
+            )
+            self.pretask_process = process
+            try:
+                output, _ = await process.communicate()
+            finally:
+                if process.returncode is not None and self.pretask_process is process:
+                    self.pretask_process = None
+
+            detail = redact_secret_text(
+                _decode_subprocess_output(output).strip(), self._secret_log_variants()
+            )
+            if detail:
+                for line in detail.splitlines():
+                    self._append_log(f"[运行前设置] {line}")
+            if process.returncode != 0:
+                error_detail = detail.splitlines()[-1] if detail else "没有输出错误详情"
+                raise RuntimeError(
+                    f"运行前设置 {display_name} 执行失败（退出码 {process.returncode}）: "
+                    f"{error_detail}"
+                )
+            self._append_log(f"运行前设置完成: {display_name}")
+
+    async def _terminate_pretask_process(self) -> None:
+        process = self.pretask_process
+        self.pretask_process = None
+        if process is None or process.returncode is not None:
+            return
+
+        try:
+            process.terminate()
+            await asyncio.wait_for(process.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+        except ProcessLookupError:
+            return
+        except Exception as exc:
+            logger.warning(f"MaaFW 运行前设置进程清理失败: {exc}")
+
+    async def _terminate_runner_process(self) -> None:
+        process = self.runner_process
+        self.runner_process = None
+        if process is None or process.returncode is not None:
+            return
+
+        # 必须在 terminate 之前把后代记下来：Windows 的 TerminateProcess 是立即
+        # 且不可捕获的，worker 的 shutdown() 没机会跑；而父进程一死，子进程就
+        # 被重新挂到别处，事后再按父子关系已经查不到它们。
+        descendants = await asyncio.to_thread(_snapshot_descendants, process.pid)
+
+        try:
+            process.terminate()
+            await asyncio.wait_for(process.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+        except ProcessLookupError:
+            pass
+        except Exception as exc:
+            logger.warning(f"MaaFW runner worker 清理失败: {exc}")
+
+        if descendants:
+            await asyncio.to_thread(_terminate_snapshot, descendants)
+
+    def _filter_period_once_tasks(self, plan: MaaFWRunPlan) -> MaaFWRunPlan:
+        daily_tasks = set(
+            _load_json_list(self.script_config.get("Run", "DailyOnceTasks"))
+        )
+        weekly_tasks = set(
+            _load_json_list(self.script_config.get("Run", "WeeklyOnceTasks"))
+        )
+        monthly_tasks = set(
+            _load_json_list(self.script_config.get("Run", "MonthlyOnceTasks"))
+        )
+        if not daily_tasks and not weekly_tasks and not monthly_tasks:
+            return plan
+
+        daily_key, weekly_key, monthly_key = _current_period_keys()
+        records = self._load_period_task_records()
+        runnable_tasks = []
+        skipped_tasks = []
+        # 周期限制按任务算，不按队列里的份数算：同一个任务被重复加入队列时，
+        # 本轮也只安排一次。否则「仅一次」在一轮内形同虚设，而且先跑的那份一
+        # 成功就会把整个任务名记成已完成，还没跑的副本会被当作已完成跳过。
+        period_limited_seen: set[str] = set()
+        for task in plan.tasks:
+            daily_done = (
+                task.name in daily_tasks
+                and records["daily"].get(task.name) == daily_key
+            )
+            weekly_done = (
+                task.name in weekly_tasks
+                and records["weekly"].get(task.name) == weekly_key
+            )
+            monthly_done = (
+                task.name in monthly_tasks
+                and records["monthly"].get(task.name) == monthly_key
+            )
+            if daily_done or weekly_done or monthly_done:
+                if daily_done:
+                    reason = "今日已正常完成"
+                elif monthly_done:
+                    reason = "本月已正常完成"
+                else:
+                    reason = "本周已正常完成"
+                skipped_tasks.append(
+                    MaaFWSkippedTaskPlan(
+                        name=task.name,
+                        label=task.label,
+                        entry=task.entry,
+                        reason=reason,
+                    )
+                )
+                continue
+            if (
+                task.name in daily_tasks
+                or task.name in weekly_tasks
+                or task.name in monthly_tasks
+            ):
+                if task.name in period_limited_seen:
+                    skipped_tasks.append(
+                        MaaFWSkippedTaskPlan(
+                            name=task.name,
+                            label=task.label,
+                            entry=task.entry,
+                            reason="本轮已安排一次",
+                        )
+                    )
+                    continue
+                period_limited_seen.add(task.name)
+            runnable_tasks.append(task)
+        return plan.model_copy(
+            update={
+                "tasks": runnable_tasks,
+                "skippedTasks": [*plan.skippedTasks, *skipped_tasks],
+            },
+        )
+
+    async def _refresh_run_plan_after_period_update(self) -> None:
+        if self.base_run_plan is not None:
+            self.run_plan = await asyncio.to_thread(
+                self._filter_period_once_tasks,
+                self.base_run_plan,
+            )
+
+    def _load_period_task_records(self) -> dict[str, dict[str, str]]:
+        raw_records = _load_json_dict(
+            self.cur_user_config.get("Data", "PeriodTaskRecords")
+        )
+        records: dict[str, dict[str, str]] = {"daily": {}, "weekly": {}, "monthly": {}}
+        for period in records:
+            raw_period_records = raw_records.get(period, {})
+            if isinstance(raw_period_records, dict):
+                records[period] = {
+                    str(task_name): str(period_key)
+                    for task_name, period_key in raw_period_records.items()
+                }
+        return records
+
+    async def _mark_period_tasks_completed(self, completed_tasks: list[str]) -> None:
+        if not completed_tasks:
+            return
+        daily_tasks = set(
+            _load_json_list(self.script_config.get("Run", "DailyOnceTasks"))
+        )
+        weekly_tasks = set(
+            _load_json_list(self.script_config.get("Run", "WeeklyOnceTasks"))
+        )
+        monthly_tasks = set(
+            _load_json_list(self.script_config.get("Run", "MonthlyOnceTasks"))
+        )
+        if not daily_tasks and not weekly_tasks and not monthly_tasks:
+            return
+
+        daily_key, weekly_key, monthly_key = _current_period_keys()
+        records = self._load_period_task_records()
+        changed = False
+        for task_name in set(completed_tasks).intersection(daily_tasks):
+            if records["daily"].get(task_name) != daily_key:
+                records["daily"][task_name] = daily_key
+                changed = True
+        for task_name in set(completed_tasks).intersection(weekly_tasks):
+            if records["weekly"].get(task_name) != weekly_key:
+                records["weekly"][task_name] = weekly_key
+                changed = True
+        for task_name in set(completed_tasks).intersection(monthly_tasks):
+            if records["monthly"].get(task_name) != monthly_key:
+                records["monthly"][task_name] = monthly_key
+                changed = True
+        if changed:
+            await self.cur_user_config.set(
+                "Data",
+                "PeriodTaskRecords",
+                json.dumps(records, ensure_ascii=False),
+            )
+
+    async def _mark_run_started(self) -> None:
+        if self.cur_user_config.get("Data", "LastProxyDate") != self.curdate:
+            await self.cur_user_config.set("Data", "LastProxyDate", self.curdate)
+            await self.cur_user_config.set("Data", "ProxyTimes", 0)
+        await self.cur_user_config.set("Data", "LastProxyStatus", "运行中")
+
+    async def _close_emulator(self) -> None:
+        if not self.opened_emulator:
+            return
+        try:
+            await close_emulator(self, log_failure=False)
+        finally:
+            self.opened_emulator = False
+            # 地址是随这次启动缓存的，关掉后下一轮要重新开、重新拿。
+            self._cached_adb_address = None
+            self._cached_device_info = None
+            # 雷电截图增强的 extras 里带着这次启动的 dnplayer pid；重开后还用旧 pid，
+            # MaaFW 建不出截图实例（Failed to create ld inst），这一轮当场 connect 失败。
+            self._cached_adb_profile = None
+
+    async def _ensure_desktop_game_started(self) -> None:
+        """Win32 场景下由 MAS 负责启动/激活桌面游戏客户端，供后续窗口解析使用。"""
+        if self.run_plan is None or self.run_plan.controllerType != "Win32":
+            return
+        if self.opened_game:
+            return
+        if not self._mas_manages_game_launch():
+            # AttachOnly：游戏由脚本或用户自己起，MAS 只负责找窗口。窗口找不到时
+            # _resolve_window_handle 会给出「未找到匹配 MaaFW Win32 controller
+            # 的窗口」，比在这里索要一个本模式用不上的 exe 更贴题。
+            return
+
+        game_path = self._resolve_game_launch_path()
+        if game_path is None or not await asyncio.to_thread(game_path.is_file):
+            raise RuntimeError(
+                "当前 MaaFW controller 需要由 MAS 启动游戏，请在脚本管理页选择实际游戏 exe"
+            )
+
+        if self.interface_model is not None and self.run_plan is not None:
+            controller = _find_controller(
+                self.interface_model,
+                self.run_plan.controllerName,
+            )
+            matches = await asyncio.to_thread(_match_controller_windows, controller)
+            if matches:
+                selected = matches[0]
+                self._append_log(
+                    "检测到游戏客户端窗口: "
+                    f"hWnd={selected.hWnd}, class={selected.className}, "
+                    f"title={selected.windowName}"
+                )
+                self._note_resolution_override_skipped()
+                self._note_launch_arguments_skipped()
+                await self._activate_desktop_game_window(game_path)
+                return
+
+        if await asyncio.to_thread(_is_process_path_running, game_path):
+            message = (
+                f"检测到游戏进程已在运行，跳过由 MAS 重复启动游戏: {game_path.name}"
+            )
+            logger.info(message)
+            self.script_info.log = message
+            self._note_resolution_override_skipped()
+            self._note_launch_arguments_skipped()
+            if await self._wait_for_desktop_game_ready(game_path):
+                # 进程在、窗口是等出来的：游戏正在启动，和 MAS 自己拉起的一样要等画面
+                self.game_window_ready_at = time.monotonic()
+            await self._activate_desktop_game_window(game_path)
+            return
+
+        game_arguments = shlex.split(
+            str(self.script_config.get("Game", "Arguments") or "").strip()
+        )
+        logger.info(
+            f"启动游戏: {game_path} - {self.script_config.get('Game', 'Arguments')}"
+        )
+        # 注册表必须在进程起来之前改好：Unity 播放器只在启动时读一次这些值
+        await self._apply_game_resolution_override(game_path)
+        try:
+            await self.game_process_manager.open_process(
+                game_path,
+                *game_arguments,
+                cwd=game_path.parent,
+                breakaway=True,
+            )
+            await self._wait_for_desktop_game_ready(game_path)
+            self.game_window_ready_at = time.monotonic()
+        except Exception:
+            with suppress(Exception):
+                await self.game_process_manager.kill()
+            await self._restore_game_resolution_override()
+            raise
+
+        self.opened_game = True
+        await self._activate_desktop_game_window(game_path)
+
+    def _unity_resolution_target(self) -> tuple[int, int] | None:
+        """``Game.UnityResolution`` 选了尺寸就返回 (宽, 高)，Off 返回 None。"""
+
+        return parse_resolution_option(
+            self.script_config.get("Game", "UnityResolution")
+        )
+
+    def _note_resolution_override_skipped(self) -> None:
+        """游戏已在运行时不能中途改分辨率，选了尺寸的用户要知道这轮没改。"""
+
+        if self._unity_resolution_target() is not None:
+            self._append_log("检测到游戏已在运行，本轮不会中途修改分辨率")
+
+    def _note_launch_arguments_skipped(self) -> None:
+        """游戏已在运行时不会重复启动，配了启动参数的用户要知道这轮没生效。"""
+
+        arguments = str(self.script_config.get("Game", "Arguments") or "").strip()
+        if arguments:
+            self._append_log(f"检测到游戏已在运行，本轮不会应用启动参数（{arguments}）")
+
+    async def _apply_game_resolution_override(self, game_path: Path) -> None:
+        """按 exe 反查 Unity 注册表并临时写入所选尺寸的窗口模式。
+
+        失败不阻断启动：这只是帮用户过脚本侧的分辨率闸门，改不成就按当前分辨率
+        启动，闸门该报什么由脚本自己报，比在这里把整轮打掉更贴题。
+        """
+
+        target = self._unity_resolution_target()
+        if target is None:
+            return
+        override = UnityGameResolutionOverride.for_executable(game_path, *target)
+        if override is None:
+            self._append_log(
+                f"未找到 {game_path.name} 的 Unity app.info，无法反查注册表，"
+                "跳过临时固定分辨率（只有 Unity 引擎的游戏支持）"
+            )
+            return
+        try:
+            await asyncio.to_thread(override.apply)
+        except Exception as exc:
+            logger.warning(f"MaaFW 临时固定游戏分辨率失败: {exc}")
+            self._append_log(f"临时固定游戏分辨率失败，按当前分辨率启动: {exc}")
+            return
+        self.game_resolution_override = override
+        self._append_log(
+            f"已尝试把 HKCU\\{override.registry_path} 的分辨率临时设为 "
+            f"{override.label} 窗口模式，游戏关闭后恢复原值"
+        )
+
+    async def _restore_game_resolution_override(self) -> None:
+        override = self.game_resolution_override
+        if override is None:
+            return
+        self.game_resolution_override = None
+        try:
+            restored = await asyncio.to_thread(override.restore)
+        except Exception as exc:
+            logger.warning(f"MaaFW 恢复游戏分辨率注册表失败: {exc}")
+            self._append_log(f"恢复游戏分辨率注册表失败: {exc}")
+            return
+        if restored:
+            self._append_log("已恢复启动前的游戏分辨率注册表")
+
+    async def _wait_for_desktop_game_ready(
+        self,
+        game_path: Path,
+        poll_interval: float = 1.0,
+    ) -> bool:
+        """等到游戏窗口（或配置了句柄时等到进程）就绪。
+
+        返回窗口是不是**等出来的**：第一轮就在的算 False（游戏早就在跑），至少睡过
+        一轮才出现的算 True（游戏正在启动）。调用方据此决定要不要再等画面稳定。
+        """
+
+        wait_time = max(0, int(self.script_config.get("Game", "WaitTime") or 0))
+        if self.run_plan is None or self.interface_model is None:
+            raise RuntimeError("MaaFW 运行计划未完成初始化")
+
+        configured_hwnd = self.script_config.get("Device", "HWnd")
+        explicit_hwnd = _optional_int(configured_hwnd)
+        controller = _find_controller(
+            self.interface_model, self.run_plan.controllerName
+        )
+
+        self._append_log(
+            f"正在等待游戏客户端窗口就绪，最大等待时间 {wait_time}s: {game_path.name}"
+        )
+        if wait_time <= 0:
+            if not await asyncio.to_thread(_is_process_path_running, game_path):
+                raise RuntimeError(f"游戏进程未启动: {game_path.name}")
+            if explicit_hwnd:
+                self._append_log(f"已配置窗口句柄，跳过窗口正则等待: {explicit_hwnd}")
+                return False
+            if not await asyncio.to_thread(_match_controller_windows, controller):
+                raise RuntimeError(f"游戏窗口未就绪: {game_path.name}")
+            return False
+
+        waited = 0.0
+        process_detected = False
+        while waited < wait_time:
+            if not explicit_hwnd:
+                matches = await asyncio.to_thread(_match_controller_windows, controller)
+                if matches:
+                    selected = matches[0]
+                    self._append_log(
+                        "检测到游戏客户端窗口: "
+                        f"hWnd={selected.hWnd}, class={selected.className}, "
+                        f"title={selected.windowName}"
+                    )
+                    return waited > 0
+
+            if await asyncio.to_thread(_is_process_path_running, game_path):
+                if not process_detected:
+                    self._append_log(f"检测到游戏进程已启动: {game_path.name}")
+                    process_detected = True
+
+                if explicit_hwnd:
+                    self._append_log(
+                        f"已配置窗口句柄，跳过窗口正则等待: {explicit_hwnd}"
+                    )
+                    return waited > 0
+
+                matches = await asyncio.to_thread(_match_controller_windows, controller)
+                if matches:
+                    selected = matches[0]
+                    self._append_log(
+                        "检测到游戏客户端窗口: "
+                        f"hWnd={selected.hWnd}, class={selected.className}, "
+                        f"title={selected.windowName}"
+                    )
+                    return waited > 0
+
+            sleep_seconds = min(poll_interval, wait_time - waited)
+            await asyncio.sleep(sleep_seconds)
+            waited += sleep_seconds
+
+        if not explicit_hwnd:
+            matches = await asyncio.to_thread(_match_controller_windows, controller)
+            if matches:
+                selected = matches[0]
+                self._append_log(
+                    "检测到游戏客户端窗口: "
+                    f"hWnd={selected.hWnd}, class={selected.className}, "
+                    f"title={selected.windowName}"
+                )
+                return True
+
+        if await asyncio.to_thread(_is_process_path_running, game_path):
+            if explicit_hwnd:
+                self._append_log(f"已配置窗口句柄，跳过窗口正则等待: {explicit_hwnd}")
+                return True
+
+            matches = await asyncio.to_thread(_match_controller_windows, controller)
+            if matches:
+                selected = matches[0]
+                self._append_log(
+                    "检测到游戏客户端窗口: "
+                    f"hWnd={selected.hWnd}, class={selected.className}, "
+                    f"title={selected.windowName}"
+                )
+                return True
+
+            raise RuntimeError(f"游戏窗口在 {wait_time}s 内未就绪: {game_path.name}")
+
+        raise RuntimeError(f"游戏进程在 {wait_time}s 内未启动: {game_path.name}")
+
+    def _task_start_not_before(self) -> float | None:
+        """刚启动的桌面游戏，第一个任务最晚可下发的墙钟时刻；不用等时返回 None。
+
+        沿用 ``Game.WaitTime``——等窗口出现用的就是它，等画面稳定再用一次同样的上限，
+        用户只需要理解一个「启动等待时间」。从窗口出现起算，扣掉已经过去的部分
+        （窗口前置、运行池租约、job 落盘）；剩下的交给 worker 在初始化完成后补足，
+        这样 MaaFW 加载资源、连 controller、起 agent 的几秒到十几秒也算在等待里。
+        worker 看到画面稳定会提前放行，这个时刻只是上限。重试轮次时游戏已经跑了
+        很久，剩余为负，直接不等。
+        """
+
+        ready_at = self.game_window_ready_at
+        if ready_at is None:
+            return None
+        settle = max(0, int(self.script_config.get("Game", "WaitTime") or 0))
+        if settle <= 0:
+            return None
+        remaining = settle - (time.monotonic() - ready_at)
+        if remaining <= 0:
+            return None
+        self._append_log(
+            f"游戏窗口出现后最多等 {settle}s 再下发任务，画面稳定即提前；"
+            f"剩余约 {remaining:.0f}s（与 MaaFW 初始化并行）"
+        )
+        return time.time() + remaining
+
+    async def _activate_desktop_game_window(self, game_path: Path) -> None:
+        try:
+            # 第二个参数是**秒数**，不是截止时刻。dev 的 #473 把计时改成单调时钟后
+            # 内部是 `time.monotonic() + timeout_seconds`，传 datetime 会直接
+            # TypeError（真机上表现为「游戏进程已启动，但定位窗口失败」，窗口没被
+            # 前置，随后第一个任务识别不到而失败）。
+            await self.game_process_manager.search_process(
+                ProcessInfo(exe=str(game_path.resolve())),
+                WINDOW_SEARCH_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            logger.warning(f"MaaFW 定位游戏进程窗口失败: {exc}")
+            self._append_log(f"游戏进程已启动，但定位窗口失败: {exc}")
+            return
+
+        activate_end_time = datetime.now() + timedelta(seconds=5)
+        while datetime.now() < activate_end_time:
+            if await self.game_process_manager.activate_window():
+                self._append_log("游戏窗口已置于前台")
+                return
+            await asyncio.sleep(0.5)
+
+        self._append_log("游戏窗口前置失败，将继续启动 MaaFW 任务")
+
+    async def _restart_client_before_retry(self, attempt: int) -> None:
+        """一轮失败后把 MAS 自己拉起的游戏/模拟器关掉，让下一轮从启动重新来。
+
+        和 MAA 专项的重试一个口径：出了问题就整个重来。以前重试只是重启 MaaFW 框架
+        再接回同一个窗口——超时那种卡在某一屏的情况（弹窗关不掉、按钮点不动），
+        第二、三轮 3 秒内就撞回同一屏，白等两倍时限。
+        游戏/模拟器不是 MAS 起的（AttachOnly、发现已在运行）时照旧不碰；
+        这是最后一轮时也不在这里关，收尾统一关。
+        """
+
+        if attempt >= self.script_config.get("Run", "RunTimesLimit"):
+            return
+        if not self.opened_game and not self.opened_emulator:
+            return
+        self._append_log("本轮失败，关闭由 MAS 启动的游戏/模拟器，下一轮重新启动")
+        await self._close_emulator()
+        await self._close_game()
+
+    def _start_attempt_log(self) -> None:
+        """重试前另起一份日志记录，与 MAA 等专项一样每次尝试单独成段。
+
+        界面日志从这一次重新显示；history 里的 ``.log`` / ``.json``、``.worker.log``、
+        ``.maafw.log`` 与失败截图都按本次开始时刻另起文件名。文件名只精确到秒，
+        上一次在同一秒内就失败时顺延一秒，免得两次尝试写进同一个文件。
+        """
+
+        start_time = datetime.now()
+        previous = self.cur_user_log_started_at
+        if previous is not None and start_time.replace(
+            microsecond=0
+        ) <= previous.replace(microsecond=0):
+            start_time = previous.replace(microsecond=0) + timedelta(seconds=1)
+        self.cur_user_log_started_at = start_time
+        self.cur_user_item.log_record[start_time] = self.cur_user_log = LogRecord()
+        # 这份日志从零开始，行号也要回到 1，否则会接着上一个用户的行号往下数
+        self.script_info.log_first_line = 1
+
+    async def _finish_on_signal(self, attempt: int, result: MaaFWRunResult) -> None:
+        """worker 回报了信号节点命中：记账、写日志状态。
+
+        不发任务页提示（TASK_NOTICE 会在前端弹通知框并响提示音）：界面上只有 runner
+        那行日志，正式通知由管理器收尾时按「信号 + 资源」各发一条（同一资源可能有
+        多位用户）。证据图只进那条通知，不当失败截图进统计信息与汇总。
+        """
+
+        signal = str(result.signal)
+        self.run_signal = signal
+        message = SIGNAL_USER_MESSAGES.get(signal, str(result.errorMessage or signal))
+        # runner 那行「游戏停服维护中，本轮剩余任务已跳过: <任务>」已进任务日志，
+        # 这里只记后端日志，不在界面上再复述一遍。
+        logger.warning(
+            f"MaaFW 用户 {self.cur_user_item.name} 命中项目信号 {signal}"
+            f"（节点 {result.signalNode}）：{message}"
+        )
+        # 证据图只认命中那个任务、kind 是信号那种的：前面任务普通失败的 failed 图不算。
+        evidence = _signal_evidence_shot(result)
+        labels = (
+            _format_completed_task_labels(self.run_plan, result.completedTasks)
+            if self.run_plan is not None
+            else list(result.completedTasks)
+        )
+        # 证据图只随信号通知发一次，不再进统计信息与代理结果汇总；前面任务的普通
+        # 失败截图照常进。
+        report_shots = [
+            (
+                _format_completed_task_labels(self.run_plan, [shot.task])[0]
+                if self.run_plan is not None
+                else shot.task,
+                Path(shot.path),
+            )
+            for shot in result.failureScreenshots
+            if shot is not evidence
+        ]
+        self._record_attempt(attempt, labels, message, screenshots=report_shots)
+        if self.cur_user_log is not None:
+            self.cur_user_log.status = message
+
+        project_name = ""
+        if self.interface_model is not None:
+            with suppress(Exception):
+                project_name = await asyncio.to_thread(
+                    interface_display_name, self.project_path, self.interface_model
+                )
+        plan = self.run_plan
+        if not project_name and plan is not None:
+            project_name = str(plan.projectLabel or plan.projectName or "")
+        resource_label = ""
+        if plan is not None:
+            label = str(plan.resource.label or "").strip()
+            resource_label = (
+                label if label and not label.startswith("$") else plan.resourceName
+            )
+        self.signal_tracker.record(
+            signal,
+            resource_name=plan.resourceName
+            if plan is not None
+            else result.resourceName,
+            resource_label=resource_label,
+            project_name=project_name,
+            node=result.signalNode,
+            user_id=str(self.cur_user_uid),
+            user_name=self.cur_user_item.name,
+            screenshot=Path(evidence.path) if evidence is not None else None,
+        )
+
+    def _is_maintenance_skip(self) -> bool:
+        return self.maintenance_skipped or self.run_signal == SERVER_MAINTENANCE
+
+    def _signal_user_message(self) -> str | None:
+        """本用户因信号没跑成时给人看的原因；没有信号返回 None。"""
+
+        if self.maintenance_skipped:
+            return MAINTENANCE_SKIP_MESSAGE
+        if self.run_signal is not None:
+            return SIGNAL_USER_MESSAGES.get(self.run_signal, self.run_signal)
+        return None
+
+    def _timed_out_user_summary(self, result: MaaFWRunResult) -> str:
+        limit = self.script_config.get("Run", "RunTimeLimit")
+        total = len(self.run_plan.tasks) if self.run_plan is not None else 0
+        stopped_at = ""
+        if result.failedTask and self.run_plan is not None:
+            labels = _format_completed_task_labels(self.run_plan, [result.failedTask])
+            stopped_at = f"，最后停在 {labels[0]}"
+        return (
+            f"MaaFW 任务运行超时（限制 {limit} 分钟，已完成 "
+            f"{len(result.completedTasks)}/{total}{stopped_at}）"
+        )
+
+    async def _close_game(self) -> None:
+        """关闭由 MAS 启动的游戏。
+
+        只看 opened_game：由 MAS 启动的一律关，其他方式启动（AttachOnly、或
+        DirectExe 下发现游戏已在运行而没重复启动）的一律不碰，没有开关。
+        """
+
+        if not self.opened_game:
+            await self._restore_game_resolution_override()
+            return
+
+        try:
+            await self.game_process_manager.kill()
+        except Exception as exc:
+            logger.warning(f"MaaFW 清理时关闭游戏失败: {exc}")
+        finally:
+            self.opened_game = False
+            self.game_window_ready_at = None
+            await self._restore_game_resolution_override()
+
+    async def _try_enter_project_path(self) -> bool:
+        project_lock_key = await try_reserve_project_path(self.project_path)
+        if project_lock_key is None:
+            return False
+        self.project_lock_key = project_lock_key
+        return True
+
+    async def _release_project_path(self) -> None:
+        if self.project_lock_key is None:
+            return
+        await release_project_path(self.project_lock_key)
+        self.project_lock_key = None
+
+    async def _save_user_logs(self) -> list[Path]:
+        """保存本轮各次尝试的日志，返回对应的统计文件路径。
+
+        路径给用户级统计推送用——``save_general_log`` 会在 ``.log`` 旁边
+        同名写一份 ``.json``，``merge_statistic_info`` 读的就是它。
+        """
+
+        statistic_paths: list[Path] = []
+        for timestamp, log_item in self.cur_user_item.log_record.items():
+            dt = timestamp.astimezone(UTC4)
+            log_path = (
+                Path.cwd()
+                / f"history/{dt.strftime('%Y-%m-%d')}/{self.cur_user_item.name}/{dt.strftime('%H-%M-%S')}.log"
+            )
+            if not log_item.content:
+                log_item.content = ["未捕获到任何运行日志"]
+            if log_item.status == "未开始监看日志":
+                log_item.status = "任务被中止"
+            await Config.save_general_log(log_path, log_item.content, log_item.status)
+            statistic_paths.append(log_path.with_suffix(".json"))
+        return statistic_paths
+
+    def _record_attempt(
+        self,
+        attempt: int,
+        completed_labels: list[str],
+        failure: str | None,
+        *,
+        screenshots: list[tuple[str, Path]] | None = None,
+    ) -> None:
+        """记下本次尝试的结果，供统计通知的「任务详情」与失败截图用。"""
+
+        self._attempt_reports.append(
+            {
+                "attempt": attempt,
+                "time": datetime.now().strftime("%H:%M:%S"),
+                "completed": list(completed_labels),
+                "failure": failure,
+                "screenshots": list(screenshots or []),
+            }
+        )
+
+    def _collect_failure_screenshots(self) -> list[tuple[str, Path]]:
+        """本用户要随通知发出去的失败截图（标签, 路径），按时间顺序。
+
+        最终成功的运行不带图：任务详情那边成功时也只留合并后的完成清单，
+        早先尝试的失败画面对已经跑通的一轮没有意义。张数上限由消费方裁。
+        """
+
+        if self.run_complete:
+            return []
+        shots: list[tuple[str, Path]] = []
+        for report in self._attempt_reports:
+            for label, path in report.get("screenshots", ()):
+                shots.append((f"第 {report['attempt']} 次尝试 · {label}", path))
+        return shots
+
+    def report_screenshots(self) -> list[tuple[str, Path]]:
+        """给脚本级「代理结果」报告用的失败截图，标签带上用户名以区分多用户。"""
+
+        return [
+            (f"{self.cur_user_item.name} · {label}", path)
+            for label, path in self._collect_failure_screenshots()
+        ]
+
+    def _build_task_details(self) -> str:
+        """汇总各次尝试的任务详情。
+
+        与 M9A 专项同形（多次尝试分块列出、最终成功时并集去重），但数据来源
+        不同：M9A 只能用 ``M9ALogAnalyzer`` 正则解析日志文本，MaaFW 手里本来
+        就有 ``completedTasks`` 与失败摘要，直接用结构化结果，不必反解日志。
+        队列里有失效任务时末尾再附一行。
+        """
+
+        details = self._build_attempt_details()
+        missing = self.missing_task_notice()
+        return "\n\n".join(part for part in (details, missing) if part)
+
+    def missing_task_notice(self) -> str:
+        """队列里 interface 已没有的任务（多半是项目更新改了 name）：进用户与脚本两份报告。"""
+
+        if not self.missing_task_names:
+            return ""
+        return f"{MISSING_TASK_NOTICE_PREFIX}: " + "、".join(self.missing_task_names)
+
+    def _build_attempt_details(self) -> str:
+        if not self._attempt_reports:
+            return ""
+
+        def block(report: dict[str, Any]) -> str:
+            lines = []
+            if report["completed"]:
+                lines.append("已完成: " + "、".join(report["completed"]))
+            else:
+                lines.append("已完成: 无")
+            if report["failure"]:
+                lines.append("未完成: " + report["failure"])
+            return "\n".join(lines)
+
+        if len(self._attempt_reports) == 1:
+            return block(self._attempt_reports[0])
+
+        if self.run_complete:
+            # 多次尝试最终成功时，逐次罗列意义不大，合并成一份去重清单。
+            merged: list[str] = []
+            for report in self._attempt_reports:
+                for label in report["completed"]:
+                    if label not in merged:
+                        merged.append(label)
+            return "已完成: " + ("、".join(merged) if merged else "无")
+
+        blocks = []
+        for report in self._attempt_reports:
+            blocks.append(
+                f"第 {report['attempt']} 次尝试（{report['time']}）"
+                + "\n"
+                + block(report)
+            )
+        return ("\n\n").join(blocks)
+
+    async def _push_user_statistics(self, statistic_paths: list[Path]) -> None:
+        """按通知设置推送用户级统计信息。
+
+        与 M9A 专项同形（``M9A/AutoProxy.py`` 的「统计信息」分支）：合并本轮各次
+        尝试的统计文件，补上用户名 / 起止时间 / 结果，再发往全局与该用户自己的
+        渠道。``MaaFWUserConfig`` 的 Notify 组一直都在、编辑页也能配，但在此之前
+        没有任何代码往它发——脚本级「代理结果」是唯一会发出去的报告。
+
+        放在状态落定之后：``user_result`` 要读最终的 ``run_complete``。
+        """
+
+        try:
+            statistics = await Config.merge_statistic_info(statistic_paths)
+            statistics["user_info"] = self.cur_user_item.name
+            statistics["start_time"] = (
+                self.user_start_time.strftime("%Y-%m-%d %H:%M:%S")
+                if self.user_start_time is not None
+                else ""
+            )
+            statistics["end_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            statistics["task_details"] = self._build_task_details()
+            images = await asyncio.to_thread(
+                load_screenshot_images,
+                self._collect_failure_screenshots()[-NOTIFY_SCREENSHOT_LIMIT:],
+                image_id_prefix="maafw",
+            )
+            statistics["screenshots"] = screenshot_entries(images)
+            signal_message = self._signal_user_message()
+            # 有失效任务时照常算完成（次数、状态不动），但不能说成「全部完成」
+            if self.run_complete and self.missing_task_names:
+                statistics["user_result"] = MISSING_TASK_USER_RESULT
+            elif self.run_complete:
+                statistics["user_result"] = "代理任务全部完成"
+            elif signal_message is not None:
+                statistics["user_result"] = signal_message
+            else:
+                statistics["user_result"] = (
+                    self.cur_user_log.status
+                    if self.cur_user_log is not None
+                    else "代理任务未完成"
+                )
+            if self.run_complete and self.missing_task_names:
+                mark = "!"
+            elif self.run_complete:
+                mark = "√"
+            elif self._is_maintenance_skip():
+                mark = MAINTENANCE_LAST_STATUS
+            else:
+                mark = "X"
+            await push_notification(
+                mode="统计信息",
+                title=(
+                    f"{datetime.now().strftime('%m-%d')} |{mark}|  "
+                    f"{self.cur_user_item.name} 的自动代理统计报告"
+                ),
+                message=statistics,
+                user_config=self.cur_user_config,
+                images=[image for _, image in images],
+            )
+        except Exception as exc:
+            logger.opt(exception=True).warning(f"推送 MaaFW 统计信息时出现异常: {exc}")
+            with suppress(Exception):
+                await Publisher.send(
+                    id=self.task_info.task_id,
+                    type=protocol.TASK_NOTICE,
+                    data=WSTaskNoticeData(
+                        level="error",
+                        message=f"推送 MaaFW 统计信息时出现异常: {exc}",
+                    ),
+                )
+
+    async def _send_success_notify(self) -> None:
+        try:
+            if self.missing_task_names:
+                names = "、".join(self.missing_task_names)
+                await Notify.push_plyer(
+                    "MaaFW 自动代理任务完成，但有失效任务",
+                    f"用户 {self.cur_user_item.name} 的队列里有 interface 内已没有的任务，"
+                    f"已跳过：{names}",
+                    f"{self.cur_user_item.name} 有失效任务：{names}",
+                    3,
+                )
+                return
+            await Notify.push_plyer(
+                "MaaFW 自动代理任务完成",
+                f"已完成用户 {self.cur_user_item.name} 的 MaaFW 自动代理任务",
+                f"已完成 {self.cur_user_item.name} 的 MaaFW 自动代理任务",
+                3,
+            )
+        except Exception as exc:
+            logger.warning(f"MaaFW 插件用户通知发送失败: {exc}")
+
+    def _append_log(self, message: str, *, warning: bool = False) -> None:
+        # 失败类的用户日志按 WARNING 进 app.log，事后按级别筛得出来
+        (logger.warning if warning else logger.info)(message)
+        if self.cur_user_log is None:
+            self._pending_user_log.append(_format_user_log_line(message))
+            return
+        content = self.cur_user_log.content
+        content.append(_format_user_log_line(message))
+        kept = content[-80:]
+        self.script_info.log = "".join(kept)
+        # 滑出窗口的行仍然占着行号：界面据此从 81 接着往下数，而不是每轮都把
+        # 最后 80 条重新编号成 1-80。
+        dropped_lines = sum(chunk.count("\n") for chunk in content[:-80])
+        self.script_info.log_first_line = dropped_lines + 1
+
+
+def _maafw_runner_jobs_dir() -> Path:
+    """MaaFW 任务 job 文件的落盘目录。
+
+    落在受保护的 ``data/`` 下，避免与 AUTO-MAS-Runtime 监督器接管的
+    ``runtime/`` 撞名；首次访问时把用户机器上已有的旧
+    ``runtime/maafw_runner_jobs`` 整体迁移过来。
+    """
+
+    new_dir = Path.cwd() / "data" / "maafw_runner_jobs"
+    migrate_legacy_dir(Path.cwd() / "runtime" / "maafw_runner_jobs", new_dir)
+    return new_dir
+
+
+def _find_controller(
+    interface_model: MaaFWInterface, controller_name: str
+) -> MaaFWController:
+    controller = next(
+        (item for item in interface_model.controller if item.name == controller_name),
+        None,
+    )
+    if controller is None:
+        raise RuntimeError(f"未找到 controller: {controller_name}")
+    return controller
+
+
+def _match_controller_windows(controller: MaaFWController) -> list[Any]:
+    # 插件形态下先查 maafw.controller.win32 服务契约再回退到直接实例化；
+    # 树内没有服务契约层，直连实现（移植指南 §4 规则 4）
+    service = MaaFWWin32ControllerService()
+    controller_payload = controller.model_dump(mode="json", by_alias=True)
+    return list(service.match_controller_windows(controller_payload))
+
+
+def _is_process_path_running(executable_path: Path) -> bool:
+    target_path = executable_path.resolve()
+    for proc in psutil.process_iter(["exe"]):
+        with suppress(psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            raw_exe = proc.info.get("exe") or proc.exe()
+            if raw_exe and Path(raw_exe).resolve() == target_path:
+                return True
+    return False
+
+
+def _optional_int(value: Any) -> int | None:
+    if value in (None, "", "-"):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_win32_method(
+    configured_value: Any,
+    interface_method: str | list[Any] | int | None,
+    method_values: dict[str, int],
+    default_name: str,
+    *,
+    label: str = "Win32 控制方式",
+    warn: Callable[[str], None] | None = None,
+    combinable: bool = False,
+) -> int:
+    """脚本级配置的数值优先，其次 interface 里写的名字，最后是默认方式。
+
+    名字不认识时退回默认方式并**告警**：以前是静默换成 DXGI_DesktopDup / Seize，
+    项目要的后台截图 / 后台输入悄悄变成前台，用户只看到游戏被抢了鼠标。
+
+    名字大小写不敏感（MFAA 用 ``Enum.TryParse(ignoreCase)``）；可以写成数组（MXU）
+    或逗号 / ``|`` 分隔（MFAA 的组合名写法），也可以是旧版整数。截图方式
+    （``combinable``）按位或合并；输入方式原生层只能选一个，给了多个取第一个并告警。
+    认得的值是不是当前原生库支持的，仍由 worker 的 ``_supported_win32_method`` 再判。
+    """
+
+    default = method_values[default_name]
+    configured = _optional_int(configured_value) or 0
+    if configured:
+        return configured
+    tokens = _win32_method_tokens(interface_method)
+    if not tokens:
+        return default
+    report = warn or logger.warning
+    by_name = {name.casefold(): (name, value) for name, value in method_values.items()}
+    resolved: list[tuple[str, int]] = []
+    unknown: list[str] = []
+    for token in tokens:
+        if isinstance(token, int):
+            if token > 0:
+                resolved.append((str(token), token))
+            else:
+                unknown.append(str(token))
+            continue
+        if token.isascii() and token.isdigit():
+            # 与整数写法同口径：0 不是任何方式（worker 对 <= 0 直接放行，交下去就是
+            # 「没有输入方式」），按无法识别处理。
+            if int(token) > 0:
+                resolved.append((token, int(token)))
+            else:
+                unknown.append(token)
+            continue
+        hit = by_name.get(token.casefold())
+        if hit is None:
+            unknown.append(token)
+        else:
+            resolved.append(hit)
+    if not resolved:
+        report(
+            f"MaaFW interface 里 {label}「{_describe_win32_method(interface_method)}」"
+            f"无法识别，已改用默认的 {default_name}"
+        )
+        return default
+    if unknown:
+        report(
+            f"MaaFW interface 里 {label}中的「{'、'.join(unknown)}」无法识别，已忽略"
+        )
+    if combinable:
+        value = 0
+        for _, item in resolved:
+            value |= item
+        return value
+    if len(resolved) > 1:
+        report(
+            f"MaaFW interface 里 {label}写了多个（"
+            f"{'、'.join(name for name, _ in resolved)}），输入方式只能选一个，"
+            f"已取第一个 {resolved[0][0]}"
+        )
+    return resolved[0][1]
+
+
+def _win32_method_tokens(value: Any) -> list[str | int]:
+    """把 interface 里的 Win32 方法声明拆成一个个名字 / 整数（空的丢掉）。"""
+
+    if value is None or isinstance(value, bool):
+        return []
+    if isinstance(value, int):
+        return [value]
+    items = value if isinstance(value, list) else [value]
+    tokens: list[str | int] = []
+    for item in items:
+        if isinstance(item, bool):
+            continue
+        if isinstance(item, int):
+            tokens.append(item)
+            continue
+        for part in re.split(r"[,|]", str(item)):
+            part = part.strip()
+            if part:
+                tokens.append(part)
+    return tokens
+
+
+def _describe_win32_method(value: Any) -> str:
+    if isinstance(value, list):
+        return "、".join(str(item) for item in value)
+    return str(value)
+
+
+def _snapshot_descendants(pid: int) -> list[tuple[int, float]]:
+    """记下某进程当前的全部后代（pid 与创建时间）。
+
+    创建时间与 pid 配对使用，防止 pid 复用导致误杀——这段时间里原进程可能
+    已经退出、pid 被别人占了。
+    """
+
+    snapshot: list[tuple[int, float]] = []
+    try:
+        for child in psutil.Process(pid).children(recursive=True):
+            with suppress(psutil.Error):
+                snapshot.append((child.pid, child.create_time()))
+    except psutil.Error:
+        return []
+    return snapshot
+
+
+def _terminate_snapshot(snapshot: list[tuple[int, float]]) -> None:
+    """结束快照里仍然存活、且身份对得上的进程。
+
+    worker 被强杀后它启动的 agent 会变成孤儿：MaaFW 的 AgentClient 用 IPC 起
+    agent，生命周期本该随 worker，但 TerminateProcess 不给收尾机会。实测残留
+    过二十多个 agent.exe / python.exe，最老的有二十二小时，它们占内存也占文件
+    句柄——曾导致 venv 目录删不掉。
+    """
+
+    victims: list[psutil.Process] = []
+    for pid, create_time in snapshot:
+        try:
+            process = psutil.Process(pid)
+            if abs(process.create_time() - create_time) > 1:
+                continue  # pid 被复用了，不是当初那个进程
+            process.terminate()
+            victims.append(process)
+        except psutil.Error:
+            continue
+    if not victims:
+        return
+    _gone, alive = psutil.wait_procs(victims, timeout=3)
+    for process in alive:
+        with suppress(psutil.Error):
+            process.kill()
+    psutil.wait_procs(alive, timeout=2)
+    logger.info(f"已清理 MaaFW worker 残留的 {len(victims)} 个子进程")
+
+
+def _decode_subprocess_output(data: bytes) -> str:
+    if not data:
+        return ""
+    for encoding in _SUBPROCESS_OUTPUT_ENCODINGS:
+        try:
+            return data.decode(encoding, errors="strict")
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return data.decode("latin1", errors="replace")
+
+
+def _clean_framework_output(message: str) -> str:
+    return _ANSI_ESCAPE_RE.sub("", str(message or ""))
+
+
+def _framework_ui_message(message: str) -> str:
+    """Bound worker diagnostics copied to the user-facing task log.
+
+    Complete native output is already retained in ``*.maafw.log``. A malformed
+    task/encoding error can otherwise contain megabytes of JSON or a parser
+    trace and make the normal task page unusable.
+    """
+
+    cleaned = _clean_framework_output(message).strip()
+    if len(cleaned) <= _FRAMEWORK_UI_LOG_MAX_CHARS:
+        return cleaned
+    lines = cleaned.splitlines()
+    compact = "\n".join(line[:240] for line in lines[:8]).strip()
+    omitted = max(0, len(cleaned) - len(compact))
+    summary = (
+        f"{compact}\n… 上述内容已省略 {omitted} 个字符，"
+        "完整内容请查看本次运行的 .maafw.log"
+    )
+    return summary[:_FRAMEWORK_UI_LOG_MAX_CHARS]
+
+
+def _parse_worker_protocol_line(
+    line: str, secrets: list[str] | tuple[str, ...]
+) -> dict[str, Any] | None:
+    """worker stdout 的一行若是协议事件（JSON 对象）就解析并打码后返回，否则 None。
+
+    **先解析、后打码**：以前对整行 JSON 做字符串替换，密码恰好是 ``true`` / ``result`` /
+    ``success`` / ``2026`` 或某个任务名时，替换会打坏 JSON 结构、键名、截图路径、完成任务
+    列表——成功的运行被判成「worker exited without result」而重试，或通知丢图、周期任务
+    不记完成。现在只替换给人读的文本（log / error 的 ``message``、结果里的
+    ``errorMessage``），结构字段（路径、任务名、状态、布尔、数字）一律不动。
+    解析不了的行（原生诊断）由调用方照旧整行打码。
+    """
+
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(event, dict):
+        return None
+    message = event.get("message")
+    if isinstance(message, str):
+        event["message"] = redact_secret_text(message, secrets)
+    data = event.get("data")
+    if isinstance(data, dict) and isinstance(data.get("errorMessage"), str):
+        event["data"] = {
+            **data,
+            "errorMessage": redact_secret_text(data["errorMessage"], secrets),
+        }
+    return event
+
+
+def _should_forward_framework_log(message: str) -> bool:
+    if any(marker in message for marker in _RAW_FAILURE_UI_LOG_MARKERS):
+        return False
+    if message.startswith(_WORKER_LOG_ONLY_MARKERS):
+        return False
+    cleaned = _clean_framework_output(message).strip()
+    if _FRAMEWORK_COORDINATE_RE.search(cleaned):
+        return False
+    if any(marker in cleaned for marker in _VERBOSE_FRAMEWORK_LOG_MARKERS):
+        return False
+    # Native MaaFramework diagnostics are always retained in the per-run
+    # ``*.worker.log`` / ``*.maafw.log`` files.  They are intentionally not
+    # copied into the user facing script log: one failed override can otherwise
+    # emit the same parser backtrace once per task and hide the actionable summary.
+    if any(marker in cleaned for marker in _NATIVE_FRAMEWORK_LOG_MARKERS):
+        return False
+    if _NATIVE_FRAMEWORK_STATUS_RE.search(cleaned) and ".cpp" in cleaned:
+        return False
+    # Some MaaFramework/Agent diagnostics do not include a C++ source marker
+    # but embed an entire pipeline JSON document in one line.  Keep the full
+    # payload in the per-run ``*.maafw.log`` and leave the normal task page to
+    # the concise runner error that follows it.
+    if len(cleaned) > _FRAMEWORK_UI_LOG_MAX_CHARS and (
+        any(marker in cleaned for marker in _FRAMEWORK_DEBUG_PAYLOAD_MARKERS)
+        or cleaned.startswith(("{", "["))
+    ):
+        return False
+    return True
+
+
+def _remove_method(methods: int, method: int, fallback: int) -> int:
+    """从位掩码中剔除 method 位；若结果为 0（无可用方法）则回退到 fallback。"""
+    filtered = methods & ~method
+    return filtered or fallback
+
+
+def _ldplayer_input_text_command(emulator_root: Path, index: int) -> list[str] | None:
+    """雷电文本输入改走 ``ldconsole action --key call.input`` 的 adb config 命令。
+
+    MaaFW 的 ``AdbShellInput`` 按 ``config.command.InputText`` 的 argv 起子进程，
+    ``{TEXT}`` 由它替换成待输入文本；首元素不必是 adb。ldconsole 成功时无输出、
+    返回 0，正好满足 MaaFW「输出为空即成功」的判据；索引错了它会打印错误，
+    MaaFW 就把这次 InputText 判失败，让节点失败而不是像 Maatouch 那样静默重打。
+    索引必须是雷电原生实例号（与 extras 同口径）。找不到 ldconsole 就返回 None，
+    调用方维持原来的 Maatouch 路径。
+    """
+    console = emulator_root / "ldconsole.exe"
+    if not console.is_file():
+        return None
+    return [
+        str(console).replace("\\", "/"),
+        "action",
+        "--index",
+        str(index),
+        "--key",
+        "call.input",
+        "--value",
+        "{TEXT}",
+    ]
+
+
+def _has_input_text_command(config: dict[str, Any]) -> bool:
+    command = config.get("command")
+    return isinstance(command, dict) and bool(command.get("InputText"))
+
+
+def _same_adb_device(left: str, right: str) -> bool:
+    """两个 ADB 地址是否指向同一台设备。
+
+    只抹平最常见的写法差异：``localhost`` 与 ``127.0.0.1``，以及本机模拟器的
+    ``emulator-<控制台端口>`` 与 ``127.0.0.1:<控制台端口 + 1>``（雷电没开时报的就是前一种）。
+    """
+
+    def normalize(address: str) -> str:
+        address = address.strip().lower()
+        console_port = address.removeprefix("emulator-")
+        if console_port != address and console_port.isdigit():
+            return f"127.0.0.1:{int(console_port) + 1}"
+        if address.startswith("localhost:"):
+            return "127.0.0.1:" + address.removeprefix("localhost:")
+        return address
+
+    return normalize(left) == normalize(right)
+
+
+def _load_json_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        with suppress(json.JSONDecodeError):
+            data = json.loads(value)
+            if isinstance(data, dict):
+                return data
+    return {}
+
+
+def _load_script_hotkeys(value: Any) -> dict[str, dict[str, str]]:
+    """``Game.Hotkeys`` → ``{option 名: {字段名: 组合键}}``；不成形的部分丢掉。"""
+
+    result: dict[str, dict[str, str]] = {}
+    for option_name, fields in _load_json_dict(value).items():
+        if not isinstance(option_name, str) or not isinstance(fields, dict):
+            continue
+        cleaned = {
+            field_name: field_value
+            for field_name, field_value in fields.items()
+            if isinstance(field_name, str) and isinstance(field_value, str)
+        }
+        if cleaned:
+            result[option_name] = cleaned
+    return result
+
+
+def _minutes_to_seconds(minutes: Any) -> int:
+    """配置里的分钟数换算成秒。0 / 负数 / 写坏的值都当「不限」（返回 0）。"""
+
+    try:
+        value = int(minutes)
+    except (TypeError, ValueError):
+        return 0
+    return value * 60 if value > 0 else 0
+
+
+def task_time_limits_from_config(config: Any) -> tuple[int, dict[str, int]]:
+    """读 Run.TaskTimeLimit / Run.TaskTimeLimitOverrides 并换算成秒。
+
+    宿主在拉起 worker 之前算一次，随 job 文件下发：worker 是独立进程，读不到 Config，
+    核心包也只收秒数，不认宿主的配置键。
+
+    Returns:
+        (默认单任务时限秒数, {任务名: 时限秒数})，0 表示不限。
+    """
+
+    default_seconds = _minutes_to_seconds(config.get("Run", "TaskTimeLimit"))
+    # 配置系统里 JSON 项存的是字符串（JSONValidator），读出来再解析一次。
+    overrides = {
+        str(name): _minutes_to_seconds(minutes)
+        for name, minutes in _load_json_dict(
+            config.get("Run", "TaskTimeLimitOverrides")
+        ).items()
+    }
+    return default_seconds, overrides
+
+
+def _load_json_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        with suppress(json.JSONDecodeError):
+            data = json.loads(value)
+            if isinstance(data, list):
+                return [str(item) for item in data if str(item).strip()]
+    return []
+
+
+def _iter_rotated_native_debug_logs(path: Path) -> list[Path]:
+    """按轮转时间升序列出 MaaFW 的历史原生日志。
+
+    文件名形如 ``maafw.bak.2026.08.30-22.58.30.451.log``，时间戳是零填充的
+    定宽字段，按文件名排序即按时间排序。
+    """
+
+    try:
+        return sorted(path.parent.glob(path.stem + ".bak.*" + path.suffix))
+    except OSError:
+        return []
+
+
+def _snapshot_native_debug_log_state(path: Path) -> tuple[int, frozenset[str]]:
+    """记下原生日志的读取起点：当前大小，以及运行前已存在的轮转文件。"""
+
+    try:
+        offset = path.stat().st_size
+    except OSError:
+        offset = 0
+    return offset, frozenset(
+        rotated.name for rotated in _iter_rotated_native_debug_logs(path)
+    )
+
+
+def _plan_native_debug_log_sources(
+    path: Path,
+    start_offset: int,
+    known_rotations: frozenset[str],
+) -> list[tuple[str, Path, int]]:
+    """列出本次运行写下的原生日志分片，按时间先后排列。
+
+    MaaFW 会在 ``maafw.log`` 涨到一定大小时把它整体挪成
+    ``maafw.bak.<时间戳>.log``，再开一个空文件继续写。只记字节偏移不够用：
+    轮转后新文件重新长回超过该偏移，收尾时便会拿运行前的偏移去 seek 一个
+    内容毫不相干的文件——运行前半段凭空消失，切口还落在任意字节上。而长到
+    足以触发轮转的运行，恰恰是最需要日志的那些。
+
+    所以改为对比运行前后的轮转文件集合：新出现的那些就是本次运行被挪走的
+    内容。其中最早的一个才是运行开始时正在写的文件，只有它要跳过运行前已有
+    的部分，其余分片都从头读。
+    """
+
+    rotated = [
+        candidate
+        for candidate in _iter_rotated_native_debug_logs(path)
+        if candidate.name not in known_rotations
+    ]
+    sources: list[tuple[str, Path, int]] = [
+        ("debug/" + candidate.name, candidate, start_offset if index == 0 else 0)
+        for index, candidate in enumerate(rotated)
+    ]
+    sources.append(("debug/" + path.name, path, 0 if rotated else start_offset))
+    return sources
+
+
+def _copy_native_debug_log_delta(
+    path: Path,
+    start_offset: int,
+    known_rotations: frozenset[str],
+    target: Path,
+    secrets: list[str] | tuple[str, ...] = (),
+) -> int:
+    """把本次运行写下的原生日志分片按顺序原样追加到 ``target``，返回复制的字节数。
+
+    按字节复制、不解码不清洗，副本才和项目 ``debug/maafw.log`` 完全一致。每次尝试
+    各写各的文件（文件名是这次尝试的开始时刻），追加只是为了不覆盖已有内容。
+    逐个分片流式复制，一份可能有几十 MB。
+
+    唯一的改动是 ``secrets``（密码字段的原文及其 JSON 转义写法）：框架在
+    ``Tasker::post_task`` 里按 INFO 级别记下整份 ``pipeline_override``（``[pipeline_override={...}]``），
+    密码会原样出现；给了就逐行换成占位（按 UTF-8 / GBK / UTF-16LE 的字节替换，其余字节不动）。项目目录里框架
+    自己写的 ``debug/maafw.log`` 不归 MAS 管，那份仍是原文。
+    """
+
+    # 每个写法按 UTF-8 / GBK / UTF-16LE 的字节都换（与 .project.log 同一套，见 option_secrets）。
+    secret_pairs = secret_byte_pairs(list(secrets))
+
+    copied = 0
+    target_file: Any | None = None
+    try:
+        for _label, source_path, source_offset in _plan_native_debug_log_sources(
+            path, start_offset, known_rotations
+        ):
+            try:
+                current_size = source_path.stat().st_size
+            except OSError:
+                continue
+            source_offset = source_offset if current_size >= source_offset else 0
+            if current_size <= source_offset:
+                continue
+            if target_file is None:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target_file = target.open("ab")
+            with source_path.open("rb") as source_file:
+                source_file.seek(source_offset)
+                if secret_pairs:
+                    for raw_line in source_file:
+                        for secret, placeholder in secret_pairs:
+                            if secret in raw_line:
+                                raw_line = raw_line.replace(secret, placeholder)
+                        target_file.write(raw_line)
+                else:
+                    shutil.copyfileobj(source_file, target_file)
+                copied += source_file.tell() - source_offset
+    finally:
+        if target_file is not None:
+            target_file.close()
+    return copied
+
+
+# worker 截图文件名是 ``[<前缀>.]<kind>-<HHMMSS>-<任务>.png``，信号证据图的 kind 见
+# core/runner/runner.py 的 SIGNAL_SCREENSHOT_KINDS。
+_SIGNAL_EVIDENCE_NAME_RE = re.compile(r"(?:^|\.)(?:maintenance|clientupdate)-\d{6}-")
+
+
+def _signal_evidence_shot(result: Any) -> Any | None:
+    """信号命中那个任务的证据图；找不到就不带图（宁缺勿错）。"""
+
+    for shot in getattr(result, "failureScreenshots", None) or ():
+        if shot.task == result.failedTask and _SIGNAL_EVIDENCE_NAME_RE.search(
+            Path(shot.path).name
+        ):
+            return shot
+    return None
+
+
+def _is_unretryable_failure(message: str) -> bool:
+    return any(marker in message for marker in _UNRETRYABLE_ENVIRONMENT_MARKERS)
+
+
+_FAILURE_REASON_MAX_CHARS = 200
+
+
+def _failure_reason_for_user(result: Any) -> str:
+    """从运行结果里取一句可读的失败原因。
+
+    runner 会把异常原文放进 ``errorMessage``，但它同时也用
+    ``MaaFW 任务执行失败: {exc}`` 发一条日志——那条命中
+    ``_RAW_FAILURE_UI_LOG_MARKERS`` 会被当框架噪声过滤掉。若这里再不取，
+    Python 侧异常（如缺模块）在任务页上就只剩「任务执行失败」四个字。
+
+    框架自身的失败原文可能是整段原生 backtrace，因此只取首个非空行并截断；
+    完整内容仍在本次运行的 ``*.worker.log`` 里。
+    """
+
+    raw = str(getattr(result, "errorMessage", "") or "").strip()
+    if not raw:
+        return ""
+    first_line = next((line.strip() for line in raw.splitlines() if line.strip()), "")
+    if not first_line:
+        return ""
+    if len(first_line) > _FAILURE_REASON_MAX_CHARS:
+        first_line = first_line[:_FAILURE_REASON_MAX_CHARS] + "…"
+    return first_line
+
+
+def _failed_task_user_summary(result: Any, plan: Any | None) -> str:
+    failed_task = str(getattr(result, "failedTask", "") or "").strip()
+    reason = _failure_reason_for_user(result)
+    suffix = f"：任务执行失败{'：' + reason if reason else ''}"
+    tasks = tuple(getattr(plan, "tasks", ()) or ()) if plan is not None else ()
+    if tasks:
+        for task in tasks:
+            task_name = str(getattr(task, "name", "") or "").strip()
+            task_entry = str(getattr(task, "entry", "") or "").strip()
+            if failed_task and failed_task not in {task_name, task_entry}:
+                continue
+            return f"{_task_display_name(task)}{suffix}"
+    return f"{failed_task or 'MaaFW 任务'}{suffix}"
+
+
+def _task_display_name(task: Any) -> str:
+    label = getattr(task, "label", None)
+    if isinstance(label, str) and label.strip() and not label.lstrip().startswith("$"):
+        return label.strip()
+    return str(getattr(task, "name", ""))
+
+
+def _format_completed_task_labels(
+    plan: MaaFWRunPlan | None,
+    task_names: list[str],
+) -> list[str]:
+    labels_by_name = (
+        {task.name: _task_display_name(task) for task in plan.tasks}
+        if plan is not None
+        else {}
+    )
+    return [labels_by_name.get(task_name, task_name) for task_name in task_names]
+
+
+def _format_run_overview_log(
+    plan: MaaFWRunPlan,
+    *,
+    selected_preset: str,
+) -> str:
+    task_names = " -> ".join(_task_display_name(task) for task in plan.tasks) or "-"
+    if len(task_names) > _RUN_OVERVIEW_LOG_VALUE_LIMIT:
+        task_names = task_names[:_RUN_OVERVIEW_LOG_VALUE_LIMIT] + "..."
+    project_name = (
+        plan.projectLabel.strip()
+        if isinstance(plan.projectLabel, str)
+        and plan.projectLabel.strip()
+        and not plan.projectLabel.lstrip().startswith("$")
+        else plan.projectName
+    )
+    project_version = str(plan.piEnv.get("PI_VERSION") or "").strip() or "未知"
+    overview = (
+        "MaaFW 运行总览: "
+        f"project={project_name}; version={project_version}; "
+        f"controller={plan.controllerName}; resource={plan.resourceName}; "
+        f"preset={selected_preset or '自定义'}; "
+        f"enabled_tasks({len(plan.tasks)})={task_names}"
+    )
+    if not plan.skippedTasks:
+        return overview
+
+    # 被跳过的任务此前没有任何出口，用户把任务加进队列却看不出它为什么没跑。
+    skipped_names = " -> ".join(
+        f"{_task_display_name(task)}({task.reason})" for task in plan.skippedTasks
+    )
+    if len(skipped_names) > _RUN_OVERVIEW_LOG_VALUE_LIMIT:
+        skipped_names = skipped_names[:_RUN_OVERVIEW_LOG_VALUE_LIMIT] + "..."
+    return f"{overview}; skipped_tasks({len(plan.skippedTasks)})={skipped_names}"
+
+
+#: 任务报告里「失效任务」一行的前缀：队列里的任务 interface 已没有，本次跳过。
+MISSING_TASK_NOTICE_PREFIX = (
+    "失效任务（interface 内已无，已跳过，请到用户配置里重新添加）"
+)
+#: 其余任务都跑完、但队列里有失效任务时统计报告的结果：照常算完成，不说「全部完成」。
+MISSING_TASK_USER_RESULT = "代理任务完成，但有失效任务"
+
+
+def _mark_abort_round_tasks(plan: MaaFWRunPlan, flavor: Any) -> MaaFWRunPlan:
+    """把特调声明的关键任务（``abort_round_entries``：entry → 失败时报的话）标到计划上。
+
+    runner 据此在这些任务失败或超时时直接结束本轮，见 ``MaaFWTaskRunPlan.abortRoundMessage``。
+    """
+
+    entries: dict[str, str] = getattr(flavor, "abort_round_entries", None) or {}
+    if not entries:
+        return plan
+    tasks = [
+        task.model_copy(update={"abortRoundMessage": entries[task.entry]})
+        if task.entry in entries
+        else task
+        for task in plan.tasks
+    ]
+    return plan.model_copy(update={"tasks": tasks})
+
+
+def _with_skipped_tasks(
+    plan: MaaFWRunPlan, skipped: list[MaaFWSkippedTaskPlan]
+) -> MaaFWRunPlan:
+    """把建计划之外判出的跳过项排在计划自己的跳过项前面。"""
+
+    if not skipped:
+        return plan
+    return plan.model_copy(update={"skippedTasks": [*skipped, *plan.skippedTasks]})
+
+
+def _current_period_keys(now: datetime | None = None) -> tuple[str, str, str]:
+    current = now or datetime.now(tz=UTC4)
+    iso_year, iso_week, _ = current.isocalendar()
+    return (
+        current.strftime("%Y-%m-%d"),
+        f"{iso_year}-W{iso_week:02d}",
+        current.strftime("%Y-%m"),
+    )
+
+
+def _format_user_log_line(message: str) -> str:
+    timestamp = datetime.now().astimezone().strftime("%H:%M:%S")
+    lines = str(message).splitlines() or [""]
+    return "".join(f"[{timestamp}] {line}\n" for line in lines)

@@ -1,0 +1,1003 @@
+#   AUTO-MAS: A Multi-Script, Multi-Config Management and Automation Software
+#   Copyright © 2025-2026 AUTO-MAS Team
+
+#   This file is part of AUTO-MAS.
+
+#   AUTO-MAS is free software: you can redistribute it and/or modify
+#   it under the terms of the GNU Affero General Public License as
+#   published by the Free Software Foundation, either version 3 of
+#   the License, or (at your option) any later version.
+
+#   AUTO-MAS is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty
+#   of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See
+#   the GNU Affero General Public License for more details.
+
+#   You should have received a copy of the GNU Affero General Public License
+#   along with AUTO-MAS. If not, see <https://www.gnu.org/licenses/>.
+
+#   Contact: DLmaster_361@163.com
+
+
+import asyncio
+import json
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Callable, Literal
+
+from app.services.system import System
+from app.utils import ProcessInfo, get_logger, is_process_running
+
+from ..task_mapping import engine_label
+from .cloud_browser import (
+    DEFAULT_DEBUG_PORT,
+    MAS_PROFILE_DIRNAME,
+    START_FAILED_MESSAGE,
+    CloudBrowser,
+    CloudBrowserError,
+    CloudBrowserMissingError,
+    cleanup_m7a_self_started_browsers,
+    cleanup_stale_cloud_browsers,
+    find_free_debug_port,
+    is_port_free,
+    locate_integrated_browser,
+)
+from .game_resolution import HSRGameResolutionOverride
+from .log_detect import has_screenshot_window_unavailable_output
+from .m7a_config import build_m7a_platform_patch, load_m7a_native_config
+from .m7a_runtime import build_m7a_platform_env
+from .run_model import HSRNonRetryableTaskError
+from .sra_runtime import (
+    SRACommandResult,
+    build_sra_start_game_config,
+    run_sra_single_task,
+    write_sra_temp_config,
+)
+
+logger = get_logger("HSR 切号")
+
+HSR_GAME_READY_DELAY_SECONDS = 5
+HSR_GAME_FOREGROUND_SETTLE_SECONDS = 2
+HSR_SCRIPT_SWITCH_DELAY_SECONDS = 5
+HSR_SRA_WINDOW_RECOVERY_MIN_INTERVAL_SECONDS = 5
+HSR_GAME_PROCESS_NAME = "StarRail.exe"
+
+HSRGamePlatform = Literal["Client", "Cloud"]
+HSR_CLOUD_PROFILE_DIRNAME = MAS_PROFILE_DIRNAME
+# 云浏览器连续起这么多次都失败才中止：三月七启动失败路径会按标记杀掉浏览器，
+# 死一次重起一次是常态，连着两次起不来才说明真有问题。
+HSR_CLOUD_BROWSER_START_ATTEMPTS = 2
+
+
+def _script_path(script_config: Any, engine: str) -> str:
+    """Resolve the old-dev engine root from ``Info`` only."""
+
+    return str(script_config.get("Info", f"{engine}Path") or "").strip()
+
+
+def resolve_game_platform(script_config: Any) -> HSRGamePlatform:
+    """读取脚本的游戏平台；缺字段或非法值按客户端处理。"""
+
+    try:
+        value = script_config.get("Game", "Platform")
+    except (AttributeError, KeyError, TypeError):
+        value = None
+    return "Cloud" if value == "Cloud" else "Client"
+
+
+def is_cloud_platform(script_config: Any) -> bool:
+    """脚本是否运行云·星穹铁道。"""
+
+    return resolve_game_platform(script_config) == "Cloud"
+
+
+def resolve_cloud_profile_root(script_id: str) -> Path:
+    """本脚本所有云浏览器 profile 的根目录（相对后端 cwd 的 ``data/{script_id}``）。"""
+
+    return Path.cwd() / f"data/{script_id}"
+
+
+def resolve_cloud_profile_dir(script_id: str, user_id: str) -> Path:
+    """一个 MAS 用户的云浏览器 profile：登录态就存在这里，用户之间互不相干。"""
+
+    return resolve_cloud_profile_root(script_id) / user_id / HSR_CLOUD_PROFILE_DIRNAME
+
+
+def _cloud_int(script_config: Any, key: str, default: int) -> int:
+    try:
+        return max(1, int(script_config.get("Cloud", key) or default))
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return default
+
+
+def cloud_use_paid_time(script_config: Any) -> bool:
+    """是否允许三月七消耗付费时长走快速排队（花钱的开关，默认关）。"""
+
+    try:
+        return bool(script_config.get("Cloud", "UsePaidTime"))
+    except (AttributeError, KeyError, TypeError):
+        return False
+
+
+def cloud_max_queue_minutes(script_config: Any) -> int:
+    """云·星穹铁道最长排队时间（分钟），也是每个模块超时的排队预算。"""
+
+    return _cloud_int(script_config, "MaxQueueMinutes", 60)
+
+
+def cloud_login_timeout_minutes(script_config: Any) -> int:
+    """三月七等用户在浏览器里手动登录的时间（分钟）。"""
+
+    return _cloud_int(script_config, "LoginTimeoutMinutes", 20)
+
+
+def build_platform_m7a_patch(
+    script_config: Any, *, debug_port: int | None = None
+) -> dict[str, Any]:
+    """本轮三月七 config.yaml 的平台字段；云平台的端口取当前用户的云浏览器。"""
+
+    cloud = is_cloud_platform(script_config)
+    return build_m7a_platform_patch(
+        cloud=cloud,
+        debug_port=debug_port,
+        max_queue_minutes=cloud_max_queue_minutes(script_config),
+        login_timeout_minutes=cloud_login_timeout_minutes(script_config),
+        use_paid_time=cloud_use_paid_time(script_config),
+    )
+
+
+def build_platform_m7a_env(
+    script_config: Any, *, direct: bool = False
+) -> dict[str, str]:
+    """本轮三月七进程的平台环境变量。
+
+    客户端平台 + 直控不钉云开关：直控尊重三月七自己的配置，「直控 + 三月七原生
+    云模式」是上游一直支持的用法（check() 会提示改用云·星穹铁道平台）。其余组合
+    （客户端托管钉 false、云平台钉 true 及浏览器参数）照常。
+    """
+
+    if direct and not is_cloud_platform(script_config):
+        return {}
+    return build_m7a_platform_env(
+        cloud=is_cloud_platform(script_config),
+        use_paid_time=cloud_use_paid_time(script_config),
+    )
+
+
+def configure_m7a_runner(
+    runner: Any, script_config: Any, *, direct: bool = False
+) -> None:
+    """按游戏平台配置三月七运行器：环境变量钉扎与终止方式，只在这一处决定。
+
+    云平台按进程树终止（子进程只有 chromedriver 与三月七自建的浏览器）；客户端
+    平台只杀主进程（三月七可能拉起了游戏客户端，按树杀会把游戏带走）。
+    """
+
+    runner.env_overrides = build_platform_m7a_env(script_config, direct=direct)
+    runner.kill_tree = is_cloud_platform(script_config)
+
+
+def check_cloud_prerequisites(script_config: Any) -> str:
+    """云·星穹铁道的脚本级前置；通过返回空串。
+
+    云模式只用三月七：三月七路径与可执行文件、发行包内置的 Chrome 与
+    chromedriver 都是硬条件；再探一次 MAS 托管浏览器能用的调试端口。
+    SRA 路径有没有都不影响。
+    """
+
+    m7a_path = _script_path(script_config, "M7A")
+    if not m7a_path:
+        return "云·星穹铁道只能由三月七执行，请先设置三月七路径"
+    m7a_exe = Path(m7a_path) / "March7th Assistant.exe"
+    if not m7a_exe.is_file():
+        return f"三月七路径中未找到 March7th Assistant.exe：{m7a_exe}"
+    try:
+        locate_integrated_browser(m7a_path)
+        find_free_debug_port(DEFAULT_DEBUG_PORT)
+    except CloudBrowserError as exc:
+        return str(exc)
+    return ""
+
+
+def read_cloud_last_login(script_config: Any) -> dict[str, str]:
+    """``Cloud.LastLogin``：user_id → 最近一次确认已登录的 ISO 时间。"""
+
+    try:
+        raw = script_config.get("Cloud", "LastLogin")
+    except (AttributeError, KeyError, TypeError):
+        return {}
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {str(key): str(value) for key, value in raw.items()}
+
+
+async def merge_cloud_last_login(script_config: Any, updates: dict[str, str]) -> None:
+    """把若干用户的登录时间合并写回 ``Cloud.LastLogin``（配置须已解锁）。"""
+
+    merged = read_cloud_last_login(script_config)
+    merged.update(updates)
+    await script_config.set(
+        "Cloud", "LastLogin", json.dumps(merged, ensure_ascii=False)
+    )
+
+
+def _cloud_auto_battle_enabled(script_config: Any) -> bool:
+    """沿用三月七 ``auto_battle_detect_enable`` 的语义决定是否写自动战斗开关。"""
+
+    try:
+        return bool(
+            load_m7a_native_config(script_config).get("auto_battle_detect_enable", True)
+        )
+    except (FileNotFoundError, OSError, ValueError):
+        return True
+
+
+async def close_cloud_browser(
+    runtime: Any,
+    append_log: Callable[[str], None],
+    *,
+    script_id: str | None = None,
+    include_m7a_started: bool = False,
+) -> None:
+    """关闭当前云浏览器，再按命令行标记兜底清理。
+
+    给了 ``script_id`` 时清理本脚本 profile 下的残留；``include_m7a_started`` 时再
+    清掉三月七自己新建的浏览器（见 :func:`cleanup_cloud_leftovers`）。
+    """
+
+    browser: CloudBrowser | None = runtime.cloud_browser
+    runtime.cloud_browser = None
+    if browser is not None:
+        try:
+            await browser.stop()
+            append_log("云浏览器已关闭")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"关闭云浏览器失败：{e}")
+            append_log(f"关闭云浏览器失败：{e}")
+    await cleanup_cloud_leftovers(
+        append_log, script_id=script_id, include_m7a_started=include_m7a_started
+    )
+
+
+async def cleanup_cloud_leftovers(
+    append_log: Callable[[str], None],
+    *,
+    script_id: str | None = None,
+    include_m7a_started: bool = False,
+) -> None:
+    """按命令行标记清理残留云浏览器；绝不碰不带三月七标记的浏览器。
+
+    - 本脚本 MAS profile（``data/{script_id}``）下的：上一轮崩溃等留下的；
+    - ``include_m7a_started`` 时，三月七自己新建的（profile 缺失或最后一级不是
+      ``cloud-profile``）：它的启动重试会先杀掉所有带标记的浏览器，再找不到 MAS
+      的就自建一个。
+    """
+
+    if script_id:
+        try:
+            count = await cleanup_stale_cloud_browsers(
+                resolve_cloud_profile_root(script_id)
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"清理残留云浏览器失败：{e}")
+            append_log(f"清理残留云浏览器失败：{e}")
+        else:
+            if count:
+                append_log(f"已清理 {count} 个残留的云浏览器")
+    if include_m7a_started:
+        try:
+            count = await cleanup_m7a_self_started_browsers()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"清理三月七自行启动的浏览器失败：{e}")
+            append_log(f"清理三月七自行启动的浏览器失败：{e}")
+        else:
+            if count:
+                append_log(f"已关闭 {count} 个三月七自行启动的云浏览器")
+
+
+def is_game_management_enabled(script_config: Any) -> bool:
+    """读取 MAS 游戏管理开关；旧配置缺少该字段时默认开启。"""
+
+    value = script_config.get("Game", "Enabled")
+    return True if value is None else bool(value)
+
+
+def _user_credential(user_config: Any, key: str) -> str:
+    """Read the old-dev account credential from ``Info``."""
+
+    return str(user_config.get("Info", key) or "")
+
+
+def _is_config_value_readable(user_config: Any, group: str, key: str) -> bool:
+    """检查配置项当前存储值是否能通过自身 validator。"""
+
+    item = user_config._config_item_index[group][key]
+    return item.validator.validate(item.value)
+
+
+def resolve_game_executable_path(script_config: Any) -> Path:
+    """从配置解析实际要启动的 StarRail.exe 路径。"""
+
+    raw_path = str(script_config.get("Game", "Path") or "").strip()
+    path = Path(raw_path) if raw_path else Path(HSR_GAME_PROCESS_NAME)
+    if path.suffix.lower() == ".exe":
+        return path
+    return path / HSR_GAME_PROCESS_NAME
+
+
+def _force_resolution_enabled(script_config: Any) -> bool:
+    """读取脚本页的临时 1920×1080 开关；旧配置缺字段时保持关闭。"""
+
+    return bool(script_config.get("Game", "ForceResolution1920x1080"))
+
+
+def prepare_game_resolution_if_needed(
+    runtime: Any,
+    script_config: Any,
+    append_log: Callable[[str], None],
+) -> None:
+    """在 MAS 启动游戏前临时写入注册表分辨率覆盖（云平台不适用）。"""
+
+    if is_cloud_platform(script_config):
+        return
+    if not is_game_management_enabled(script_config) or not _force_resolution_enabled(
+        script_config
+    ):
+        return
+
+    override = runtime.game_resolution_override
+    if override is None:
+        override = HSRGameResolutionOverride()
+        first_apply = override.apply()
+        runtime.game_resolution_override = override
+    else:
+        first_apply = override.apply()
+
+    if first_apply:
+        append_log("已临时把星铁注册表设为 1920×1080 窗口模式；游戏关闭后将恢复原值")
+    else:
+        append_log("重新启动游戏前已再次应用临时 1920×1080 窗口模式")
+
+
+def restore_game_resolution_if_needed(
+    runtime: Any,
+    append_log: Callable[[str], None],
+) -> None:
+    """在关闭游戏后恢复启动前的注册表值。"""
+
+    override = runtime.game_resolution_override
+    if override is None:
+        return
+
+    restored = override.restore()
+    runtime.game_resolution_override = None
+    if restored:
+        append_log("已恢复任务开始前的星铁分辨率注册表")
+
+
+def resolve_sra_start_mode_from_credentials(
+    account_id: str,
+    password: str,
+    user_name: str,
+) -> str:
+    """根据账号密码明文选择 SRA StartGame 模式。"""
+
+    if account_id.strip() and password.strip():
+        return "switch"
+
+    logger.warning(
+        f"用户「{user_name}」未配置账号或密码，"
+        f"SRA StartGame 将使用当前已记住账号进入游戏；"
+        f"若客户端停在登录页，需要手动登录，否则任务会失败。"
+    )
+    return "remembered"
+
+
+def resolve_sra_start_mode(user_config: Any, user_name: str) -> str:
+    """根据用户账号密码情况选择 SRA StartGame 模式。"""
+
+    return resolve_sra_start_mode_from_credentials(
+        _user_credential(user_config, "Id"),
+        _user_credential(user_config, "Password"),
+        user_name,
+    )
+
+
+def user_needs_account_switch(user_config: Any) -> bool:
+    """判断用户是否配置了可用于切号的账号密码。"""
+
+    plain_id = _user_credential(user_config, "Id")
+    plain_pw = _user_credential(user_config, "Password")
+    return bool(plain_id.strip() and plain_pw.strip())
+
+
+def check_user_credentials(user_config: Any, user_name: str) -> str:
+    """校验账号密码密文可读；空账号密码时交给 SRA 当前登录态。"""
+
+    if not _is_config_value_readable(user_config, "Info", "Id"):
+        return (
+            f"用户「{user_name}」的账号密文损坏或当前 Windows 用户无法解密，"
+            "请重新设置账号"
+        )
+    decrypted_id = _user_credential(user_config, "Id")
+    if not decrypted_id or not decrypted_id.strip():
+        logger.warning(
+            f"用户「{user_name}」的账号为空，SRA StartGame 将使用当前已记住账号进入游戏"
+        )
+        return "Pass"
+
+    if not _is_config_value_readable(user_config, "Info", "Password"):
+        return (
+            f"用户「{user_name}」的密码密文损坏或当前 Windows 用户无法解密，"
+            "请重新设置密码"
+        )
+    decrypted_pw = _user_credential(user_config, "Password")
+    if not decrypted_pw or not decrypted_pw.strip():
+        logger.warning(
+            f"用户「{user_name}」的密码为空，SRA StartGame 将使用当前已记住账号进入游戏"
+        )
+        return "Pass"
+
+    logger.debug(f"用户「{user_name}」的账号密码校验通过（已确认可解密）")
+    return "Pass"
+
+
+async def stop_external_processes(
+    runtime: Any,
+    append_log: Callable[[str], None],
+    script_config: Any | None = None,
+) -> None:
+    """停止当前仍在运行的 SRA/M7A 子进程。"""
+
+    stopped = False
+    if runtime.m7a_runner is not None:
+        try:
+            stopped = await runtime.m7a_runner.terminate() or stopped
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"终止三月七当前子进程失败：{e}")
+            append_log(f"终止三月七当前子进程失败：{e}")
+
+    try:
+        stopped = (
+            await runtime.sra_process_registry.terminate_current_process() or stopped
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"终止 SRA 当前子进程失败：{e}")
+        append_log(f"终止 SRA 当前子进程失败：{e}")
+
+    path_checked = False
+    if script_config is not None:
+        m7a_path = _script_path(script_config, "M7A")
+        if m7a_path:
+            m7a_exe_path = Path(m7a_path) / "March7th Assistant.exe"
+            try:
+                await System.kill_process(m7a_exe_path)
+                path_checked = True
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"按路径清理三月七进程失败：{m7a_exe_path} - {e}")
+                append_log(f"按路径清理三月七进程失败：{e}")
+
+        sra_path = _script_path(script_config, "SRA")
+        if sra_path:
+            sra_exe_path = Path(sra_path) / "SRA-cli.exe"
+            try:
+                await System.kill_process(sra_exe_path)
+                path_checked = True
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"按路径清理 SRA 进程失败：{sra_exe_path} - {e}")
+                append_log(f"按路径清理 SRA 进程失败：{e}")
+
+    if stopped:
+        append_log("已向 SRA / 三月七外部进程发送停止信号")
+    if path_checked:
+        append_log("已按路径清理 SRA / 三月七外部进程")
+
+
+async def close_game_if_needed(
+    runtime: Any,
+    script_config: Any,
+    append_log: Callable[[str], None],
+    *,
+    script_id: str | None = None,
+) -> None:
+    """任务结束后关闭由 MAS 本次启动的游戏；云平台关闭 MAS 托管的浏览器。"""
+
+    if is_cloud_platform(script_config):
+        if runtime.cloud_browser is not None:
+            append_log("任务结束，正在关闭 MAS 托管的云浏览器")
+        await close_cloud_browser(
+            runtime,
+            append_log,
+            script_id=script_id,
+            include_m7a_started=True,
+        )
+        runtime.game_started_by_mas = False
+        return
+
+    if not is_game_management_enabled(script_config):
+        return
+    if not runtime.game_started_by_mas:
+        return
+
+    game_exe_path = runtime.game_exe_path or resolve_game_executable_path(script_config)
+    append_log("任务结束，正在关闭由 MAS 启动的游戏")
+    try:
+        await System.kill_process(game_exe_path)
+        await runtime.game_process_manager.clear()
+        append_log("游戏进程已关闭")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"关闭 HSR 游戏进程失败：{e}")
+        append_log(f"关闭游戏进程失败：{e}")
+
+
+class HSRAccountSwitcher:
+    """HSR 启动游戏与 SRA StartGame 切号运行器。"""
+
+    def __init__(
+        self,
+        *,
+        script_config: Any,
+        runtime: Any,
+        append_log: Callable[[str], None],
+        script_id: str = "",
+        user_id: str = "",
+    ) -> None:
+        self.script_config = script_config
+        self.runtime = runtime
+        self._append_log = append_log
+        # 云平台按用户分浏览器 profile，需要知道本切换器服务的是谁。
+        self.script_id = script_id
+        self.user_id = user_id
+        self._last_sra_window_recovery_at: datetime | None = None
+
+    @property
+    def cloud(self) -> bool:
+        return is_cloud_platform(self.script_config)
+
+    async def ensure_cloud_browser(
+        self, *, fixed_port: int | None = None
+    ) -> CloudBrowser:
+        """确保**当前用户**的云浏览器在跑：换用户关旧起新，死了就重起。
+
+        同一用户的模块之间浏览器保持不动，下一个三月七进程连回去时已在游戏
+        画面里，不重新登录也不重新排队。连续
+        ``HSR_CLOUD_BROWSER_START_ATTEMPTS`` 次起不来才判失败（不可重试）。
+
+        Args:
+            fixed_port: 直控用：必须用这个调试端口（来自用户的三月七配置，
+                MAS 不改用户配置），被占直接报错；托管时为 None，由 MAS 从
+                9222 起探测空闲端口，再写进本轮三月七 patch。
+        """
+
+        runtime = self.runtime
+        browser: CloudBrowser | None = runtime.cloud_browser
+        if browser is not None and (
+            browser.user_id != self.user_id
+            or (fixed_port is not None and browser.port not in (None, fixed_port))
+        ):
+            self._append_log("切换用户：正在关闭上一个用户的云浏览器")
+            await close_cloud_browser(runtime, self._append_log)
+            browser = None
+
+        if browser is not None and await browser.is_alive():
+            runtime.game_started_by_mas = True
+            return browser
+
+        m7a_root = _script_path(self.script_config, "M7A")
+        # 兜底：上一轮崩溃留下的本脚本云浏览器、三月七启动重试时自建的浏览器
+        # 一律先关，保证起来之后只有一个带三月七标记的浏览器、且是 MAS 的。
+        await cleanup_cloud_leftovers(
+            self._append_log, script_id=self.script_id, include_m7a_started=True
+        )
+        if browser is None:
+            browser = CloudBrowser(
+                m7a_root,
+                resolve_cloud_profile_dir(self.script_id, self.user_id),
+                self.user_id,
+                preferred_port=fixed_port or DEFAULT_DEBUG_PORT,
+                auto_battle=_cloud_auto_battle_enabled(self.script_config),
+            )
+            runtime.cloud_browser = browser
+            self._append_log("正在启动 MAS 托管的云浏览器")
+        else:
+            self._append_log(
+                "检测到云浏览器已退出（三月七启动失败时会自行关闭浏览器），正在重新启动"
+            )
+
+        last_error: Exception | None = None
+        for attempt in range(1, HSR_CLOUD_BROWSER_START_ATTEMPTS + 1):
+            if fixed_port is not None and not is_port_free(fixed_port):
+                await close_cloud_browser(runtime, self._append_log)
+                raise HSRNonRetryableTaskError(
+                    f"{START_FAILED_MESSAGE}：三月七配置的浏览器调试端口 {fixed_port} "
+                    "已被占用，请在三月七设置中修改浏览器调试端口"
+                )
+            try:
+                await browser.start()
+            except CloudBrowserMissingError as e:
+                await close_cloud_browser(runtime, self._append_log)
+                raise HSRNonRetryableTaskError(str(e)) from e
+            except CloudBrowserError as e:
+                last_error = e
+                self._append_log(f"云浏览器第 {attempt} 次启动失败：{e}")
+                continue
+            if fixed_port is not None and browser.port != fixed_port:
+                await close_cloud_browser(runtime, self._append_log)
+                raise HSRNonRetryableTaskError(
+                    f"{START_FAILED_MESSAGE}：三月七配置的浏览器调试端口 {fixed_port} "
+                    "已被占用，请在三月七设置中修改浏览器调试端口"
+                )
+            self._append_log(f"云浏览器已就绪（调试端口 {browser.port}）")
+            runtime.game_started_by_mas = True
+            return browser
+
+        await close_cloud_browser(runtime, self._append_log)
+        message = str(last_error)
+        if not message.startswith(START_FAILED_MESSAGE):
+            message = f"{START_FAILED_MESSAGE}：{message}"
+        raise HSRNonRetryableTaskError(message)
+
+    async def wait_before_external_script(
+        self,
+        script: str,
+        user_name: str = "",
+        *,
+        track_last_script: bool = True,
+    ) -> None:
+        """SRA/M7A 交替执行前按开关处理游戏切换，避免状态污染。"""
+
+        previous = self.runtime.last_external_script
+        if self.cloud:
+            # 云平台只有三月七，不会发生引擎切换；浏览器存活由模块自己在写
+            # patch 前检查（端口要写进 patch）。
+            previous = None
+        if previous is not None and previous != script:
+            if is_game_management_enabled(self.script_config):
+                self._append_log(
+                    f"外部脚本从{engine_label(previous)}切换到{engine_label(script, right=False)}，"
+                    f"等待 {HSR_SCRIPT_SWITCH_DELAY_SECONDS}s 后重启游戏"
+                )
+                await asyncio.sleep(HSR_SCRIPT_SWITCH_DELAY_SECONDS)
+                # 切换时由 MAS 关闭并重新拉起游戏，避免上一个脚本遗留的页面
+                # 状态导致下一个脚本无法初始化（例如 SRA 找不到 enter.png）。
+                await self._restart_game_after_script_switch(user_name)
+            else:
+                self._append_log(
+                    f"外部脚本从{engine_label(previous)}切换到{engine_label(script, right=False)}，"
+                    "MAS 未管理游戏，跳过游戏重启"
+                )
+        if track_last_script:
+            self.runtime.last_external_script = script
+        if script == "M7A":
+            self.runtime.game_session_clean = False
+
+    async def _restart_game_after_script_switch(self, user_name: str) -> None:
+        """M7A/SRA 切换时由 MAS 关闭并重新启动游戏。"""
+
+        if not is_game_management_enabled(self.script_config):
+            self.runtime.last_external_script = None
+            self._append_log(
+                f"用户「{user_name}」外部脚本切换，MAS 未管理游戏，跳过游戏重启"
+            )
+            return
+
+        game_exe_path = resolve_game_executable_path(self.script_config)
+        process_name = HSR_GAME_PROCESS_NAME
+
+        self._append_log(
+            f"用户「{user_name}」外部脚本切换，正在由 MAS 关闭并重新启动游戏"
+        )
+
+        self.runtime.game_exe_path = game_exe_path
+        self.runtime.game_launch_checked = False
+        self.runtime.game_started_by_mas = False
+        self.runtime.game_session_clean = False
+        self.runtime.last_external_script = None
+        self.runtime.game_transitioning = True
+
+        try:
+            await System.kill_process(game_exe_path)
+            await self.runtime.game_process_manager.clear()
+            self._append_log(
+                f"已请求关闭游戏，等待 {HSR_GAME_READY_DELAY_SECONDS}s 后重新启动"
+            )
+            await asyncio.sleep(HSR_GAME_READY_DELAY_SECONDS)
+            if process_name and is_process_running(process_name):
+                self._append_log(
+                    f"等待后仍检测到游戏进程运行（{process_name}），"
+                    "将交由 ensure_game_started_by_mas 继续处理"
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"脚本切换时关闭 HSR 游戏失败：{e}")
+            self._append_log(f"脚本切换时关闭游戏失败：{e}")
+            # 关闭失败不抛错，让 ensure_game_started_by_mas 继续尝试
+
+        try:
+            await self.ensure_game_started_by_mas()
+        finally:
+            self.runtime.game_transitioning = False
+
+    async def ensure_game_started_by_mas(self) -> None:
+        """按开关在 SRA/M7A 接手前准备游戏状态；云平台确保当前用户的浏览器在跑。"""
+
+        if self.cloud:
+            self.runtime.game_launch_checked = True
+            await self.ensure_cloud_browser()
+            return
+
+        if self.runtime.game_launch_checked:
+            return
+        self.runtime.game_launch_checked = True
+
+        if not is_game_management_enabled(self.script_config):
+            self.runtime.game_started_by_mas = False
+            self.runtime.game_transitioning = False
+            self._append_log("MAS 未管理游戏，跳过游戏启动、进程检查和窗口前置")
+            return
+
+        game_exe_path = resolve_game_executable_path(self.script_config)
+        self.runtime.game_exe_path = game_exe_path
+        process_name = HSR_GAME_PROCESS_NAME
+        if process_name and is_process_running(process_name):
+            if (
+                _force_resolution_enabled(self.script_config)
+                and self.runtime.game_resolution_override is None
+            ):
+                self._append_log(
+                    "检测到游戏已在运行，本轮不会中途修改分辨率；"
+                    "请关闭游戏后重新执行以应用 1920×1080"
+                )
+            self._append_log(f"检测到游戏进程已在运行（{process_name}），跳过重复启动")
+            await self._wait_after_game_process_detected(process_name)
+            return
+
+        wait_time = max(0, int(self.script_config.get("Game", "WaitTime") or 60))
+
+        if not game_exe_path.exists():
+            raise RuntimeError(f"游戏启动文件不存在：{game_exe_path}")
+
+        prepare_game_resolution_if_needed(
+            self.runtime,
+            self.script_config,
+            self._append_log,
+        )
+
+        self._append_log(f"正在由 MAS 启动游戏：{game_exe_path}")
+        await self.runtime.game_process_manager.open_process(
+            game_exe_path,
+            cwd=game_exe_path.parent,
+        )
+        self.runtime.game_started_by_mas = True
+
+        await self._wait_for_game_process_after_launch(process_name, wait_time)
+
+    async def prepare_game_for_account_switch(self, user_name: str) -> None:
+        """需要切换账号前按开关准备游戏重启链路。
+
+        云平台的「切号」就是换浏览器：关上一个用户的、起本用户的。
+        """
+
+        if self.cloud:
+            self.runtime.game_launch_checked = True
+            self.runtime.game_session_clean = False
+            self.runtime.last_external_script = None
+            self.runtime.game_transitioning = False
+            await self.ensure_cloud_browser()
+            return
+
+        if not is_game_management_enabled(self.script_config):
+            self.runtime.game_launch_checked = True
+            self.runtime.game_started_by_mas = False
+            self.runtime.game_session_clean = False
+            self.runtime.last_external_script = None
+            self.runtime.game_transitioning = False
+            self._append_log(
+                f"用户「{user_name}」需要登录/切号，MAS 未管理游戏，跳过游戏重启"
+            )
+            return
+
+        game_exe_path = resolve_game_executable_path(self.script_config)
+        process_name = HSR_GAME_PROCESS_NAME
+
+        self.runtime.game_exe_path = game_exe_path
+        self.runtime.game_launch_checked = False
+        self.runtime.game_started_by_mas = False
+        self.runtime.game_session_clean = False
+        self.runtime.last_external_script = None
+        self.runtime.game_transitioning = True
+
+        try:
+            if process_name and is_process_running(process_name):
+                self._append_log(
+                    f"用户「{user_name}」需要登录/切号，检测到游戏正在运行，"
+                    f"正在关闭游戏并等待 {HSR_GAME_READY_DELAY_SECONDS}s 后重启"
+                )
+                try:
+                    await System.kill_process(game_exe_path)
+                    await self.runtime.game_process_manager.clear()
+                    await asyncio.sleep(HSR_GAME_READY_DELAY_SECONDS)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"登录/切号前关闭 HSR 游戏失败：{e}")
+                    self._append_log(
+                        f"登录/切号前关闭游戏失败，将继续尝试启动流程：{e}"
+                    )
+
+            await self.ensure_game_started_by_mas()
+        finally:
+            self.runtime.game_transitioning = False
+
+    async def run_sra_task(
+        self,
+        sra_exe_path: Path,
+        task_class: str,
+        temp_path: Path,
+        user_name: str,
+        module_name: str,
+        timeout_seconds: int | None = None,
+        module_key: str = "",
+        track_script_switch: bool = True,
+    ) -> SRACommandResult:
+        """执行一条 SRA 单任务并同步调度台日志。"""
+
+        await self.wait_before_external_script(
+            "SRA",
+            user_name,
+            track_last_script=track_script_switch,
+        )
+        self._append_log(
+            f"用户「{user_name}」开始执行 SRA {module_name}（{task_class}）"
+        )
+        result = await run_sra_single_task(
+            sra_exe_path,
+            task_class,
+            temp_path,
+            timeout=timeout_seconds or 600,
+            process_registry=self.runtime.sra_process_registry,
+            log_callback=self._append_log,
+            output_line_callback=self.recover_game_window_if_screenshot_blocked,
+            module_key=module_key,
+        )
+        if result.success:
+            self._append_log(f"用户「{user_name}」SRA {module_name} 执行完成")
+        else:
+            self._append_log(f"用户「{user_name}」SRA {module_name} 执行失败")
+        return result
+
+    async def run_start_game(
+        self,
+        *,
+        user_config: Any,
+        user_name: str,
+        user_id: str,
+        script_id: str,
+        sra_exe_path: Path,
+        module_key: str,
+        temp_files: list[Path],
+        timeout_seconds: int,
+    ) -> SRACommandResult:
+        """只运行 SRA StartGameTask，用于自动代理前置切号与人工检查。"""
+
+        await self.ensure_game_started_by_mas()
+        start_mode = resolve_sra_start_mode(user_config, user_name)
+        start_cfg = build_sra_start_game_config(
+            self.script_config,
+            user_config,
+            mode=start_mode,
+        )
+        temp_path = write_sra_temp_config(
+            start_cfg,
+            script_id,
+            user_id,
+            module_key,
+        )
+        temp_files.append(temp_path)
+        result = await self.run_sra_task(
+            sra_exe_path,
+            "StartGameTask",
+            temp_path,
+            user_name,
+            "登录/切号",
+            timeout_seconds=timeout_seconds,
+            track_script_switch=False,
+        )
+        self.runtime.game_session_clean = bool(result.success)
+        return result
+
+    async def _wait_after_game_process_detected(self, process_name: str) -> None:
+        if not is_game_management_enabled(self.script_config):
+            return
+
+        self._append_log(
+            f"检测到游戏进程（{process_name}），"
+            f"等待 {HSR_GAME_READY_DELAY_SECONDS}s 后前置游戏窗口"
+        )
+        await asyncio.sleep(HSR_GAME_READY_DELAY_SECONDS)
+        if await self._activate_game_window(process_name):
+            self._append_log(
+                f"游戏窗口已置于前台，等待 {HSR_GAME_FOREGROUND_SETTLE_SECONDS}s "
+                "后启动外部脚本"
+            )
+        else:
+            self._append_log(
+                f"游戏窗口前置失败，等待 {HSR_GAME_FOREGROUND_SETTLE_SECONDS}s "
+                "后仍继续启动外部脚本"
+            )
+        await asyncio.sleep(HSR_GAME_FOREGROUND_SETTLE_SECONDS)
+
+    async def recover_game_window_if_screenshot_blocked(self, line: str) -> None:
+        """外部脚本因窗口不可截图卡住时，尝试重新前置游戏窗口。"""
+
+        if self.cloud or not is_game_management_enabled(self.script_config):
+            return
+        if not has_screenshot_window_unavailable_output(line):
+            return
+
+        now = datetime.now()
+        if (
+            self._last_sra_window_recovery_at is not None
+            and now - self._last_sra_window_recovery_at
+            < timedelta(seconds=HSR_SRA_WINDOW_RECOVERY_MIN_INTERVAL_SECONDS)
+        ):
+            return
+        self._last_sra_window_recovery_at = now
+
+        self._append_log("检测到外部脚本无法截图游戏窗口，正在重新前置游戏窗口")
+        if await self._activate_game_window(HSR_GAME_PROCESS_NAME):
+            self._append_log(
+                f"游戏窗口已重新前置，等待 {HSR_GAME_FOREGROUND_SETTLE_SECONDS}s "
+                "后让外部脚本继续识别"
+            )
+            await asyncio.sleep(HSR_GAME_FOREGROUND_SETTLE_SECONDS)
+        else:
+            self._append_log("重新前置游戏窗口失败，SRA 可能继续等待窗口恢复")
+
+    async def _activate_game_window(self, process_name: str) -> bool:
+        if self.cloud or not is_game_management_enabled(self.script_config):
+            return False
+
+        manager = self.runtime.game_process_manager
+        if manager.main_pid is None or manager.main_hwnd is None:
+            try:
+                await manager.search_process(
+                    ProcessInfo(name=process_name),
+                    5.0,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"定位 HSR 游戏进程窗口失败：{e}")
+                return False
+
+        return await manager.activate_window()
+
+    async def _wait_for_game_process_after_launch(
+        self,
+        process_name: str,
+        wait_time: int,
+        poll_interval: int = 5,
+    ) -> None:
+        if not is_game_management_enabled(self.script_config):
+            return
+        if wait_time <= 0:
+            self._append_log("游戏启动等待时间为 0s，继续执行三月七 / SRA 任务")
+            return
+
+        self._append_log(
+            f"正在等待游戏完成启动，最大启动等待时间 {wait_time}s，"
+            f"每 {poll_interval}s 检查一次进程"
+        )
+        waited = 0
+        while waited < wait_time:
+            sleep_seconds = min(poll_interval, wait_time - waited)
+            await asyncio.sleep(sleep_seconds)
+            waited += sleep_seconds
+            if process_name and is_process_running(process_name):
+                await self._wait_after_game_process_detected(process_name)
+                return
+
+        self._append_log(
+            f"已达到最大启动等待时间 {wait_time}s，继续执行三月七 / SRA 任务"
+        )

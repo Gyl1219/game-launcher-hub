@@ -1,0 +1,202 @@
+#   Copyright © 2025-2026 AUTO-MAS Team
+
+#   This file is part of AUTO-MAS.
+
+#   AUTO-MAS is free software: you can redistribute it and/or modify
+#   it under the terms of the GNU Affero General Public License as
+#   published by the Free Software Foundation, either version 3 of
+#   the License, or (at your option) any later version.
+
+#   AUTO-MAS is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty
+#   of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See
+#   the GNU Affero General Public License for more details.
+
+#   You should have received a copy of the GNU Affero General Public License
+#   along with AUTO-MAS. If not, see <https://www.gnu.org/licenses/>.
+
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Awaitable, Callable, Literal
+
+from app.utils import ProcessManager
+
+from .cloud_browser import CloudBrowser
+from .game_resolution import HSRGameResolutionOverride
+from .log_detect import select_failure_summary_lines
+from .m7a_runtime import M7ARunner
+from .sra_runtime import SRAProcessRegistry
+
+HSRPhase = Literal["daily", "weekly"]
+HSRScriptRunner = Literal["M7A", "SRA"]
+# cloud：云·星穹铁道。不走 SRA StartGame，按「切号」处理——关上一个用户的
+# 云浏览器、起本用户的（每个用户一份 profile，登录态就在里面）。
+HSRLoginMode = Literal["sra_switch", "sra_remembered", "m7a_fallback", "cloud"]
+HSRModuleResultStatus = Literal["completed", "failed", "incomplete", "skipped"]
+
+
+@dataclass(frozen=True)
+class HSRLoginPlan:
+    """HSR 用户本轮进入游戏/登录策略。"""
+
+    mode: HSRLoginMode
+    sra_exe_path: Path
+
+    @property
+    def uses_sra_start_game(self) -> bool:
+        """是否需要在队列中插入 SRA StartGame。"""
+
+        return self.mode in ("sra_switch", "sra_remembered")
+
+    @property
+    def needs_account_switch(self) -> bool:
+        """是否需要按切号流程重启游戏（云平台下是切换云浏览器）。"""
+
+        return self.mode in ("sra_switch", "cloud")
+
+
+@dataclass
+class CompletionWriteback:
+    """真实执行成功后需要写回用户 Data 的完成态"""
+
+    user_id: str
+    user_name: str
+    reason: str
+    fields: list[tuple[str, str, object]]
+
+
+@dataclass
+class HSRModuleResult:
+    """单用户单模块的最终执行结果，用于调度台日志和通知汇总。"""
+
+    user_id: str
+    user_name: str
+    module_key: str
+    module_name: str
+    script: HSRScriptRunner | str
+    status: HSRModuleResultStatus
+    reason: str = ""
+
+
+@dataclass
+class HSRRunItem:
+    """HSR 队列中的一个真实执行项。"""
+
+    user_name: str
+    user_id: str
+    phase: HSRPhase
+    module_key: str
+    module_name: str
+    script: HSRScriptRunner
+    description: str
+    run: Callable[[], Awaitable[object]]
+    on_success: Callable[[object], None] | None = None
+    last_error: str = ""
+    attempts: int = 0
+    # 非 HSRRetryableTaskError 的异常（配置或代码错误）补跑也不会变好，置 False 后
+    # 只记失败、不进补跑队列
+    retryable: bool = True
+
+
+class HSRRetryableTaskError(RuntimeError):
+    """外部脚本已启动但业务执行失败，可在本轮末尾补跑。"""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        result: object | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.result = result
+
+
+class HSRGameExitedError(HSRRetryableTaskError):
+    """游戏进程在外部脚本运行中途退出，当前阶段的剩余模块不应继续。
+
+    继承 ``HSRRetryableTaskError`` 以保持既有的本轮末尾补跑语义；
+    ``_run_queue_items`` 按类型识别它，不靠错误文案匹配。
+    """
+
+
+class HSRNonRetryableTaskError(RuntimeError):
+    """补跑也不会变好的失败：该用户本轮直接判失败，不进 ``RunTimesLimit`` 补跑。
+
+    与 ``HSRRetryableTaskError`` 是兄弟而不是子类：云·星穹铁道的登录超时、
+    排队超时、时长耗尽、云浏览器起不来都属于这一类，补跑只会再等一遍。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        result: object | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.result = result
+
+
+@dataclass
+class HSRRuntimeState:
+    """HSR 单次运行中跨用户共享的外部脚本状态。"""
+
+    log_lines: list[str]
+    completion_writebacks: list[CompletionWriteback]
+    module_results: list[HSRModuleResult] = field(default_factory=list)
+    m7a_runner: M7ARunner | None = None
+    sra_process_registry: SRAProcessRegistry = field(default_factory=SRAProcessRegistry)
+    game_process_manager: ProcessManager = field(default_factory=ProcessManager)
+    game_launch_checked: bool = False
+    game_started_by_mas: bool = False
+    game_exe_path: Path | None = None
+    # 非空表示本次运行已在 Windows 注册表写入临时 1920×1080 覆盖，
+    # final_task 必须在关闭游戏后恢复并清空。
+    game_resolution_override: HSRGameResolutionOverride | None = None
+    last_external_script: HSRScriptRunner | None = None
+    game_session_clean: bool = False
+    game_transitioning: bool = False
+    # 云平台下当前用户的 MAS 托管浏览器；任一时刻只有一个（三月七只认标记不认
+    # 账号），换用户时关旧起新，final_task 全关。
+    cloud_browser: CloudBrowser | None = None
+    # 本轮确认已登录的时刻（user_id → ISO 时间）。运行期脚本配置锁定，等
+    # final_task 解锁后再合并进 Cloud.LastLogin。
+    cloud_login_times: dict[str, str] = field(default_factory=dict)
+    # 本轮已为「需要手动登录」推过通知的用户，同一用户不重复推。
+    cloud_login_notified: set[str] = field(default_factory=set)
+    # 本轮出现过「三月七自建浏览器」的用户：登录态可能落在三月七的临时 profile
+    # 而不是 MAS 的，本轮不写 LastLogin。
+    cloud_login_suppressed: set[str] = field(default_factory=set)
+    # 当前这条三月七命令里是否拦下过它自建浏览器；每条命令开跑前清零。
+    cloud_self_browser_detected: bool = False
+    # 最近一次读到的云游戏剩余时长（user_id → (总, 付费, 免费) 分钟）。
+    cloud_remaining: dict[str, tuple[int, int, int]] = field(default_factory=dict)
+
+    def record_module_result(self, result: HSRModuleResult) -> None:
+        """记录模块最终态；同一用户同一模块以后写入为准。"""
+
+        self.module_results = [
+            item
+            for item in self.module_results
+            if not (
+                item.user_id == result.user_id and item.module_key == result.module_key
+            )
+        ]
+        self.module_results.append(result)
+
+
+def external_result_failure_summary(result: object) -> str:
+    """提取外部脚本结果中的失败摘要，避免整段日志刷屏。"""
+
+    if result is None:
+        return "未知错误"
+    error = str(getattr(result, "error", "") or "").strip()
+    output = str(getattr(result, "output", "") or "").strip()
+    returncode = getattr(result, "returncode", None)
+    text = error or output
+    if not text and returncode not in (None, 0):
+        text = f"进程退出码：{returncode}"
+    if not text:
+        text = "未知错误"
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return "\n".join(select_failure_summary_lines(lines))

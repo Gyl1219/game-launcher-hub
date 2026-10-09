@@ -1,0 +1,1535 @@
+#   AUTO-MAS: A Multi-Script, Multi-Config Management and Automation Software
+#   Copyright © 2024-2025 DLmaster361
+#   Copyright © 2025-2026 AUTO-MAS Team
+
+#   This file is part of AUTO-MAS.
+
+#   AUTO-MAS is free software: you can redistribute it and/or modify
+#   it under the terms of the GNU Affero General Public License as
+#   published by the Free Software Foundation, either version 3 of
+#   the License, or (at your option) any later version.
+
+#   AUTO-MAS is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty
+#   of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See
+#   the GNU Affero General Public License for more details.
+
+#   You should have received a copy of the GNU Affero General Public License
+#   along with AUTO-MAS. If not, see <https://www.gnu.org/licenses/>.
+
+#   Contact: DLmaster_361@163.com
+
+
+import asyncio
+import shutil
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from app.core import Config
+from app.core.ws import Publisher, protocol
+from app.models.config import HSRConfig, HSRUserConfig
+from app.models.ConfigBase import MultipleConfig
+from app.models.schema import WSTaskNoticeData
+from app.models.task import LogRecord, ScriptItem, TaskExecuteBase, UserItem
+from app.utils import get_logger
+from app.utils.constants import TASK_MODE_ZH, UTC4
+from app.utils.io import atomic_write, replace_dir
+from app.utils.platform import is_admin
+
+from .AutoProxy import HSRAutoProxyTask, resolve_daily_native_modes
+from .task_mapping import (
+    HSR_TASK_MODULES,
+    engine_label,
+    engine_list,
+    resolve_script_assignment,
+    script_supports,
+)
+from .tools import push_notification
+from .tools.account_switch import (
+    HSRAccountSwitcher,
+    check_cloud_prerequisites,
+    check_user_credentials,
+    close_game_if_needed,
+    cloud_max_queue_minutes,
+    is_cloud_platform,
+    is_game_management_enabled,
+    merge_cloud_last_login,
+    resolve_game_executable_path,
+    restore_game_resolution_if_needed,
+    stop_external_processes,
+    user_needs_account_switch,
+)
+from .tools.backup_archive import archive_native_backup
+from .tools.cloud_browser import DEFAULT_DEBUG_PORT, is_port_free
+from .tools.external_locks import (
+    HSRExternalPathLockLease,
+    acquire_external_path_locks,
+    resolve_external_lock_paths,
+)
+from .tools.extra_script import run_script_after_task, run_script_before_task
+from .tools.m7a_config import load_m7a_native_config, load_m7a_yaml
+from .tools.managed_config import list_managed_modules
+from .tools.native_control import (
+    native_provider,
+    resolve_configured_engines,
+    resolve_plan,
+    resolve_script_path,
+    resolve_user_control,
+)
+from .tools.run_model import CompletionWriteback, HSRRuntimeState
+from .tools.sra_runtime import (
+    disable_sra_windows_notifications,
+    get_sra_app_data_dir,
+    load_sra_native_config,
+    resolve_sra_profile_selection,
+    sra_cloud_game_enabled,
+)
+from .tools.stage_runtime import resolve_configured_daily_stages
+
+logger = get_logger("HSR 调度器")
+
+METHOD_BOOK: dict[str, type[HSRAutoProxyTask]] = {
+    "AutoProxy": HSRAutoProxyTask,
+}
+
+_M7A_CONFIG_LABEL = "三月七 config.yaml"
+"""外部配置备份表里三月七 config.yaml 的标签：进日志，也是直控前单独还原它的判据。"""
+
+
+def _remove_path(path: Path) -> None:
+    """删除文件或目录，供原子恢复前清理临时路径。"""
+
+    if path.is_dir():
+        shutil.rmtree(path, ignore_errors=True)
+    elif path.exists():
+        path.unlink()
+
+
+def _restore_path_from_backup(label: str, source: Path, backup: Path) -> None:
+    """用 tmp + rename 恢复一个外部配置路径。"""
+
+    if not backup.exists():
+        raise RuntimeError(f"备份路径不存在：{backup}")
+
+    source.parent.mkdir(parents=True, exist_ok=True)
+
+    if backup.is_dir():
+        replace_dir(backup, source)
+    else:
+        _remove_path(source)
+        shutil.copy2(backup, source)
+
+    logger.info(f"{label} 已恢复：{source}")
+
+
+class HSRManager(TaskExecuteBase):
+    """HSR 调度器，管理星穹铁道 M7A/SRA 双脚本任务。"""
+
+    def __init__(self, script_info: ScriptItem):
+        super().__init__()
+
+        if script_info.task_info is None:
+            raise RuntimeError("ScriptItem 未绑定到 TaskItem")
+
+        self.task_info = script_info.task_info
+        self.script_info = script_info
+        self.check_result: str = "-"
+        self.begin_time: str = ""
+        self.crashed: bool = False
+        self.script_config: HSRConfig | None = None
+        self.user_config: MultipleConfig[HSRUserConfig] | None = None
+        # 真实执行成功后的完成态写回队列。执行链路只登记意图，等待 final_task()
+        # 确认整轮正常结束、脚本配置解锁后，再写回真实 UserData。
+        self._completion_writebacks: list[CompletionWriteback] = []
+        self._log_lines: list[str] = []
+        self._runtime: HSRRuntimeState = HSRRuntimeState(
+            log_lines=self._log_lines,
+            completion_writebacks=self._completion_writebacks,
+        )
+        self.temp_path: Path = Path.cwd() / f"data/{self.script_info.script_id}/Temp"
+        self._external_config_targets: list[tuple[str, Path, Path, bool]] = []
+        # 同一上游 M7A/SRA 路径可能被多个 HSR 脚本共享；持有至恢复完成。
+        self._external_path_lock: HSRExternalPathLockLease | None = None
+        # 旧 dev 没有插件 registry；由调度器独占本轮直控会话并在停止时取消。
+        self._direct_sessions: dict[str, Any] = {}
+
+    def _release_external_path_lock(self) -> None:
+        lease = self._external_path_lock
+        self._external_path_lock = None
+        if lease is not None:
+            lease.release()
+
+    def _backup_external_configs(self) -> None:
+        """运行前备份 M7A/SRA 的真实配置文件。"""
+
+        if self.script_config is None:
+            return
+
+        backup_root = self.temp_path / "ExternalConfig"
+        shutil.rmtree(backup_root, ignore_errors=True)
+        backup_root.mkdir(parents=True, exist_ok=True)
+        self._external_config_targets = []
+
+        def backup_path(label: str, source: Path, backup: Path) -> None:
+            existed = source.exists()
+            self._external_config_targets.append((label, source, backup, existed))
+            if not existed:
+                logger.info(f"{label} 原配置不存在，记录为缺失：{source}")
+                return
+
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            if source.is_dir():
+                shutil.copytree(source, backup, dirs_exist_ok=True)
+            elif source.is_file():
+                shutil.copy2(source, backup)
+            else:
+                raise RuntimeError(f"{label} 既不是文件也不是目录：{source}")
+            logger.info(f"{label} 已备份：{source} -> {backup}")
+
+        m7a_path = resolve_script_path(self.script_config, "M7A")
+        if m7a_path:
+            backup_path(
+                _M7A_CONFIG_LABEL,
+                Path(str(m7a_path)) / "config.yaml",
+                backup_root / "M7A" / "config.yaml",
+            )
+
+        sra_path = resolve_script_path(self.script_config, "SRA")
+        if sra_path:
+            sra_app_data = get_sra_app_data_dir()
+            backup_path(
+                "SRA settings.json",
+                sra_app_data / "settings.json",
+                backup_root / "SRA" / "settings.json",
+            )
+            backup_path(
+                "SRA cache.json",
+                sra_app_data / "cache.json",
+                backup_root / "SRA" / "cache.json",
+            )
+            backup_path(
+                "SRA configs",
+                sra_app_data / "configs",
+                backup_root / "SRA" / "configs",
+            )
+
+        logger.info(f"HSR 外部配置备份完成，共 {len(self._external_config_targets)} 项")
+
+    def _restore_external_config_targets(self) -> None:
+        """运行后恢复 M7A/SRA 配置，并清理备份目录。"""
+
+        targets = list(self._external_config_targets)
+        if not targets:
+            return
+
+        errors: list[str] = []
+        for label, source, backup, existed in reversed(targets):
+            try:
+                if not existed:
+                    if source.is_dir():
+                        shutil.rmtree(source, ignore_errors=True)
+                    elif source.exists():
+                        source.unlink()
+                    logger.info(f"{label} 原配置不存在，已清理任务期新增路径：{source}")
+                    continue
+
+                _restore_path_from_backup(label, source, backup)
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"{label}: {e}")
+                logger.opt(exception=True).warning(
+                    f"恢复 HSR 外部配置失败：{label}: {e}"
+                )
+
+        shutil.rmtree(self.temp_path / "ExternalConfig", ignore_errors=True)
+        try:
+            if self.temp_path.exists() and not any(self.temp_path.iterdir()):
+                self.temp_path.rmdir()
+        except OSError:
+            pass
+
+        self._external_config_targets = []
+        if errors:
+            raise RuntimeError("；".join(errors))
+
+        logger.info("HSR 外部配置已恢复")
+
+    async def _rollback_pending_updates(self) -> None:
+        """收拾上一轮崩在中途的外部脚本更新。
+
+        只读 journal、只动改名，不联网。放在拿到路径锁之后、备份外部配置之前：
+        备份要拿到的是回滚之后的稳定状态。
+        """
+
+        from app.task.HSR.tools.update import rollback_pending
+
+        for engine in ("M7A", "SRA"):
+            root = resolve_script_path(self.script_config, engine)
+            if not root:
+                continue
+            try:
+                await rollback_pending(Path(root), send_log=self._append_log)
+            except Exception as e:  # noqa: BLE001 - 回滚失败不该挡住任务启动
+                name = engine_label(engine, left=False)
+                logger.opt(exception=True).warning(
+                    f"HSR 更新：回滚{engine_label(engine)}残留失败"
+                )
+                self._append_log(f"{name}未完成更新的回滚失败，将按现状继续：{e}")
+
+    def _update_aborted(self) -> bool:
+        """用户是否已经要求停止——下载途中每收一块问一次。
+
+        收尾期的更新跑在 ``asyncio.shield`` 里（``models/task.py`` 的
+        ``_execute_task``），取消传不进来：``stopped_manually`` 只覆盖「停止落在
+        主任务里」，而停止落在更新途中时唯一的痕迹是根任务已经被取消。两个都
+        看，才不至于让用户按了停止还要等一个几百 MB 的下载走完、期间外部目录锁
+        一直被占着。
+        """
+
+        if self.stopped_manually:
+            return True
+        task_item = self.task_info
+        root_task = getattr(task_item, "task", None) if task_item else None
+        return bool(root_task is not None and root_task.cancelled())
+
+    async def _update_external_scripts(self) -> str | None:
+        """本轮正常跑完后更新外部脚本。返回非空字符串表示应判为异常。
+
+        更新失败本身不算任务失败——按现有版本继续跑就是了。只有目录真的被改
+        坏（回滚也失败）才必须让脚本进异常态，否则下一轮会在半坏的目录上反复
+        跑。
+        """
+
+        script_config = self.script_config
+        if script_config is None:
+            return None
+        if str(script_config.get("Update", "AutoUpdateMode") or "Off") != "AfterRun":
+            return None
+        # 取消或已经出错的这一轮不动目录：收尾期最不该起一个几百 MB 的下载。
+        # `stopped_manually` 是基类在任何 CancelledError 上置的（models/task.py），
+        # 且置于 final_task 之前，比只看 `crashed` 气密——HSR 只在用户循环里置
+        # `crashed`，取消若落在 check() 通过之后、用户循环开始之前就会漏掉。
+        if self.stopped_manually or self.crashed or self.check_result != "Pass":
+            return None
+
+        from app.task.HSR.tools.update import update_engine_if_needed
+
+        channel = str(script_config.get("Update", "Channel") or "stable")
+        cdk = str(script_config.get("Update", "MirrorChyanCDK") or "")
+        # 与 MaaFW 更新缓存同一口径：下载包落 MAS 数据目录，不落安装卷。
+        download_dir = Path.cwd() / "data" / "hsr_update"
+
+        blocking: list[str] = []
+        for engine in ("M7A", "SRA"):
+            if self._update_aborted():
+                break
+            root = resolve_script_path(script_config, engine)
+            if not root:
+                continue
+            source = str(script_config.get("Update", f"{engine}Source") or "")
+            try:
+                outcome = await update_engine_if_needed(
+                    engine,
+                    Path(root),
+                    source=source,
+                    channel=channel,
+                    cdk=cdk,
+                    proxy=Config.proxy,
+                    download_dir=download_dir,
+                    send_log=self._append_log,
+                    should_abort=self._update_aborted,
+                )
+            except Exception as e:  # noqa: BLE001 - 更新绝不能拖垮任务收尾
+                name = engine_label(engine, left=False)
+                logger.opt(exception=True).warning(f"HSR 更新：{name}更新时出错")
+                self._append_log(f"{name}更新异常，按现有版本继续：{e}")
+                continue
+            if outcome.blocking:
+                blocking.append(outcome.message)
+
+        return "；".join(blocking) if blocking else None
+
+    def _append_log(self, message: str, *, max_lines: int = 500) -> None:
+        """向调度台日志追加一行 HSR 运行信息。"""
+
+        text = str(message).strip()
+        if not text:
+            return
+        # 日志行时间戳跟随用户本机时区；HSR 之外的专项都用本地时间，
+        # 这里曾硬编码 UTC+8，非中国时区的用户看到的每一行都是偏的。
+        # 注意别把周常重置日、历战余响开始日那几处一起改掉，那些是游戏服务器
+        # 日期语义，用 UTC+4 表达（服务器周一 04:00 重置 = UTC+4 零点）。
+        now_text = datetime.now().astimezone().strftime("%H:%M:%S")
+        for line in text.splitlines():
+            line = line.strip()
+            if line:
+                formatted = f"[{now_text}] {line}"
+                self._log_lines.append(formatted)
+        if len(self._log_lines) > max_lines:
+            dropped_lines = len(self._log_lines) - max_lines
+            del self._log_lines[:-max_lines]
+            self.script_info.log_first_line += dropped_lines
+        self.script_info.log = "\n".join(self._log_lines)
+
+    async def _stop_external_processes(self) -> None:
+        """停止当前仍在运行的 SRA/M7A 子进程。"""
+
+        for engine, session in reversed(list(self._direct_sessions.items())):
+            try:
+                await session.cancel()
+            except Exception as exc:  # noqa: BLE001
+                message = (
+                    f"终止 HSR {engine_label(engine, left=False)}直控会话失败：{exc}"
+                )
+                logger.warning(message)
+                self._append_log(message)
+
+        await stop_external_processes(
+            self._runtime,
+            self._append_log,
+            self.script_config,
+        )
+
+    async def _close_game_if_needed(self) -> None:
+        """任务结束后关闭由 MAS 本次启动的游戏。"""
+
+        if not isinstance(self.script_config, HSRConfig):
+            return
+
+        await close_game_if_needed(
+            self._runtime,
+            self.script_config,
+            self._append_log,
+            script_id=self.script_info.script_id,
+        )
+
+    async def check(self) -> str:
+        """校验 HSR 配置是否可用，返回 'Pass' 或错误描述"""
+
+        if self.task_info.mode not in METHOD_BOOK:
+            return "HSR 暂不支持该任务模式，请检查任务配置"
+
+        script_id = uuid.UUID(self.script_info.script_id)
+        if script_id not in Config.ScriptConfig:
+            return "脚本配置不存在，可能已被删除"
+
+        script_config = Config.ScriptConfig[script_id]
+        if not isinstance(script_config, HSRConfig):
+            return "脚本配置类型错误，不是 HSR 脚本类型"
+
+        cloud = is_cloud_platform(script_config)
+        # 云平台没有本地客户端，「MAS 管理游戏」只对客户端有意义。
+        game_management_enabled = (
+            is_game_management_enabled(script_config) and not cloud
+        )
+
+        m7a_path = resolve_script_path(script_config, "M7A")
+        sra_path = resolve_script_path(script_config, "SRA")
+        effective_engines = resolve_configured_engines(script_config)
+
+        if cloud:
+            cloud_error = self._check_cloud_prerequisites(script_config)
+            if cloud_error:
+                return cloud_error
+        elif not m7a_path and not sra_path:
+            return "未配置任何脚本路径，请至少填写三月七或 SRA 路径"
+
+        for module in HSR_TASK_MODULES:
+            raw_assigned = script_config._config_item_index["TaskMapping"][
+                module.key
+            ].value
+            if not script_supports(module.key, raw_assigned):
+                return (
+                    f"模块「{module.name}」的分配脚本 '{raw_assigned}' "
+                    f"不被该模块支持（仅支持：{engine_list(module.supported_scripts)}）"
+                )
+
+        m7a_available = False
+        sra_available = False
+
+        if m7a_path:
+            m7a_exe = Path(m7a_path) / "March7th Assistant.exe"
+            if not m7a_exe.exists():
+                return f"三月七路径中未找到 March7th Assistant.exe：{m7a_exe}"
+            m7a_available = True
+
+        # 云平台不用 SRA：SRA 路径有没有、可不可用都不影响。
+        if sra_path and not cloud:
+            sra_exe = Path(sra_path) / "SRA-cli.exe"
+            if not sra_exe.exists():
+                return f"SRA 路径中未找到 SRA-cli.exe：{sra_exe}"
+            sra_available = True
+
+        has_executable_user = False
+        has_direct_user = False
+        m7a_needed = False
+        sra_needed = False
+        managed_user_count = 0
+        managed_users_with_credentials = 0
+        # 直控用户共用同一份三月七 config.yaml，原生云模式的提示只说一次。
+        m7a_native_cloud_warned = False
+        enabled_module_keys: set[str] = set()
+        # (计划, 用户配置, 用户名, 体力模块实际执行引擎)；关卡预检放到原生配置
+        # 可用性确认之后再做，免得把「配置文件不存在」这种更根本的问题盖住。
+        daily_stage_checks: list[tuple[Any, HSRUserConfig, str, str]] = []
+
+        for uid, user_config in script_config.UserData.items():
+            if not user_config.get("Info", "Status"):
+                continue
+            if user_config.get("Info", "RemainedDay") == 0:
+                continue
+            # 预检结论要和本轮真正会跑的用户对齐：单独运行指定用户时，别让其他
+            # 用户的直控前置条件、引擎需求与托管账号数把这一个用户拦下来。
+            if not self.task_info.is_target_user(str(uid)):
+                continue
+            has_executable_user = True
+
+            control = resolve_user_control(user_config, script_config=script_config)
+            user_name = str(user_config.get("Info", "Name") or uid)
+            if control.mode == "direct":
+                has_direct_user = True
+                if self.task_info.mode != "AutoProxy":
+                    return f"用户「{user_name}」启用了脚本直控，但直控仅支持自动代理"
+                if cloud and "SRA" in control.engines:
+                    return (
+                        f"用户「{user_name}」启用了 SRA 直控，"
+                        "云·星穹铁道不支持 SRA 直控，请改用三月七直控"
+                    )
+                if not control.engines:
+                    return f"用户「{user_name}」尚未启用任何直控脚本"
+                for engine in control.engines:
+                    # 直控直接跑脚本当前的原生配置：CLI/Assistant 可执行与
+                    # 原生配置文件都是硬条件。
+                    script_root = resolve_script_path(script_config, engine)
+                    label = engine_label(engine, left=False)
+                    unavailable = f"用户「{user_name}」{label}直控不可用："
+                    if not script_root:
+                        return f"{unavailable}未配置原生脚本路径"
+                    executable = Path(script_root) / (
+                        "SRA-cli.exe" if engine == "SRA" else "March7th Assistant.exe"
+                    )
+                    if not executable.is_file():
+                        return f"{unavailable}原生执行文件不存在：{executable}"
+                    native_config = native_provider(engine).native_config_path(
+                        script_config
+                    )
+                    if not native_config.is_file():
+                        return (
+                            f"{unavailable}{label}原生配置不存在：{native_config}，"
+                            f"请先在{engine_label(engine)}中保存一次设置"
+                        )
+                if (
+                    not cloud
+                    and "M7A" in control.engines
+                    and not m7a_native_cloud_warned
+                ):
+                    m7a_native_cloud_warned = self._warn_m7a_native_cloud_game(
+                        script_config
+                    )
+                if cloud:
+                    # 直控不改用户配置：云浏览器必须开在三月七自己配置的调试端口上。
+                    port = self._m7a_direct_debug_port(script_config)
+                    if not is_port_free(port):
+                        return (
+                            f"用户「{user_name}」三月七直控不可用：三月七配置的浏览器"
+                            f"调试端口 {port} 已被占用，请在三月七设置中修改"
+                        )
+                # 直控由脚本原生配置承载完整计划，跳过 MAS 模块队列和凭证检查。
+                continue
+
+            managed_user_count += 1
+            if user_needs_account_switch(user_config):
+                managed_users_with_credentials += 1
+
+            # 任务开关、副本与引擎分配读计划（脚本来源 = 脚本配置上的共享计划），
+            # 账号与完成态仍读用户配置。
+            plan = resolve_plan(user_config, script_config)
+            for module in HSR_TASK_MODULES:
+                if plan.get("TaskSwitch", module.key):
+                    enabled_module_keys.add(module.key)
+                    assigned = resolve_script_assignment(
+                        module,
+                        script_config,
+                        user_config=plan,
+                        effective_engines=effective_engines,
+                    )
+                    if module.key == "Daily":
+                        daily_stage_checks.append(
+                            (plan, user_config, user_name, assigned)
+                        )
+                    if assigned == "SRA":
+                        sra_needed = True
+                    if assigned == "M7A":
+                        m7a_needed = True
+                    if assigned == "M7A" and not m7a_available:
+                        return f"用户「{user_name}」模块「{module.name}」分配给了三月七，但三月七路径不可用"
+                    if assigned == "SRA" and not sra_available:
+                        return f"用户「{user_name}」模块「{module.name}」分配给了 SRA，但 SRA 路径不可用"
+
+        if not has_executable_user:
+            return "未找到任何可执行用户，请确保至少有一个启用且剩余天数不为 0 的用户"
+
+        # 后端未提权时：MAS 起游戏会 WinError 740，直接拦下；不管游戏时只提示，
+        # SRA 带 --no-admin 原地继续，三月七会另起提权进程并被判为失败。
+        # 云平台不起本地客户端，只提示。
+        if not is_admin():
+            if game_management_enabled:
+                return (
+                    "AUTO-MAS 未以管理员身份运行，无法由 MAS 启动游戏；"
+                    "请以管理员身份运行 AUTO-MAS，或在脚本设置中关闭「MAS 管理游戏」"
+                )
+            logger.warning("AUTO-MAS 未以管理员身份运行，HSR 外部脚本可能无法正常执行")
+            self._append_log(
+                "AUTO-MAS 未以管理员身份运行：SRA 将以非管理员身份继续，"
+                "三月七会另起提权进程、脱离 MAS 跟踪并被判为失败；"
+                "建议以管理员身份运行 AUTO-MAS"
+            )
+
+        if game_management_enabled and (enabled_module_keys or has_direct_user):
+            if not str(script_config.get("Game", "Path") or "").strip():
+                return "请设置游戏路径"
+            game_exe_path = resolve_game_executable_path(script_config)
+            if not game_exe_path.exists():
+                return f"游戏启动文件不存在：{game_exe_path}"
+
+        # 切号只能通过 SRA StartGame 完成（M7A 原生配置里不写账号密码）。
+        # 缺少 SRA 路径时 _build_login_plan 会直接回落到 m7a_fallback，队列里
+        # 不再插入 StartGame，而游戏已在运行时启动环节又会跳过——于是切号被
+        # 静默跳过，多个用户全跑在同一个已登录账号上，还各自写回完成态。
+        # 只在确实配了账密时才管：没配账密的用户本来就依赖当前登录态，
+        # 有没有 SRA 都是同一个账号，不该被这条拦住。
+        # 云平台按用户分浏览器 profile，切号不经 SRA，不适用。
+        if not cloud and not sra_available and managed_users_with_credentials:
+            if managed_user_count > 1:
+                return (
+                    f"有 {managed_users_with_credentials} 个启用的托管用户配置了账号密码，"
+                    "但未配置 SRA 路径。切换账号只能通过 SRA 完成，"
+                    "否则所有用户都会跑在同一个已登录账号上。"
+                    "请填写 SRA 路径，或只保留一个启用的托管用户"
+                )
+            self._append_log(
+                "未配置 SRA 路径，本轮不会登录到所填账号，"
+                "将直接使用游戏当前已登录的账号"
+            )
+
+        try:
+            if m7a_needed:
+                load_m7a_native_config(script_config)
+            if sra_needed:
+                # 脚本配置的档案不存在时 resolve 会静默回退；运行日志里要说清。
+                profile = resolve_sra_profile_selection(script_config)
+                if profile.fallback and profile.fallback_reason:
+                    self._append_log(profile.fallback_reason)
+                load_sra_native_config(script_config)
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            return f"HSR 原生配置不可用：{exc}"
+
+        # 以下两条只提示不阻断：MAS 不按次改写 SRA 的云游戏开关，也不接管三月七
+        # 自己保存的账号。
+        if sra_available and sra_cloud_game_enabled():
+            self._append_log(
+                "SRA 设置中开启了云游戏，SRA 任务将运行云·星穹铁道而不是本地客户端；"
+                "如需本地运行，请在 SRA 设置中关闭云游戏"
+            )
+        if not cloud and m7a_available and managed_users_with_credentials:
+            accounts_dir = Path(m7a_path) / "settings" / "accounts"
+            try:
+                has_m7a_accounts = accounts_dir.is_dir() and any(accounts_dir.iterdir())
+            except OSError:
+                has_m7a_accounts = False
+            if has_m7a_accounts:
+                self._append_log(
+                    "三月七内置账号管理与 MAS 切号可能互相覆盖，建议二选一"
+                    f"（三月七已保存账号：{accounts_dir}）"
+                )
+
+        # 脚本来源用户共用一份计划，同一条「未选择副本」提示只记一次。
+        precheck_seen: set[str] = set()
+        for plan, user_config, user_name, assigned in daily_stage_checks:
+            self._precheck_daily_stages(
+                script_config,
+                plan,
+                user_config,
+                user_name,
+                assigned,
+                seen=precheck_seen,
+            )
+
+        if sra_available:
+            return self._validate_sra_user_credentials(script_config)
+
+        return "Pass"
+
+    @staticmethod
+    def _check_cloud_prerequisites(script_config: HSRConfig) -> str:
+        """云·星穹铁道的脚本级前置；通过返回空串。"""
+
+        return check_cloud_prerequisites(script_config)
+
+    def _warn_m7a_native_cloud_game(self, script_config: HSRConfig) -> bool:
+        """客户端平台 + 三月七直控，而三月七自己开了云游戏：只提示，不报错。
+
+        直控不钉云开关、尊重三月七的配置，这是上游一直支持的用法；这里建议改用
+        云·星穹铁道平台，由 MAS 托管浏览器并按用户隔离登录。返回是否提示过。
+        """
+
+        try:
+            value = load_m7a_native_config(script_config).get("cloud_game_enable")
+        except (FileNotFoundError, OSError, ValueError):
+            return False
+        if not (value is True or str(value).strip().lower() in ("true", "1")):
+            return False
+        message = (
+            "三月七设置里开了云游戏，本轮按三月七自己的云模式运行；"
+            "建议把游戏平台改为云·星穹铁道，由 MAS 托管浏览器并按用户隔离登录"
+            "（首次需重新登录一次）"
+        )
+        if is_game_management_enabled(script_config):
+            message += "。MAS 仍会启动游戏客户端，建议关闭 MAS 管理游戏"
+        self._append_log(message)
+        return True
+
+    @staticmethod
+    def _m7a_direct_debug_port(script_config: HSRConfig) -> int:
+        """直控读三月七自己配置的浏览器调试端口（缺省 9222），MAS 不改它。"""
+
+        try:
+            value = load_m7a_native_config(script_config).get("browser_debug_port")
+            return int(value) if value else DEFAULT_DEBUG_PORT
+        except (FileNotFoundError, OSError, ValueError, TypeError):
+            return DEFAULT_DEBUG_PORT
+
+    def _precheck_daily_stages(
+        self,
+        script_config: HSRConfig,
+        plan: Any,
+        user_config: HSRUserConfig,
+        user_name: str,
+        assigned: str,
+        *,
+        seen: set[str] | None = None,
+    ) -> None:
+        """把体力模块「引擎名下没配关卡」的跳过判定提前到预检，只提示不阻断。
+
+        口径与 ``HSRAutoProxyTask._resolve_daily_runnable_parts`` 完全一致：
+        SRA 开了「使用培养目标」或活动双倍、M7A 开了培养目标或任一活动时，副本由
+        脚本自己决定，缺主关卡是正常的，不提示。
+
+        这里刻意只写日志、不返回错误：``TaskSwitch.Daily`` 默认开启，新建用户在配
+        好副本之前天然处于「该引擎下一个关卡都没选」的状态，若据此中止整个任务，
+        一个还没配完的用户会连带让同脚本下其他用户全部跑不了。用户在编辑页已经
+        能看到「当前引擎下未选择副本」的提示，这里再在开跑前复述一次即可。
+
+        副本、托管值与历战余响开始日读 ``plan``，本周是否已完成读 ``user_config``。
+        脚本来源用户共用一份计划，提示以「脚本共享任务配置」为主语、经 ``seen``
+        去重，免得 N 个用户把同一句话刷 N 遍。
+        """
+
+        engine_name = engine_label(assigned)
+        subject = (
+            "脚本共享任务配置：" if plan is script_config else f"用户「{user_name}」"
+        )
+
+        def log_once(message: str) -> None:
+            if seen is not None:
+                if message in seen:
+                    return
+                seen.add(message)
+            self._append_log(message)
+
+        try:
+            values: dict[str, object] = {}
+            for module in list_managed_modules(assigned, script_config, plan):
+                if module.key == "Daily":
+                    values = {field.key: field.value for field in module.fields}
+                    break
+        except (OSError, ValueError, TypeError):
+            values = {}
+        cultivation_enabled, activity_enabled = resolve_daily_native_modes(
+            assigned, values
+        )
+        main_configured, eow_configured = resolve_configured_daily_stages(
+            plan, assigned
+        )
+        if cultivation_enabled or activity_enabled:
+            main_configured = True
+        daily_eow_enabled, _ = HSRAutoProxyTask._resolve_daily_params(
+            user_config, plan=plan
+        )
+
+        if not main_configured and not eow_configured:
+            log_once(
+                f"{subject}体力模块由{engine_name}执行，"
+                f"但{engine_name}下未选择体力副本和历战余响关卡，体力模块本轮不会执行。"
+                "副本按执行引擎分别保存，切换引擎后需要重新选择；"
+                "或在该引擎中开启「培养目标」由脚本自行决定副本"
+            )
+            return
+        if not main_configured and not daily_eow_enabled:
+            log_once(
+                f"{subject}{engine_label(assigned, left=False)}下未选择体力副本，"
+                "今日不需要历战余响，体力模块将跳过"
+            )
+        if daily_eow_enabled and not eow_configured:
+            log_once(
+                f"{subject}本周需要历战余响，但{engine_name}下未选择"
+                "历战余响关卡，历战余响将跳过"
+            )
+
+    @staticmethod
+    def _is_executable_user(user_config) -> bool:
+        """判断用户是否处于本轮可执行状态。"""
+
+        return (
+            bool(user_config.get("Info", "Status"))
+            and user_config.get("Info", "RemainedDay") != 0
+        )
+
+    def _validate_sra_user_credentials(self, script_config: HSRConfig) -> str:
+        """校验启用用户的 SRA 登录/切号凭证。"""
+
+        for uid, user_config in script_config.UserData.items():
+            if not self._is_executable_user(user_config):
+                continue
+            if not self.task_info.is_target_user(str(uid)):
+                continue
+            if (
+                resolve_user_control(
+                    user_config,
+                    script_config=script_config,
+                ).mode
+                == "direct"
+            ):
+                continue
+            user_name = user_config.get("Info", "Name")
+            result = check_user_credentials(user_config, user_name)
+            if result != "Pass":
+                return result
+
+        return "Pass"
+
+    async def _apply_completion_writebacks(self) -> None:
+        """在配置解锁后，把真实成功的完成态写回用户 Data。"""
+
+        pending = list(self._completion_writebacks)
+        if not pending:
+            return
+
+        script_id = uuid.UUID(self.script_info.script_id)
+        script_config = Config.ScriptConfig[script_id]
+        for item in pending:
+            user_uuid = uuid.UUID(item.user_id)
+            user_config = script_config.UserData[user_uuid]
+            for group, key, value in item.fields:
+                await user_config.set(group, key, value)
+            logger.success(f"用户「{item.user_name}」HSR 完成态已写回：{item.reason}")
+
+        self._completion_writebacks.clear()
+
+    async def _apply_cloud_login_writebacks(self) -> None:
+        """配置解锁后把本轮确认已登录的时间合并进 ``Cloud.LastLogin``。
+
+        只是给界面看的记录，写失败只记日志，不影响任务结果。
+        """
+
+        pending = dict(self._runtime.cloud_login_times)
+        if not pending:
+            return
+        script_id = uuid.UUID(self.script_info.script_id)
+        if script_id not in Config.ScriptConfig:
+            return
+        try:
+            await merge_cloud_last_login(Config.ScriptConfig[script_id], pending)
+        except Exception as e:  # noqa: BLE001
+            logger.opt(exception=True).warning(f"云·星穹铁道登录时间写回失败：{e}")
+            self._append_log(f"云·星穹铁道登录时间写回失败：{e}")
+            return
+        self._runtime.cloud_login_times.clear()
+        logger.info(f"云·星穹铁道登录时间已写回：{sorted(pending)}")
+
+    async def prepare(self):
+        """锁定配置、加载用户列表（不启动外部程序）"""
+
+        script_id = uuid.UUID(self.script_info.script_id)
+        await Config.ScriptConfig[script_id].lock()
+        self.script_config = Config.ScriptConfig[script_id]
+        self.user_config = MultipleConfig([HSRUserConfig])
+        await self.user_config.load(
+            await self.script_config.UserData.toDict(if_decrypt=False)
+        )
+
+        logger.success(f"{self.script_info.script_id} 已锁定，HSR 配置提取完成")
+
+        try:
+            external_paths = resolve_external_lock_paths(
+                self.script_config,
+                ("SRA", "M7A"),
+            )
+            self._external_path_lock = await acquire_external_path_locks(
+                external_paths,
+                wait=False,
+            )
+            self._append_log("HSR 外部脚本目录运行锁已获取")
+
+            await self._rollback_pending_updates()
+            self._backup_external_configs()
+            self._append_log("HSR 外部脚本配置已备份")
+            # 运行前归档两引擎原生配置到持久池（运行会写托管字段、结束按运行期
+            # 备份清单还原，崩溃残留会污染；持久归档提供跨会话找回。指纹去重，
+            # 失败不阻断任务）
+            m7a_root = resolve_script_path(self.script_config, "M7A")
+            try:
+                archive_native_backup(
+                    Path(m7a_root) if m7a_root else None,
+                    get_sra_app_data_dir(),
+                )
+            except Exception:
+                logger.opt(exception=True).warning(
+                    "HSR 运行前原生配置归档失败，已跳过（不阻断任务）"
+                )
+            if resolve_script_path(self.script_config, "SRA"):
+                try:
+                    disable_sra_windows_notifications()
+                    self._append_log("已确认 SRA 本体 Windows 系统通知在本轮为关闭状态")
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"SRA 本体 Windows 通知关闭失败：{e}")
+                    self._append_log(f"SRA 本体 Windows 通知关闭失败，将继续执行：{e}")
+        except BaseException:
+            # 若备份已登记目标，交给 final_task 在恢复后释放；否则没有
+            # 关键区需要收尾，可以立即释放空/已获取的 lease。
+            if not self._external_config_targets:
+                self._release_external_path_lock()
+            raise
+
+        self.script_info.user_list = [
+            UserItem(
+                user_id=str(uid),
+                name=config.get("Info", "Name"),
+                status="等待",
+            )
+            for uid, config in self.user_config.items()
+            if config.get("Info", "Status")
+            and config.get("Info", "RemainedDay") != 0
+            and self.task_info.is_target_user(str(uid))
+        ]
+        logger.info(
+            f"HSR 用户列表加载完成，已筛选用户数：{len(self.script_info.user_list)}"
+        )
+        self._append_log(
+            f"HSR 配置已加载，可执行用户数：{len(self.script_info.user_list)}"
+        )
+
+    async def main_task(self):
+        """主任务入口。"""
+
+        self._append_log("开始 HSR 配置检查")
+        self.check_result = await self.check()
+        if self.check_result != "Pass":
+            logger.warning(f"HSR 配置检查未通过：{self.check_result}")
+            self._append_log(f"HSR 配置检查未通过：{self.check_result}")
+            await Publisher.send(
+                id=self.task_info.task_id,
+                type=protocol.TASK_NOTICE,
+                data=WSTaskNoticeData(level="error", message=self.check_result),
+            )
+            return
+
+        self.begin_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        await self.prepare()
+
+        if not isinstance(self.script_config, HSRConfig) or self.user_config is None:
+            raise RuntimeError("脚本配置类型错误，不是 HSR 脚本类型")
+
+        if not self.script_info.user_list:
+            logger.warning("HSR 无可用用户，跳过执行")
+            self._append_log("HSR 无可用用户，跳过执行")
+            self.script_info.status = "完成"
+            return
+
+        task_cls = METHOD_BOOK[self.task_info.mode]
+        steps_count = 0
+        user_errors: list[str] = []
+        try:
+            for user_index, user_item in enumerate(self.script_info.user_list):
+                self.script_info.current_index = user_index
+                proxy = None
+                try:
+                    user_config = self.user_config[uuid.UUID(user_item.user_id)]
+                    control = resolve_user_control(
+                        user_config,
+                        script_config=self.script_config,
+                    )
+                    if control.mode == "direct":
+                        steps_count += await self._run_direct_user(
+                            user_item,
+                            user_config,
+                        )
+                    else:
+                        self._reset_m7a_config_for_managed(user_item.name)
+                        proxy = task_cls(
+                            self.script_info,
+                            self.script_config,
+                            self.user_config,
+                            user_item,
+                            self._runtime,
+                        )
+                        await self.spawn(proxy)
+                        steps_count += getattr(proxy, "steps_count", 0)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    user_item.status = "异常"
+                    if user_item.log_record:
+                        latest_time = max(user_item.log_record)
+                        user_log = user_item.log_record[latest_time]
+                    else:
+                        user_log = LogRecord()
+                        user_item.log_record[datetime.now()] = user_log
+                    user_log.status = f"HSR 执行异常: {e}"
+                    user_log.content.append(str(e))
+                    user_errors.append(f"用户「{user_item.name}」执行异常：{e}")
+                    logger.opt(exception=True).warning(
+                        f"HSR 用户「{user_item.name}」执行异常，继续后续用户：{e}"
+                    )
+                    self._append_log(
+                        f"用户「{user_item.name}」执行异常，继续处理后续用户：{e}"
+                    )
+                    continue
+
+                if proxy is not None and proxy.crashed:
+                    error_message = proxy.error_message or "HSR 用户任务异常"
+                    user_errors.append(
+                        f"用户「{user_item.name}」执行异常：{error_message}"
+                    )
+                    logger.warning(
+                        f"HSR 用户「{user_item.name}」执行异常，继续后续用户："
+                        f"{error_message}"
+                    )
+                    self._append_log(
+                        f"用户「{user_item.name}」执行异常，继续处理后续用户："
+                        f"{error_message}"
+                    )
+        except asyncio.CancelledError:
+            self.crashed = True
+            self._append_log("HSR 任务收到停止请求，正在终止 SRA / 三月七")
+            await self._stop_external_processes()
+            raise
+
+        if user_errors:
+            self._append_log(
+                "HSR 部分用户执行异常，已继续处理后续用户：" + "；".join(user_errors)
+            )
+
+        if self.task_info.mode == "AutoProxy" and steps_count == 0 and not user_errors:
+            logger.info("HSR 无模块需要执行，所有用户跳过")
+            self._append_log("HSR 无模块需要执行，所有用户跳过")
+            self.script_info.status = "完成"
+            return
+
+        logger.info(
+            "HSR 执行计划处理完毕，"
+            f"共 {len(self.script_info.user_list)} 个用户，"
+            f"共 {steps_count} 个步骤"
+        )
+        self._append_log(
+            f"HSR 执行计划处理完成：{len(self.script_info.user_list)} 个用户，"
+            f"{steps_count} 个步骤"
+        )
+
+    async def _run_direct_user(self, user_item: UserItem, user_config: Any) -> int:
+        """按脚本直控运行一个用户。
+
+        直接执行 SRA/M7A 当前的原生配置（见 ``native_control`` 模块说明）。
+        直控只把外部配置交给对应 CLI；MAS 是否管理游戏启停由脚本开关决定，
+        日志、取消和会话收尾始终由 MAS 负责。
+        """
+
+        if self.script_config is None:
+            raise RuntimeError("HSR 脚本配置尚未加载")
+        control = resolve_user_control(user_config, script_config=self.script_config)
+        user_name = str(user_config.get("Info", "Name") or user_item.name)
+        started_at = datetime.now()
+        log_item = LogRecord(status="HSR 脚本直控运行中")
+        user_item.log_record[started_at] = log_item
+        user_item.status = "运行"
+        log_start = len(self._log_lines)
+
+        if "M7A" in control.engines:
+            # 端口（云平台）与收尾动作都要从还原后的原生配置里读，先还原再往下走；
+            # 必须在任务前脚本之前：直控多账号共用一份 config.yaml，按账号改它的
+            # 正是任务前脚本，还原放后面会把它的改动整份盖掉。
+            self._reset_m7a_config_for_direct(user_name)
+
+        # 执行任务前脚本（每用户仅一次）
+        await run_script_before_task(user_config)
+
+        switcher = HSRAccountSwitcher(
+            script_config=self.script_config,
+            runtime=self._runtime,
+            append_log=self._append_log,
+            script_id=self.script_info.script_id,
+            user_id=user_item.user_id,
+        )
+        self._runtime.game_launch_checked = False
+        cloud = is_cloud_platform(self.script_config)
+        if cloud:
+            # 直控 + 云：MAS 照样托管本用户的浏览器，但端口用三月七自己配置的
+            # browser_debug_port（直控不写用户配置）。
+            await switcher.ensure_cloud_browser(
+                fixed_port=self._m7a_direct_debug_port(self.script_config)
+            )
+        else:
+            await switcher.ensure_game_started_by_mas()
+        if cloud:
+            self._append_log(
+                f"用户「{user_name}」进入脚本直控；MAS 托管该用户的云浏览器，"
+                f"三月七按原生配置连接并执行：{engine_list(control.engines)}"
+            )
+        elif is_game_management_enabled(self.script_config):
+            self._append_log(
+                f"用户「{user_name}」进入脚本直控；MAS 负责先启动游戏并跟踪脚本进程，"
+                f"原生配置原样执行：{engine_list(control.engines)}"
+            )
+        else:
+            self._append_log(
+                f"用户「{user_name}」进入脚本直控；MAS 不管理游戏，"
+                f"仅运行原生配置并跟踪脚本进程：{engine_list(control.engines)}"
+            )
+        timeout_seconds = control.timeout_seconds
+        if cloud:
+            # 云·星穹铁道整轮只排一次队，直控加一份排队预算。
+            queue_minutes = cloud_max_queue_minutes(self.script_config)
+            timeout_seconds += queue_minutes * 60
+            self._append_log(
+                f"直控按整份原生配置一次跑完，单个脚本运行上限 "
+                f"{control.timeout_minutes + queue_minutes} 分钟"
+                f"（日常 {control.daily_limit_minutes} + 周常 "
+                f"{control.weekly_limit_minutes} + 云排队 {queue_minutes}），"
+                "超时将终止脚本进程"
+            )
+        else:
+            self._append_log(
+                f"直控按整份原生配置一次跑完，单个脚本运行上限 {control.timeout_minutes} 分钟"
+                f"（日常 {control.daily_limit_minutes} + 周常 {control.weekly_limit_minutes}），"
+                "超时将终止脚本进程"
+            )
+        if "M7A" in control.engines:
+            self._log_ignored_m7a_after_finish()
+
+        summaries: list[str] = []
+        try:
+            for engine in control.engines:
+                # 复用旧脚本切号的等待/切换语义。
+                await switcher.wait_before_external_script(engine, user_name)
+                provider = native_provider(engine)
+                session = await provider.open_direct_session(
+                    script_config=self.script_config,
+                    log=self._append_log,
+                )
+                self._direct_sessions[engine] = session
+                try:
+                    m7a_before_run = (
+                        self._read_m7a_config_bytes() if engine == "M7A" else None
+                    )
+                    result = await session.run(timeout_seconds)
+                    if engine == "M7A":
+                        # 成败都刷新：跑失败时三月七已经写回的状态同样是真实状态。
+                        self._refresh_m7a_backup_after_direct(user_name, m7a_before_run)
+                    if not result.success:
+                        raise RuntimeError(
+                            result.error
+                            or f"{engine_label(engine, left=False)}直控执行失败"
+                        )
+                    summary = (
+                        result.summary
+                        or f"{engine_label(engine, left=False)}直控执行完成"
+                    )
+                    summaries.append(summary)
+                    self._append_log(f"用户「{user_name}」{summary}")
+                except asyncio.CancelledError:
+                    await session.cancel()
+                    raise
+                finally:
+                    try:
+                        await session.close()
+                    finally:
+                        if self._direct_sessions.get(engine) is session:
+                            self._direct_sessions.pop(engine, None)
+        except Exception:
+            user_item.status = "异常"
+            log_item.status = "HSR 脚本直控异常"
+            log_item.content.extend(f"{line}\n" for line in self._log_lines[log_start:])
+            # 执行任务后脚本（每用户仅一次）
+            await run_script_after_task(user_config)
+            raise
+
+        user_item.status = "完成"
+        log_item.status = "HSR 脚本直控完成"
+        log_item.content.extend(f"{line}\n" for line in self._log_lines[log_start:])
+        # 执行任务后脚本（每用户仅一次）
+        await run_script_after_task(user_config)
+        return len(control.engines)
+
+    def _reset_m7a_config_for_direct(self, user_name: str) -> None:
+        """直控前把三月七 config.yaml 还原成本轮开始前的原样。
+
+        托管三月七模块把 MAS 模板字段（副本、奖励开关、关通知、云平台端口等）
+        直接写进真实 config.yaml，整轮结束才按运行期备份还原；三月七自己也会
+        把运行状态（各任务时间戳等）写回同一个文件。同一轮里排在别的用户之后的
+        直控用户不还原，跑的就是上一个用户留下的配置，而不是「原样跑原生配置」。
+        备份在 ``prepare`` 里取，还原不动备份，收尾照常再还原一次。
+        """
+
+        for label, source, backup, existed in self._external_config_targets:
+            if label != _M7A_CONFIG_LABEL or not existed:
+                continue
+            try:
+                _restore_path_from_backup(label, source, backup)
+            except Exception as e:  # noqa: BLE001
+                logger.opt(exception=True).warning(f"直控前还原三月七配置失败：{e}")
+                self._append_log(
+                    f"用户「{user_name}」直控前还原三月七 config.yaml 失败，"
+                    f"将按当前文件运行：{e}"
+                )
+                return
+            self._append_log(
+                f"用户「{user_name}」直控前已把三月七 config.yaml 还原为本轮开始前的原生配置"
+            )
+            return
+
+    def _reset_m7a_config_for_managed(self, user_name: str) -> None:
+        """托管用户开跑前把三月七 config.yaml 还原成本轮运行期备份。
+
+        托管模块的 patch 直接写进真实 config.yaml，而下一个托管用户没在 MAS 里
+        覆盖的字段、活动子开关等「原生值」又从这份文件读——不还原就会继承上一个
+        用户的覆盖值。文件已与备份一致（本轮第一个用户、上一个用户没跑三月七）时
+        不动它。必须在任务前脚本之前（它在托管队列里跑），按账号换整份配置的
+        任务前脚本才不会被这里盖掉。还原失败只记日志，按当前文件继续。
+        """
+
+        target = self._m7a_backup_target()
+        if target is None:
+            return
+        label, source, backup, existed = target
+        if not existed:
+            return
+        try:
+            if source.read_bytes() == backup.read_bytes():
+                return
+            _restore_path_from_backup(label, source, backup)
+        except Exception as e:  # noqa: BLE001
+            logger.opt(exception=True).warning(f"托管用户开跑前还原三月七配置失败：{e}")
+            self._append_log(
+                f"用户「{user_name}」开跑前还原三月七 config.yaml 失败，"
+                f"将在当前文件上继续：{e}"
+            )
+            return
+        logger.info(f"用户「{user_name}」开跑前已把{label}还原为本轮运行期备份")
+
+    def _m7a_backup_target(self) -> tuple[str, Path, Path, bool] | None:
+        """外部配置备份表里三月七 config.yaml 那一项；本轮没备份它时为 None。"""
+
+        for target in self._external_config_targets:
+            if target[0] == _M7A_CONFIG_LABEL:
+                return target
+        return None
+
+    def _read_m7a_config_bytes(self) -> bytes | None:
+        """直控开跑前三月七 config.yaml 的原始字节，读不到时为 None。"""
+
+        target = self._m7a_backup_target()
+        if target is None:
+            return None
+        try:
+            return target[1].read_bytes()
+        except OSError:
+            return None
+
+    def _refresh_m7a_backup_after_direct(
+        self, user_name: str, before_run: bytes | None
+    ) -> None:
+        """直控三月七跑完后，把本轮 config.yaml 的运行期备份刷新为当前文件。
+
+        直控前 :meth:`_reset_m7a_config_for_direct` 已把文件还原成本轮开始前的原生
+        配置，跑完的文件就是「原生配置 + 三月七自己写回的状态」（周常时间戳、
+        体力计划余量、每日实训记录等）。``final_task`` / ``on_crash`` 按备份整轮还原，
+        不刷新的话这些状态每轮都被抹掉，直控用户的周常每轮重进。同一轮后面的托管
+        用户仍在刷新后的文件上打 patch，整轮结束还原回刷新后的备份；后面的直控用户
+        直控前也还原成它。
+
+        只在开跑前的文件与备份逐字节一致时刷新：不一致说明任务前脚本改过它（按账号
+        切换整份配置的用法）或直控前还原失败，这时跑完的文件不是「原生 + 三月七状态」，
+        保持原先的整轮还原语义。刷新失败只记日志，不影响后续用户与收尾。
+        """
+
+        target = self._m7a_backup_target()
+        if target is None:
+            return
+        label, source, backup, existed = target
+        if not existed:
+            return
+        try:
+            if before_run is None or before_run != backup.read_bytes():
+                self._append_log(
+                    f"用户「{user_name}」直控前三月七 config.yaml 与本轮开始前的原生配置"
+                    "不一致（任务前脚本改过或直控前还原失败），不刷新运行期备份，"
+                    "整轮结束仍按本轮开始前的配置还原"
+                )
+                return
+            current = source.read_bytes()
+            # 三月七写配置不是原子写，超时被强杀可能留下截断的文件；只有能解析成
+            # 非空对象才当新备份，否则维持整轮还原，把损坏的文件修回去。
+            try:
+                parsed = load_m7a_yaml(current.decode("utf-8-sig"))
+            except Exception:  # noqa: BLE001
+                parsed = None
+            if not isinstance(parsed, dict) or not parsed:
+                self._append_log(
+                    f"用户「{user_name}」直控后三月七 config.yaml 不是有效配置，"
+                    "不刷新运行期备份，整轮结束按本轮开始前的配置还原"
+                )
+                return
+            atomic_write(backup, current)
+        except Exception as e:  # noqa: BLE001
+            logger.opt(exception=True).warning(f"直控后刷新{label}运行期备份失败：{e}")
+            self._append_log(
+                f"用户「{user_name}」直控后刷新三月七 config.yaml 备份失败，"
+                f"整轮结束将按本轮开始前的配置还原：{e}"
+            )
+            return
+        logger.info(f"{label} 运行期备份已刷新为直控后的文件：{source} -> {backup}")
+        self._append_log(
+            f"用户「{user_name}」直控结束，三月七 config.yaml 的运行期备份已刷新，"
+            "整轮结束保留三月七自己写回的运行状态"
+        )
+
+    def _log_ignored_m7a_after_finish(self) -> None:
+        """直控下三月七的 ``after_finish`` 被运行环境钉成 None，配了别的值就说一声。"""
+
+        try:
+            after_finish = load_m7a_native_config(self.script_config).get(
+                "after_finish"
+            )
+        except (FileNotFoundError, OSError, ValueError):
+            return
+        if after_finish is None or str(after_finish) == "None":
+            return
+        self._append_log(
+            f"本轮忽略三月七的收尾动作（{after_finish}），"
+            "关机/睡眠请用 MAS 的队列完成后操作"
+        )
+
+    async def _persist_user_logs(self) -> None:
+        """将 HSR 用户日志写入历史记录。"""
+
+        for user_item in self.script_info.user_list:
+            for start_time, log_item in user_item.log_record.items():
+                if log_item.status == "HSR 正常运行中":
+                    log_item.status = (
+                        "任务被用户手动中止" if self.crashed else "HSR 任务结束"
+                    )
+                if not log_item.content:
+                    log_item.content = ["未捕获到任何 HSR 日志内容\n"]
+                    if log_item.status in ("未开始监看日志", "HSR 正常运行中"):
+                        log_item.status = "未捕获到日志"
+
+                dt = start_time.astimezone(UTC4)
+                log_path = Config.build_history_log_path(
+                    script_name=self.script_info.name,
+                    user_name=user_item.name,
+                    log_time=dt,
+                )
+                await Config.save_hsr_log(log_path, log_item.content, log_item.status)
+
+    async def _restore_external_configs(self) -> str:
+        """恢复 SRA / M7A 外部配置，返回错误文本或空串。"""
+
+        if not self._external_config_targets:
+            return ""
+
+        try:
+            self._restore_external_config_targets()
+            self._append_log("HSR 外部脚本配置已恢复")
+            return ""
+        except Exception as e:  # noqa: BLE001
+            logger.opt(exception=True).warning(f"HSR 外部脚本配置恢复失败：{e}")
+            self._append_log(f"HSR 外部脚本配置恢复失败：{e}")
+            return f"HSR 外部脚本配置恢复失败：{e}"
+
+    async def _unlock_script_config(self) -> bool:
+        """解锁当前 HSR 脚本配置；配置已不存在时跳过。"""
+
+        script_id = uuid.UUID(self.script_info.script_id)
+        if script_id not in Config.ScriptConfig:
+            logger.warning(
+                f"HSR 脚本配置不存在，跳过解锁：{self.script_info.script_id}"
+            )
+            return False
+
+        await Config.ScriptConfig[script_id].unlock()
+        return True
+
+    async def _push_result_notification(self) -> None:
+        """推送 HSR 脚本级任务结果。"""
+
+        if not self.script_info.user_list:
+            return
+
+        over_count = sum(1 for u in self.script_info.user_list if u.status == "完成")
+        uncompleted_count = sum(
+            1 for u in self.script_info.user_list if u.status != "完成"
+        )
+        task_mode = TASK_MODE_ZH.get(self.task_info.mode, self.task_info.mode)
+        title = (
+            f"{datetime.now().strftime('%m-%d')} | "
+            f"{self.script_info.name or '空白'}的{task_mode}任务报告"
+        )
+        result = {
+            "title": f"{task_mode}任务报告",
+            "script_name": self.script_info.name or "空白",
+            "start_time": self.begin_time,
+            "end_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "completed_count": over_count,
+            "uncompleted_count": uncompleted_count,
+            "result": self.script_info.result,
+        }
+
+        try:
+            await push_notification(
+                mode="代理结果",
+                title=title,
+                message=result,
+                user_config=None,
+                task_info=self.task_info,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.opt(exception=True).warning(f"推送 HSR 代理结果时出现异常: {e}")
+            await self._send_notification_error(f"推送 HSR 代理结果时出现异常: {e}")
+
+    async def _send_notification_error(self, message: str) -> None:
+        """通知失败时尽量提示前端；提示失败不影响任务收尾。"""
+
+        try:
+            await Publisher.send(
+                id=self.task_info.task_id,
+                type=protocol.TASK_NOTICE,
+                data=WSTaskNoticeData(level="error", message=message),
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"发送 HSR 通知错误提示失败：{e}")
+
+    async def final_task(self):
+        """解锁配置、恢复外部配置并落盘日志。"""
+
+        final_errors: list[str] = []
+        try:
+            await self._stop_external_processes()
+        except Exception as e:  # noqa: BLE001
+            msg = f"停止 SRA / 三月七外部进程失败：{e}"
+            logger.opt(exception=True).warning(msg)
+            self._append_log(msg)
+            final_errors.append(msg)
+
+        try:
+            await self._close_game_if_needed()
+        except Exception as e:  # noqa: BLE001
+            msg = f"关闭 HSR 游戏进程失败：{e}"
+            logger.opt(exception=True).warning(msg)
+            self._append_log(msg)
+            final_errors.append(msg)
+
+        try:
+            # 分辨率注册表只在游戏关闭后恢复，且放在 final_task 中保证
+            # TaskExecuteBase 的取消/异常 finally 路径也不会遗留临时值。
+            # 配置检查未通过或 prepare() 未走完时 script_config 仍为 None，
+            # 与上面 _close_game_if_needed 一样跳过，不把它记成收尾异常。
+            if (
+                isinstance(self.script_config, HSRConfig)
+                and is_game_management_enabled(self.script_config)
+                and not is_cloud_platform(self.script_config)
+            ):
+                restore_game_resolution_if_needed(
+                    self._runtime,
+                    self._append_log,
+                )
+        except Exception as e:  # noqa: BLE001
+            msg = f"恢复星铁分辨率注册表失败：{e}"
+            logger.opt(exception=True).warning(msg)
+            self._append_log(msg)
+            final_errors.append(msg)
+
+        try:
+            restore_error = await self._restore_external_configs()
+            # 外部脚本更新是这一段关键区里的最后一件事：往前必须晚于配置恢复
+            # （恢复写的是打补丁前的用户配置，反过来会把旧配置盖到新版本上），
+            # 往后必须早于释放路径锁，否则更新期间目录不再独占。
+            if not final_errors and not restore_error:
+                update_error = await self._update_external_scripts()
+                if update_error:
+                    final_errors.append(update_error)
+        finally:
+            # 备份/运行/恢复是同一关键区；配置解锁与通知在锁释放后进行。
+            self._release_external_path_lock()
+        if restore_error:
+            final_errors.append(restore_error)
+
+        if final_errors:
+            self.crashed = True
+
+        if self.check_result != "Pass" or self.crashed:
+            self.script_info.status = "异常"
+            self._append_log("HSR 异常或中止结束，开始解锁配置")
+            logger.info("HSR 异常结束，开始解锁配置")
+            if await self._unlock_script_config():
+                logger.info(f"已解锁脚本配置 {self.script_info.script_id}（异常结束）")
+                self._append_log("HSR 配置已解锁（异常或中止结束）")
+            try:
+                if self.task_info.mode == "AutoProxy":
+                    await self._apply_completion_writebacks()
+            except Exception as e:  # noqa: BLE001
+                msg = f"HSR 已完成模块状态写回失败：{e}"
+                logger.opt(exception=True).warning(msg)
+                self._append_log(msg)
+                final_errors.append(msg)
+            await self._apply_cloud_login_writebacks()
+            await self._persist_user_logs()
+            await self._push_result_notification()
+            return "；".join(final_errors) or self.check_result
+
+        logger.info("HSR 主任务已结束，开始解锁配置")
+        self._append_log("HSR 主任务已结束，开始解锁配置")
+        if await self._unlock_script_config():
+            logger.success(f"已解锁脚本配置 {self.script_info.script_id}")
+            self._append_log("HSR 配置已解锁")
+
+        await self._apply_cloud_login_writebacks()
+        try:
+            if self.task_info.mode == "AutoProxy":
+                await self._apply_completion_writebacks()
+        except Exception as e:
+            self.script_info.status = "异常"
+            logger.opt(exception=True).warning(f"HSR 用户数据写回失败：{e}")
+            self._append_log(f"HSR 用户数据写回失败：{e}")
+            return f"HSR 用户数据写回失败：{e}"
+
+        if any(user.status == "异常" for user in self.script_info.user_list):
+            self.script_info.status = "异常"
+        else:
+            self.script_info.status = "完成"
+        self._append_log("HSR 任务完成")
+        await self._persist_user_logs()
+        await self._push_result_notification()
+
+    async def on_crash(self, e: Exception):
+        """任务异常处理"""
+
+        self.crashed = True
+        self.script_info.status = "异常"
+        logger.opt(exception=True).warning(f"HSR 任务出现异常：{e}")
+        self._append_log(f"HSR 任务出现异常：{e}")
+        await Publisher.send(
+            id=self.task_info.task_id,
+            type=protocol.TASK_NOTICE,
+            data=WSTaskNoticeData(level="error", message=f"HSR 任务出现异常：{e}"),
+        )

@@ -1,0 +1,606 @@
+"""从 SRA/M7A 原生配置生成 MAS 托管表单。
+
+露出哪些键、按什么顺序与分组，由 ``managed_fields`` 的显式字段表决定（它同时是
+运行时白名单的来源）；值来自用户当前安装的 ``config.json``/``config.yaml``，
+``Managed.Options`` 只保存用户覆盖值。原生配置里不存在的键不显示，因此老版本
+引擎缺字段时表单相应变短，已有旧配置执行路径不受影响。
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+
+from .m7a_config import _user_managed_options as _m7a_user_managed_options
+from .m7a_config import (
+    load_m7a_native_config,
+    overlay_m7a_managed_options,
+)
+from .managed_fields import (
+    SRA_REWARD_LABELS,
+    SRA_REWARD_NAMED_KEYS,
+    HSRFieldGroup,
+    ManagedFieldSpec,
+    ManagedFieldVisibleWhen,
+    managed_field_specs,
+)
+from .managed_overlay import DroppedOverride
+from .native_control import _script_path
+from .sra_runtime import _managed_options as _sra_user_managed_options
+from .sra_runtime import (
+    discover_sra_managed_options,
+    load_sra_native_config,
+    overlay_sra_managed_options,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class HSRManagedFieldOption:
+    value: Any
+    label: str
+
+    def asdict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class HSRManagedField:
+    key: str
+    label: str
+    type: str
+    value: Any
+    description: str = ""
+    options: tuple[HSRManagedFieldOption, ...] = ()
+    minimum: float | None = None
+    maximum: float | None = None
+    readonly: bool = False
+    group: HSRFieldGroup = "common"
+    """分组；``common`` 平铺，其余各成一个默认收起的折叠面板"""
+    overridden: bool = False
+    """当前计划（``plan_owner`` 指向的那份 ``Managed.Options``）对该键有生效中的覆盖值"""
+    native_value: Any = None
+    """引擎原生配置里的值，重置单项后前端可直接显示"""
+    visible_when: ManagedFieldVisibleWhen | None = None
+    """同模块同引擎里另一字段取特定值时才显示"""
+
+    def asdict(self) -> dict[str, Any]:
+        data = asdict(self)
+        data["options"] = [item.asdict() for item in self.options]
+        data["visible_when"] = (
+            self.visible_when.asdict() if self.visible_when is not None else None
+        )
+        return data
+
+
+@dataclass(frozen=True, slots=True)
+class HSRManagedModule:
+    """一个引擎下一个模块的托管表单。
+
+    ``warnings`` 只放人类可读的表单级提示（如三月七缺配置说明文件）；
+    ``dropped_overrides`` 记录该模块被忽略的 ``Managed.Options`` 覆盖键，
+    前端据此提示并提供清理入口。
+    """
+
+    key: str
+    engine: str
+    fields: tuple[HSRManagedField, ...]
+    source: str
+    warnings: tuple[str, ...] = ()
+    dropped_overrides: tuple[DroppedOverride, ...] = ()
+
+    def asdict(self) -> dict[str, Any]:
+        data = asdict(self)
+        data["fields"] = [item.asdict() for item in self.fields]
+        data["warnings"] = list(self.warnings)
+        data["dropped_overrides"] = [item.asdict() for item in self.dropped_overrides]
+        return data
+
+
+def _field_type(value: Any, options: tuple[HSRManagedFieldOption, ...]) -> str:
+    if options:
+        return "select"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, (list, dict)):
+        return "json"
+    return "string"
+
+
+def _field(
+    spec: ManagedFieldSpec,
+    native_value: Any,
+    value: Any,
+    *,
+    label: str | None = None,
+    description: str = "",
+    options: tuple[HSRManagedFieldOption, ...] = (),
+    minimum: float | None = None,
+    maximum: float | None = None,
+    overridden: bool = False,
+) -> HSRManagedField:
+    return HSRManagedField(
+        key=spec.key,
+        label=spec.label or label or spec.key,
+        type=spec.type or _field_type(native_value, options),
+        value=value,
+        description=(spec.description if spec.description is not None else description),
+        options=options,
+        minimum=minimum,
+        maximum=maximum,
+        group=spec.group,
+        overridden=overridden,
+        native_value=native_value,
+        visible_when=spec.visible_when,
+    )
+
+
+def _effective_override_keys(
+    overrides: dict[str, Any], dropped: tuple[DroppedOverride, ...]
+) -> frozenset[str]:
+    """计划里对本模块生效中的覆盖键：保存过、且没被当成失效覆盖丢弃的。"""
+
+    dropped_keys = {item.key for item in dropped}
+    return frozenset(str(key) for key in overrides if str(key) not in dropped_keys)
+
+
+# 露出哪些键由 managed_fields.SRA_MANAGED_FIELDS 决定；这里只管显示文案。表外的
+# enabled / tasklist / redeemCodes 等也给了名称，免得字段表调整后退化成裸键。
+_SRA_LABELS = {
+    "enabled": "启用该任务",
+    "tasklist": "自定义副本清单",
+    "replenish.enabled": "自动补充开拓力",
+    "replenish.times": "补充次数",
+    "replenish.way": "补充方式",
+    "useAssistant": "使用支援角色",
+    "useBuildTarget": "使用培养目标",
+    "activity.enabled": "体力活动检测",
+    "activity.gardenOfPlenty.level1": "花藏繁生：拟造花萼（金）",
+    "activity.gardenOfPlenty.level2": "花藏繁生：拟造花萼（赤）",
+    "activity.planarFissure.level": "位面分裂：饰品提取",
+    "activity.realmOfTheStrange.level": "异器盈界：侵蚀隧洞",
+    "redeemCodes": "兑换码",
+    "pointRewards.enabled": "领取积分奖励",
+    "divergentUniverse.enabled": "执行差分宇宙",
+    "divergentUniverse.mode": "演算类别",
+    "divergentUniverse.runtimes": "运行次数",
+    "divergentUniverse.useTechnique": "使用秘技",
+    "currencyWars.enabled": "执行货币战争",
+    "currencyWars.mode": "博弈类别",
+    "currencyWars.difficulty": "难度",
+    "currencyWars.policy": "策略来源",
+    "currencyWars.reroll.bossAffixes": "刷开局：首领词条条件",
+    "currencyWars.reroll.bossNames": "刷开局：首领名称条件",
+    "currencyWars.reroll.investEnvironments": "刷开局：投资环境条件",
+    "currencyWars.reroll.investStrategies": "刷开局：投资策略条件",
+    "currencyWars.runtimes": "运行次数",
+    "currencyWars.strategy": "攻略文件",
+    "currencyWars.strategyIndex": "策略序号",
+    "currencyWars.username": "开拓者名称",
+}
+# SRA_REWARD_LABELS / SRA_REWARD_NAMED_KEYS 定义在 managed_fields，这里沿用导出。
+_SRA_LABELS.update(zip(SRA_REWARD_NAMED_KEYS, SRA_REWARD_LABELS, strict=True))
+_SRA_REROLL_ONLY = "仅「博弈类别」为「刷开局」时生效。"
+# 说明只写能从 SRA 源码（tasks/CosmicStrifeTask.py、tasks/currency_wars/RerollStart.py、
+# tasks/TrailblazePowerTask.py）里确认的格式；拿不准的一律指回 SRA 内的同名设置。
+_SRA_DESCRIPTIONS = {
+    "enabled": "该开关由 MAS 在运行时按任务开关自动设置，此处的值不生效。",
+    "tasklist": (
+        "SRA 原生的自定义副本清单。MAS 运行时会按本模块「刷取副本」里选择的副本"
+        "重新生成，此处的值不生效。"
+    ),
+    "replenish.times": "0 表示不补充。",
+    "useBuildTarget": (
+        "开启后由 SRA 按游戏内「培养目标」自动决定要刷的副本，"
+        "本模块「刷取副本」里选择的副本将被忽略。"
+    ),
+    "activity.enabled": (
+        "检测到双倍活动时改刷下方指定的活动关卡；开启后即使未选择体力副本也会运行。"
+    ),
+    "redeemCodes": "多个兑换码用空格分隔。",
+    "currencyWars.mode": (
+        "标准博弈、超频博弈会打完整局；「刷开局」只按下方四个重开条件反复重开，"
+        "直到开局满足条件为止，不会打完整局。"
+    ),
+    "currencyWars.policy": "由 SRA 维护，格式见 SRA 内的同名设置。",
+    "currencyWars.reroll.bossAffixes": (
+        _SRA_REROLL_ONLY + "多个词条用空格分隔；词条前加 ! 表示出现该词条就重开，"
+        "例如「削韧 !加速」。留空表示不限。"
+    ),
+    "currencyWars.reroll.bossNames": (
+        _SRA_REROLL_ONLY + "按第一、二、三位面的顺序填写首领名称，用分号分隔，"
+        "例如「首领A;首领B;首领C」；某个位面留空表示不限。"
+    ),
+    "currencyWars.reroll.investEnvironments": (
+        _SRA_REROLL_ONLY
+        + "多个环境用空格分隔；环境前加 ? 表示可选（出现即可，不强制）。留空表示不限。"
+    ),
+    "currencyWars.reroll.investStrategies": (
+        _SRA_REROLL_ONLY + "按阶段顺序填写投资策略，用分号分隔，例如「策略1;策略2」；"
+        "某个阶段留空表示不限。"
+    ),
+    "currencyWars.runtimes": "本次运行货币战争的局数；刷开局模式下为重开次数上限。",
+    "currencyWars.strategy": (
+        "SRA 使用的货币战争攻略文件名，对应 SRA 目录下 tasks/currency_wars/strategies"
+        " 里的同名 json（不带 .json 后缀）；带 .json 时按文件路径读取。"
+        "一般在 SRA 中选好即可，不要手填。"
+    ),
+    "currencyWars.strategyIndex": "由 SRA 维护的策略序号，一般无需修改；格式见 SRA 内的同名设置。",
+    "currencyWars.username": (
+        "游戏内显示的开拓者名称，SRA 用它在货币战争里识别自己的角色。"
+        "留空时使用该用户在 MAS 中的用户名。"
+    ),
+}
+_SRA_USERNAME_KEY = "currencyWars.username"
+# 只给有依据的边界：次数、序号都是非负整数；没有可靠上界的不设上界，免得挡住用户。
+_SRA_RANGES: dict[str, tuple[float | None, float | None]] = {
+    # 活动关卡序号平时是下拉（0 = 不刷）；SRA 关卡表读不到时退化成数字框，至少别让填负数。
+    "activity.gardenOfPlenty.level1": (0, None),
+    "activity.gardenOfPlenty.level2": (0, None),
+    "activity.planarFissure.level": (0, None),
+    "activity.realmOfTheStrange.level": (0, None),
+    "replenish.times": (0, None),
+    "divergentUniverse.runtimes": (0, None),
+    "currencyWars.runtimes": (0, None),
+    "currencyWars.strategyIndex": (0, None),
+}
+# 选项含义按 SRA 源码：TrailblazePowerTask.replenish 里 way 0/1/2 依次为
+# 后备开拓力 / 燃料 / 星琼；CosmicStrifeTask 里 mode 0/1/2 依次为标准 / 超频 / 刷开局。
+_SRA_SELECTS = {
+    "replenish.way": (
+        HSRManagedFieldOption(0, "后备开拓力"),
+        HSRManagedFieldOption(1, "燃料"),
+        HSRManagedFieldOption(2, "星琼"),
+    ),
+    "divergentUniverse.mode": (
+        HSRManagedFieldOption(0, "常规演算"),
+        HSRManagedFieldOption(1, "周期演算"),
+    ),
+    "currencyWars.mode": (
+        HSRManagedFieldOption(0, "标准博弈"),
+        HSRManagedFieldOption(1, "超频博弈"),
+        HSRManagedFieldOption(2, "刷开局"),
+    ),
+    "currencyWars.difficulty": (
+        HSRManagedFieldOption(0, "最低难度"),
+        HSRManagedFieldOption(1, "最高难度"),
+    ),
+}
+
+_SRA_ACTIVITY_STAGE_CATEGORIES = {
+    "activity.gardenOfPlenty.level1": "calyx_golden",
+    "activity.gardenOfPlenty.level2": "calyx_crimson",
+    "activity.planarFissure.level": "ornament_extraction",
+    "activity.realmOfTheStrange.level": "caver_of_corrosion",
+}
+_SRA_ACTIVITY_STAGE_DESCRIPTION = (
+    "检测到对应双倍活动时使用的 SRA 原生关卡；选择‘不刷’则跳过这一类活动副本。"
+)
+
+
+def _sra_activity_stage_options(
+    script_config: Any,
+) -> dict[str, tuple[HSRManagedFieldOption, ...]]:
+    """把已安装 SRA 的动态关卡表转成活动配置下拉选项。"""
+
+    try:
+        from .stage_provider import get_sra_stage_options
+
+        payload = get_sra_stage_options(script_config)
+    except (FileNotFoundError, OSError, RuntimeError, ValueError, TypeError):
+        return {}
+
+    categories = payload.get("categories") if isinstance(payload, dict) else None
+    category_by_key = {
+        str(category.get("categoryKey")): category
+        for category in categories or ()
+        if isinstance(category, dict)
+    }
+    result: dict[str, tuple[HSRManagedFieldOption, ...]] = {}
+    for field_key, category_key in _SRA_ACTIVITY_STAGE_CATEGORIES.items():
+        options = [HSRManagedFieldOption(0, "不刷")]
+        category = category_by_key.get(category_key)
+        raw_options = category.get("options") if category else ()
+        for option in raw_options or ():
+            if not isinstance(option, dict):
+                continue
+            native = option.get("sra")
+            if not isinstance(native, dict):
+                continue
+            try:
+                level = int(native.get("level"))
+            except (TypeError, ValueError):
+                continue
+            label = str(option.get("label") or level)
+            detail = str(option.get("detail") or "").strip()
+            if detail:
+                label = f"{label}｜{detail}"
+            options.append(HSRManagedFieldOption(level, label))
+        result[field_key] = tuple(options)
+    return result
+
+
+def list_sra_managed_modules(
+    script_config: Any, user_config: Any | None = None
+) -> tuple[HSRManagedModule, ...]:
+    source, _payload = load_sra_native_config(script_config)
+    activity_stage_options = _sra_activity_stage_options(script_config)
+    result: list[HSRManagedModule] = []
+    for module_key in ("Daily", "ReceiveRewards", "DivergentUniverse", "CurrencyWars"):
+        values, _section_name = discover_sra_managed_options(module_key, script_config)
+        effective, dropped = overlay_sra_managed_options(
+            module_key, script_config, user_config
+        )
+        overrides = _sra_user_managed_options(user_config, module_key)
+        overridden_keys = _effective_override_keys(overrides, dropped)
+        fields: list[HSRManagedField] = []
+        for spec in managed_field_specs("SRA", module_key):
+            key = spec.key
+            if key not in values:
+                continue
+            native = values[key]
+            value = effective.get(key, native)
+            if key == _SRA_USERNAME_KEY:
+                # 运行时没填覆盖值就用 MAS 用户名，不用原生 profile 里的名字；
+                # 表单显示为空，与说明「留空时使用 MAS 用户名」一致。单项恢复后
+                # 前端显示 native_value，所以它也按空串给。
+                native = ""
+                if not overrides.get(key):
+                    value = ""
+            fields.append(
+                _field(
+                    spec,
+                    native,
+                    value,
+                    label=(
+                        SRA_REWARD_LABELS[int(key.removeprefix("rewards."))]
+                        if key.startswith("rewards.")
+                        and key.removeprefix("rewards.").isdigit()
+                        and int(key.removeprefix("rewards.")) < len(SRA_REWARD_LABELS)
+                        else _SRA_LABELS.get(key, key)
+                    ),
+                    description=(
+                        _SRA_ACTIVITY_STAGE_DESCRIPTION
+                        if key in _SRA_ACTIVITY_STAGE_CATEGORIES
+                        else _SRA_DESCRIPTIONS.get(key, "")
+                    ),
+                    options=activity_stage_options.get(
+                        key,
+                        _SRA_SELECTS.get(key, ()),
+                    ),
+                    minimum=_SRA_RANGES.get(key, (None, None))[0],
+                    maximum=_SRA_RANGES.get(key, (None, None))[1],
+                    overridden=key in overridden_keys,
+                )
+            )
+        result.append(
+            HSRManagedModule(
+                module_key,
+                "SRA",
+                tuple(fields),
+                str(source),
+                dropped_overrides=dropped,
+            )
+        )
+    return tuple(result)
+
+
+_M7A_LABEL_FALLBACKS = {
+    "instance_teams": "指定副本队伍",
+    "borrow_friends": "支援好友列表",
+}
+_M7A_SELECTS = {
+    "build_target_scheme": (
+        HSRManagedFieldOption("instance", "按副本名称识别"),
+        HSRManagedFieldOption("drop", "按副本素材识别"),
+    ),
+    "weekly_divergent_type": (
+        HSRManagedFieldOption("normal", "常规演算"),
+        HSRManagedFieldOption("cycle", "周期演算"),
+    ),
+    "currencywars_type": (
+        HSRManagedFieldOption("normal", "标准博弈"),
+        HSRManagedFieldOption("overclock", "超频博弈"),
+    ),
+    "currencywars_rank_difficulty": (
+        HSRManagedFieldOption("lowest", "最低职级"),
+        HSRManagedFieldOption("current", "当前职级"),
+        HSRManagedFieldOption("highest", "最高职级"),
+    ),
+    # 三月七 GUI（setting_interface.py 货币战争策略）：默认 / 阿格莱雅 / 希儿【测试版】
+    "currencywars_strategy": (
+        HSRManagedFieldOption("default", "默认策略"),
+        HSRManagedFieldOption("aglaea", "阿格莱雅策略"),
+        HSRManagedFieldOption("seele", "希儿策略（测试版）"),
+    ),
+    # 三月七 GUI 的默认队伍是 1–12 的 SpinBox，存成字符串（"6"）
+    "instance_team_number": tuple(
+        HSRManagedFieldOption(str(number), f"队伍{number}") for number in range(1, 13)
+    ),
+    # 三月七 GUI 的沉浸器上限下拉：字符串 "1"–"12"
+    "merge_immersifier_limit": tuple(
+        HSRManagedFieldOption(str(number), str(number)) for number in range(1, 13)
+    ),
+    "activity_gardenofplenty_instance_type": (
+        HSRManagedFieldOption("拟造花萼（金）", "拟造花萼（金）"),
+        HSRManagedFieldOption("拟造花萼（赤）", "拟造花萼（赤）"),
+    ),
+}
+# 上界来自 config.example.yaml 注释或三月七 GUI 控件写明的取值范围。
+_M7A_RANGES: dict[str, tuple[float | None, float | None]] = {
+    "build_target_ornament_weekly_count": (0, 7),
+    "weekly_divergent_level": (1, 6),
+    # 三月七 GUI「滚动查找次数」RangeSettingCard1 [1, 10]
+    "borrow_scroll_times": (1, 10),
+}
+
+
+def _load_m7a_comments(path: Path) -> dict[str, str]:
+    """读取同行或紧邻前置注释中的 M7A 原生字段说明。"""
+
+    if not path.is_file():
+        return {}
+    comments: dict[str, str] = {}
+    pending: list[str] = []
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            text = stripped.removeprefix("#").strip()
+            if text:
+                pending.append(text)
+            continue
+        match = re.match(r"^([A-Za-z][A-Za-z0-9_]*):.*?(?:#\s*(.+))?$", stripped)
+        if match:
+            inline = str(match.group(2) or "").strip()
+            comments[match.group(1)] = inline or " ".join(pending)
+        pending = []
+    return comments
+
+
+# 注释里交代取值的句子与分句：开关、下拉、数字框自己就表达了这些，照搬只是噪音
+_M7A_VALUE_SENTENCE = re.compile(r"^(true|false)\b", re.IGNORECASE)
+_M7A_VALUE_CLAUSE = re.compile(r"^(可选|取值范围|可以是)")
+
+
+def _m7a_texts(key: str, comment: str) -> tuple[str, str]:
+    """把 config.example.yaml 的注释拆成（标题, 说明）。
+
+    注释惯例是「是否XX。true 开启，false 关闭。」「XX，可选值：…」「XX，取值范围
+    1-6，…」：标题取第一句里取值分句之前的部分并去掉「是否」；说明只留标题之外
+    的补充，取值说明一律丢掉。没有补充时说明为空，前端就不挂问号。
+    """
+
+    sentences = [
+        text.strip()
+        for text in re.split(r"[。；]", comment)
+        if text.strip()
+        and not _M7A_VALUE_SENTENCE.match(text.strip())
+        and not _M7A_VALUE_CLAUSE.match(text.strip())
+    ]
+    label, extra = "", []
+    if sentences:
+        clauses = [clause.strip() for clause in sentences[0].split("，")]
+        cut = next(
+            (i for i, clause in enumerate(clauses) if _M7A_VALUE_CLAUSE.match(clause)),
+            len(clauses),
+        )
+        label = "，".join(clauses[:cut]).replace("是否", "")
+        rest = "，".join(
+            clause for clause in clauses[cut:] if not _M7A_VALUE_CLAUSE.match(clause)
+        )
+        extra = [rest, *sentences[1:]] if rest else sentences[1:]
+    description = "。".join(extra) + "。" if extra else ""
+    return _M7A_LABEL_FALLBACKS.get(key) or label or key, description
+
+
+def list_m7a_managed_modules(
+    script_config: Any, user_config: Any | None = None
+) -> tuple[HSRManagedModule, ...]:
+    raw_root = _script_path(script_config, "M7A")
+    if not raw_root:
+        raise FileNotFoundError("请先设置三月七路径")
+    root = Path(raw_root)
+    source = root / "config.yaml"
+    if not source.is_file():
+        raise FileNotFoundError(f"三月七原生配置不存在：{source}")
+    payload = load_m7a_native_config(script_config)
+    example_path = root / "assets" / "config" / "config.example.yaml"
+    comments = _load_m7a_comments(example_path)
+    module_warnings: tuple[str, ...] = ()
+    if not comments:
+        # 字段名称与说明都取自这份带注释的样例；缺了只能退化成原始键名，
+        # 要让用户知道为什么表单看起来像一堆变量名。
+        module_warnings = (
+            f"未找到三月七的配置说明文件 {example_path}，"
+            "配置项只能显示原始键名、没有说明；请检查三月七安装是否完整",
+        )
+    buckets: dict[str, list[HSRManagedField]] = {
+        key: []
+        for key in ("Daily", "ReceiveRewards", "DivergentUniverse", "CurrencyWars")
+    }
+    overlay_by_module = {
+        module_key: overlay_m7a_managed_options(payload, user_config, module_key)
+        for module_key in buckets
+    }
+    for module_key, fields in buckets.items():
+        effective, dropped = overlay_by_module[module_key]
+        overridden_keys = _effective_override_keys(
+            _m7a_user_managed_options(user_config, module_key), dropped
+        )
+        for spec in managed_field_specs("M7A", module_key):
+            key = spec.key
+            if key not in payload:
+                continue
+            value = payload[key]
+            label, description = _m7a_texts(key, comments.get(key, ""))
+            fields.append(
+                _field(
+                    spec,
+                    value,
+                    effective.get(key, value),
+                    label=label,
+                    description=description,
+                    options=_M7A_SELECTS.get(key, ()),
+                    minimum=_M7A_RANGES.get(key, (None, None))[0],
+                    maximum=_M7A_RANGES.get(key, (None, None))[1],
+                    overridden=key in overridden_keys,
+                )
+            )
+    return tuple(
+        HSRManagedModule(
+            key,
+            "M7A",
+            tuple(fields),
+            str(source),
+            warnings=module_warnings,
+            dropped_overrides=tuple(overlay_by_module[key][1]),
+        )
+        for key, fields in buckets.items()
+    )
+
+
+def list_managed_modules(
+    engine: str, script_config: Any, user_config: Any | None = None
+) -> tuple[HSRManagedModule, ...]:
+    normalized = str(engine or "").strip().upper()
+    if normalized == "SRA":
+        return list_sra_managed_modules(script_config, user_config)
+    if normalized == "M7A":
+        return list_m7a_managed_modules(script_config, user_config)
+    raise ValueError(f"不支持的 HSR 托管引擎：{engine!r}")
+
+
+def redeem_code_fingerprint(engine: str, script_config: Any) -> str:
+    """Return a stable hash of an engine's native redeem-code payload only."""
+
+    normalized = str(engine or "").strip().upper()
+    if normalized == "SRA":
+        _source, payload = load_sra_native_config(script_config)
+        value = (payload.get("receiveRewards") or {}).get("redeemCodes")
+    elif normalized == "M7A":
+        payload = load_m7a_native_config(script_config)
+        value = payload.get("redemption_code")
+    else:
+        raise ValueError(f"不支持的 HSR 兑换码引擎：{engine!r}")
+    canonical = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+__all__ = [
+    "HSRManagedField",
+    "HSRManagedFieldOption",
+    "HSRManagedModule",
+    "list_managed_modules",
+    "list_m7a_managed_modules",
+    "list_sra_managed_modules",
+    "redeem_code_fingerprint",
+]
