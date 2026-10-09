@@ -9603,6 +9603,42 @@ AUTO_MAS_HEALTH_PROTOCOL = 1
 AUTO_MAS_HEALTH_MAX_BYTES = 64 * 1024      # 响应体上限，超过即视为异常
 AUTO_MAS_CLOSE_TIMEOUT_SEC = 15            # close 后等待自然退出的秒数
 
+# ---- Job Object 结构体（64 位实测 ELI 总大小 144 字节）----
+# 必须定义在模块级：class 体内嵌套定义时，_ELI 引用 _JBLI 会 NameError
+# （类体作用域彼此不可见，实测踩过）。
+class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_int64),
+        ("PerJobUserTimeLimit", ctypes.c_int64),
+        ("LimitFlags", ctypes.c_uint32),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", ctypes.c_uint32),
+        ("Affinity", ctypes.c_void_p),
+        ("PriorityClass", ctypes.c_uint32),
+        ("SchedulingClass", ctypes.c_uint32),
+    ]
+
+
+class _IO_COUNTERS(ctypes.Structure):
+    _fields_ = [(n, ctypes.c_uint64) for n in (
+        "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+        "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+
+class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+        ("IoInfo", _IO_COUNTERS),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+_KILL_ON_JOB_CLOSE = 0x2000
+
 
 AUTO_MAS_VENDOR = os.path.join(LAUNCHER_DIR, "vendor", "auto-mas")
 
@@ -9688,27 +9724,26 @@ class ServiceWorker(QThread):
         self._health = None
 
     # ---------- Job Object：托管进程树，防孤儿 ----------
+    # KILL_ON_JOB_CLOSE：Job 句柄关闭即终止组内所有进程。
+    # 结构体定义在模块级（类体内互相引用会 NameError）。
+    # 之前用 112 字节 buffer + 偏移 40 是拍脑袋写的，SetInformationJobObject
+    # 一直静默失败——防孤儿实际全靠 close 接口，这是隐患，已改真结构体。
+
     def _attach_job(self, pid):
         """把子进程挂进 Job Object，主进程消失时系统自动结束整棵进程树。"""
         try:
-            import ctypes
             from ctypes import wintypes
             k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.CreateJobObjectW.restype = wintypes.HANDLE
+            k32.OpenProcess.restype = wintypes.HANDLE
             job = k32.CreateJobObjectW(None, None)
             if not job:
                 return None
-            # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE：Job 句柄关闭即终止组内所有进程
-            info = (ctypes.c_uint64 * 2)()  # 简化：仅设置 LimitFlags 结构首部
-            # 完整结构较大，这里用 bytes 构造 JOBOBJECT_EXTENDED_LIMIT_INFORMATION
-            buf = ctypes.create_string_buffer(112)
-            # BasicLimitInformation(8+8+4+4+8+8+8+8=64?) → 直接置 LimitFlags 位
-            # 结构布局：BasicLimitInformation 前 48 字节，之后是 IoInfo/ProcessMemory...
-            # 采用稳妥做法：只设 KILL_ON_JOB_CLOSE(0x2000) 位于偏移 40(4 bytes)
-            ctypes.memset(buf, 0, 112)
-            ctypes.c_uint32.from_buffer(buf, 40).value = 0x2000
+            eli = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            eli.BasicLimitInformation.LimitFlags = _KILL_ON_JOB_CLOSE
             ok = k32.SetInformationJobObject(
                 job, 9,  # JobObjectExtendedLimitInformation
-                ctypes.byref(buf), 112)
+                ctypes.byref(eli), ctypes.sizeof(eli))
             if not ok:
                 k32.CloseHandle(job)
                 return None
@@ -9788,10 +9823,15 @@ class ServiceWorker(QThread):
 
         try:
             os.makedirs(self._workdir, exist_ok=True)
+            # CREATE_NO_WINDOW 必加：后端 python.exe 是控制台程序，启动器自身
+            # 跑在 pythonw（无控制台）下，不加这个标志 Windows 会给它弹一个
+            # 黑色控制台窗口（用户实机所见「点启动弹个黑窗」）。
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             self._proc = subprocess.Popen(
                 [self._py, os.path.join(self._repo, "main.py")],
                 cwd=self._workdir, env=env,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=flags,
             )
         except Exception as e:
             self.sig_state.emit("failed", "拉起后端失败：%s" % e)
