@@ -5921,8 +5921,20 @@ class AppCard(CardWidget):
         self._mas_worker = None
         self._mas_state = "stopped"
 
+        # 先定位后端（下面的 _installed 依赖它，顺序不能颠倒）
         repo, py = auto_mas_paths()
         self._mas_repo, self._mas_py = repo, py
+
+        # 必设：refresh_data / snapshot / refresh_badge 都会读这些字段，
+        # MAS 卡没有 app.json 可走，必须自己给出「已安装」语义
+        # （vendor 后端在 = 可启动，即视为已装；否则降级为不可用）。
+        # 漏设会直接 AttributeError 崩掉整张卡（真实事故）。
+        self._installed = bool(repo)
+        self._host_ready = False
+        self._host_actual = ""
+        self._install_dir = ""
+        self.data = {}
+        self.profile = {}
 
         # 复用卡片既有骨架：清空动态区后往 body_box 里加（与 lite/generic 同套路）
         self.clear_body()
@@ -7330,6 +7342,16 @@ class AppCard(CardWidget):
         self.changelog_text.setMinimumHeight(max(120, doc_h + extra))
 
     def refresh_data(self):
+        # AUTO-MAS 服务卡：没有 app_json，安装态 = vendor 后端是否可用。
+        # 必须在这里拦住，否则会掉进下面读 app_json 的分支（MAS 的 app_json 为空），
+        # 而 _installed 若未初始化就 AttributeError 崩卡（真实事故）。
+        if getattr(self, "_mas", False):
+            now_ok = bool(getattr(self, "_mas_repo", ""))
+            if now_ok != self._installed:
+                self._installed = now_ok
+                self.rebuild_body()
+            return
+
         # lite 模式：无 app_json 可读，只维护「安装态 + 运行态」
         if self.app.get("lite") or self.app.get("generic"):
             exe = self.app.get("exe", "") or ""
