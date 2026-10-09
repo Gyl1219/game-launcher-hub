@@ -33,6 +33,7 @@ import struct
 import base64
 import stat as _stat
 import ctypes
+import socket
 import subprocess
 import traceback
 import threading
@@ -9430,6 +9431,273 @@ class PosterWorker(QThread):
             except Exception:
                 _POSTER_FAILED.add(url)
                 continue
+
+
+# ===== AUTO-MAS 后端监督（外部监督器协议） =====
+# AUTO-MAS（AGPL-3.0）作为**独立子进程**受本启动器监督：
+#   · 不嵌入其 Electron GUI，只调用后端 HTTP 服务；
+#   · 不改 AUTO-MAS 任何源码，只通过环境变量 + 两个 HTTP 接口交互；
+#   · 用 Windows Job Object 托管进程树，杜绝主程序退出后的孤儿 python 进程。
+# 契约（已在 repo/app/api/core.py 与 app/utils/supervision.py 核实）：
+#   AUTO_MAS_SUPERVISED=1            开启监督模式
+#   AUTO_MAS_SUPERVISED_PORT=<port>  监督器注入监听端口（缺失回退 36163）
+#   GET  /api/core/health            {ready,backgroundStatus,backgroundError,
+#                                     backgroundWarnings,protocol,version,commit}
+#   POST /api/core/close             真正退出进程（监督模式下恒为非 dev 模式）
+
+AUTO_MAS_KEY = "auto-mas"
+AUTO_MAS_EXPECTED_VERSION = "5.6.2"
+AUTO_MAS_HEALTH_PROTOCOL = 1
+AUTO_MAS_HEALTH_MAX_BYTES = 64 * 1024      # 响应体上限，超过即视为异常
+AUTO_MAS_CLOSE_TIMEOUT_SEC = 15            # close 后等待自然退出的秒数
+
+
+def auto_mas_paths():
+    """定位 AUTO-MAS 的后端源码与解释器。
+
+    返回 (repo_dir, python_exe)；任一项不存在返回 ("", "")。
+    vendor 引入后应改为指向 launcher 目录下的 vendor 副本（见 NOTICE.md）。
+    """
+    for root in (r"D:\AUTO-MAS", os.path.join(os.path.dirname(LAUNCHER_DIR), "AUTO-MAS")):
+        repo = os.path.join(root, "repo")
+        main_py = os.path.join(repo, "main.py")
+        if not os.path.isfile(main_py):
+            continue
+        # 优先用 AUTO-MAS 自带 Python；没有则回退当前解释器
+        for py in (os.path.join(root, "environment", "python", "python.exe"),
+                   sys.executable):
+            if os.path.isfile(py):
+                return repo, py
+    return "", ""
+
+
+def _free_port():
+    """取一个空闲的本机端口给后端监听（避免与已装正式版 36163 抢占）。"""
+    try:
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        p = s.getsockname()[1]
+        s.close()
+        return p
+    except Exception:
+        return 0
+
+
+class ServiceWorker(QThread):
+    """AUTO-MAS 后端监督线程：拉起 → 健康检查 → 优雅关闭 → 兜底杀进程树。
+
+    【Qt 铁律】run() 里只做子进程/HTTP/纯逻辑，绝不触碰任何 QWidget。
+    状态通过 Signal 回主线程，由 UI 层（尚未实现）消费。
+
+    本类只负责「进程与协议」，不含任何界面代码——按交接文档要求，
+    最小可验证切片阶段先不碰 UI。
+    """
+
+    # (state, detail)：state ∈ starting/ready/failed/stopped
+    sig_state = Signal(str, str)
+
+    def __init__(self, repo_dir, python_exe, workdir, parent=None):
+        super().__init__(parent)
+        self._repo = repo_dir
+        self._py = python_exe
+        self._workdir = workdir
+        self._proc = None
+        self._port = 0
+        self._job = None
+        self._stop = False
+        self._health = None
+
+    # ---------- Job Object：托管进程树，防孤儿 ----------
+    def _attach_job(self, pid):
+        """把子进程挂进 Job Object，主进程消失时系统自动结束整棵进程树。"""
+        try:
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            job = k32.CreateJobObjectW(None, None)
+            if not job:
+                return None
+            # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE：Job 句柄关闭即终止组内所有进程
+            info = (ctypes.c_uint64 * 2)()  # 简化：仅设置 LimitFlags 结构首部
+            # 完整结构较大，这里用 bytes 构造 JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+            buf = ctypes.create_string_buffer(112)
+            # BasicLimitInformation(8+8+4+4+8+8+8+8=64?) → 直接置 LimitFlags 位
+            # 结构布局：BasicLimitInformation 前 48 字节，之后是 IoInfo/ProcessMemory...
+            # 采用稳妥做法：只设 KILL_ON_JOB_CLOSE(0x2000) 位于偏移 40(4 bytes)
+            ctypes.memset(buf, 0, 112)
+            ctypes.c_uint32.from_buffer(buf, 40).value = 0x2000
+            ok = k32.SetInformationJobObject(
+                job, 9,  # JobObjectExtendedLimitInformation
+                ctypes.byref(buf), 112)
+            if not ok:
+                k32.CloseHandle(job)
+                return None
+            hproc = k32.OpenProcess(0x1F0FFF, False, pid)
+            if not hproc:
+                k32.CloseHandle(job)
+                return None
+            if not k32.AssignProcessToJobObject(job, hproc):
+                k32.CloseHandle(hproc)
+                k32.CloseHandle(job)
+                return None
+            k32.CloseHandle(hproc)
+            return job
+        except Exception:
+            return None
+
+    def _close_job(self):
+        if self._job:
+            try:
+                ctypes.windll.kernel32.CloseHandle(self._job)
+            except Exception:
+                pass
+            self._job = None
+
+    # ---------- HTTP 交互 ----------
+    def _url(self, path):
+        return "http://127.0.0.1:%d%s" % (self._port, path)
+
+    def _get_health(self, timeout=3):
+        """拉一次 health；返回 dict 或 None。响应体超 64KiB 直接判异常。"""
+        try:
+            with urllib.request.urlopen(self._url("/api/core/health"),
+                                        timeout=timeout) as r:
+                body = r.read(AUTO_MAS_HEALTH_MAX_BYTES + 1)
+            if len(body) > AUTO_MAS_HEALTH_MAX_BYTES:
+                return None
+            return json.loads(body.decode("utf-8", "replace"))
+        except Exception:
+            return None
+
+    def _post_close(self):
+        try:
+            req = urllib.request.Request(
+                self._url("/api/core/close"), data=b"{}", method="POST",
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                return r.status == 200
+        except Exception:
+            return False
+
+    # ---------- 主流程 ----------
+    def request_stop(self):
+        """主线程调用：请求优雅停止（非阻塞）。"""
+        self._stop = True
+
+    def run(self):
+        if not (self._repo and self._py and os.path.isfile(
+                os.path.join(self._repo, "main.py"))):
+            self.sig_state.emit("failed", "找不到 AUTO-MAS 后端源码")
+            return
+
+        self._port = _free_port()
+        if not self._port:
+            self.sig_state.emit("failed", "无法分配监听端口")
+            return
+
+        env = dict(os.environ)
+        env.update({
+            "AUTO_MAS_SUPERVISED": "1",
+            "AUTO_MAS_SUPERVISED_PORT": str(self._port),
+            "AUTO_MAS_EXPECTED_VERSION": AUTO_MAS_EXPECTED_VERSION,
+        })
+        # main.py 会自行清理，但宿主侧也摘一遍更安全
+        for k in ("VIRTUAL_ENV", "UV", "UV_PROJECT_ENVIRONMENT",
+                  "UV_RUN_RECURSION_DEPTH"):
+            env.pop(k, None)
+
+        try:
+            os.makedirs(self._workdir, exist_ok=True)
+            self._proc = subprocess.Popen(
+                [self._py, os.path.join(self._repo, "main.py")],
+                cwd=self._workdir, env=env,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception as e:
+            self.sig_state.emit("failed", "拉起后端失败：%s" % e)
+            return
+
+        # 受监督时工作目录由监督器决定，不能 chdir 进 repo（main.py 约定）
+        self._job = self._attach_job(self._proc.pid)
+        self.sig_state.emit("starting", "端口 %d，pid %d" % (self._port, self._proc.pid))
+
+        # 等待就绪
+        h = None
+        end = time.time() + 90
+        while time.time() < end and not self._stop:
+            if self._proc.poll() is not None:
+                self.sig_state.emit("failed", "后端提前退出，rc=%s" % self._proc.returncode)
+                self._close_job()
+                return
+            h = self._get_health()
+            if h is not None:
+                break
+            time.sleep(1)
+
+        if h is None:
+            self.sig_state.emit("failed", "健康检查超时")
+            self._terminate()
+            return
+
+        # 校验协议版本
+        if h.get("protocol") != AUTO_MAS_HEALTH_PROTOCOL:
+            self.sig_state.emit(
+                "failed", "协议版本不兼容：后端 %s，期望 %s"
+                % (h.get("protocol"), AUTO_MAS_HEALTH_PROTOCOL))
+            self._stop_backend()
+            return
+        if h.get("ready") is not True:
+            self.sig_state.emit("failed", "后端未就绪：%s" % (h.get("backgroundError") or "未知"))
+            self._stop_backend()
+            return
+
+        self._health = h
+        warn = h.get("backgroundWarnings") or []
+        detail = "v%s" % h.get("version", "?")
+        if warn:
+            detail += "，警告 %d 项" % len(warn)
+        self.sig_state.emit("ready", detail)
+
+        # 保持运行，直到请求停止或进程意外退出
+        while not self._stop:
+            if self._proc.poll() is not None:
+                self.sig_state.emit("stopped", "后端自行退出")
+                self._close_job()
+                return
+            time.sleep(1)
+
+        self._stop_backend()
+        self.sig_state.emit("stopped", "已优雅关闭")
+
+    def _stop_backend(self):
+        """优雅关闭：先 close 接口，超时再强杀进程树。"""
+        try:
+            if self._proc is None or self._proc.poll() is not None:
+                self._close_job()
+                return
+            self._post_close()
+            try:
+                self._proc.wait(timeout=AUTO_MAS_CLOSE_TIMEOUT_SEC)
+            except Exception:
+                pass
+            if self._proc.poll() is None:
+                self._terminate()
+        except Exception:
+            pass
+        self._close_job()
+
+    def _terminate(self):
+        """兜底：强杀整棵进程树（Job Object 会连带子进程）。"""
+        try:
+            if self._proc is not None and self._proc.poll() is None:
+                subprocess.run(["taskkill", "/PID", str(self._proc.pid), "/F", "/T"],
+                               capture_output=True, timeout=15)
+        except Exception:
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
+        self._close_job()
 
 
 def build_banner_slides(apps, cards, max_slides=6):
