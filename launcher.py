@@ -11914,6 +11914,31 @@ class SettingsPage(QWidget):
         root.addWidget(self.tele_tip)
         self._refresh_tele_tip()
 
+        # ---------- AUTO-MAS 任务编排（融合集成）----------
+        root.addSpacing(18)
+        root.addWidget(StrongBodyLabel("AUTO-MAS 任务编排"))
+        tip_mas = CaptionLabel(
+            "聚合启动器内置的自动化工具引擎，支持多账号\n"
+            "任务队列、调度编排与脚本管理。常驻后台约 20MB 内存。")
+        tip_mas.setWordWrap(True)
+        root.addWidget(tip_mas)
+
+        self.mas_enabled_chk = QCheckBox("启用 AUTO-MAS 任务编排")
+        self.mas_enabled_chk.setCursor(Qt.PointingHandCursor)
+        cfg = self._read_cfg()
+        mas_enabled = bool(cfg.get("mas_enabled", True))
+        self.mas_enabled_chk.setChecked(mas_enabled)
+        self.mas_enabled_chk.stateChanged.connect(self._on_mas_toggle)
+        root.addWidget(self.mas_enabled_chk)
+
+        mas_status = CaptionLabel("")
+        mas_status.setStyleSheet("color:#8a8d96; font-size:11px; margin-top:-14px;")
+        mas_status.setText("已禁用 · 点击「启用」后常驻后台")
+        mas_status.setVisible(not mas_enabled)
+        root.addWidget(mas_status)
+        self.mas_status_lbl = mas_status
+        self.mas_state_locked = not mas_enabled  # 初始化状态锁
+
         # ---------- GitHub 账号 ----------
         root.addSpacing(18)
         root.addWidget(StrongBodyLabel("GitHub 账号"))
@@ -12007,6 +12032,30 @@ class SettingsPage(QWidget):
             return
         self.tele_ping_chk.setEnabled(self.tele_chk.isChecked())
         self._refresh_tele_tip()
+
+
+    def _on_mas_toggle(self, *_a):
+        """把开关写回 config.json（不动其它字段）。"""
+        cfg = self._read_cfg()
+        mas_enabled = self.mas_enabled_chk.isChecked()
+        cfg["mas_enabled"] = mas_enabled
+        try:
+            with open(self._cfg_path(), "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            QMessageBox.warning(self, "保存失败", "写 config.json 失败：%s" % e)
+            # 恢复勾选状态
+            self.mas_enabled_chk.setChecked(not mas_enabled)
+            return
+        if mas_enabled:
+            self.mas_status_lbl.setText(
+                "已启用 · 侧栏将显示「AUTO-MAS 任务编排」（重启后生效）")
+            self.mas_state_locked = False
+        else:
+            self.mas_status_lbl.setText(
+                "已禁用 · 侧栏菜单将在重启后移除")
+            self.mas_state_locked = True
+        self.mas_status_lbl.setVisible(True)
 
     # ---------- GitHub 账号 ----------
     def _refresh_github_state(self):
@@ -12481,8 +12530,15 @@ class Launcher(QWidget):
         root.setSpacing(0)
 
         # ===== 左侧固定侧栏 =====
-        # 只列正式助手：预约条目没有安装/运行语义，不该占侧栏（否则几十条撑爆侧栏）
-        self.sidebar = SideBar(LIVE_APPS)
+        # AUTO-MAS 融合集成状态：从 config.json 读开关（默认启用）。
+        # 命名沿用 locked：locked=True 表示功能未启用、菜单不显示。
+        self._mas_state_locked = not bool(_load_cfg_safe().get("mas_enabled", True))
+
+        # 只列正式助手 + AUTO-MAS：预约条目没有安装/运行语义，不该占侧栏（否则几十条撑爆侧栏）
+        mas_apps = list(LIVE_APPS)
+        if not self._mas_state_locked:
+            mas_apps.append({"key": "auto-mas-menu", "display": "AUTO-MAS 任务编排"})
+        self.sidebar = SideBar(mas_apps)
         root.addWidget(self.sidebar)
         # 挂进布局后立刻按主窗口当前宽度校正折叠态（启动即窄窗也能正确收起）
         self.sidebar.auto_adapt(self.width())
@@ -12600,6 +12656,7 @@ class Launcher(QWidget):
         """切到指定页面（侧栏点击、总览页点卡片两条路径共用）。
 
         "settings" 特殊：不切 stack，弹独立设置窗口（非模态，可与主窗口并存）。
+        "auto-mas-menu" 特殊：MAS 融合页面不是子页面，而是启动器的主内容区替换。
         """
         if key == "settings":
             self._open_settings_dialog()
@@ -12610,11 +12667,21 @@ class Launcher(QWidget):
                     self.sidebar.select(k)
                     break
             return
+        
+        if key == "auto-mas-menu":
+            # MAS 融合模式：直接切入 MAS 主界面，其他所有助手被隐藏
+            self._mas_toggle_fullscreen(True)
+            return
+        
         idx = self._page_index.get(key)
         if idx is None:
             return
         self.stack.setCurrentIndex(idx)
         self.sidebar.select(key)  # 内部有幂等守卫，不会递归
+        
+        # 如果切回总览/游戏卡片，关闭 MAS 全屏
+        if key == "overview" or key in self.cards:
+            self._mas_toggle_fullscreen(False)
 
     def _open_settings_dialog(self):
         """弹出设置独立窗（单例复用；已开则置顶激活，不重复创建）。"""
@@ -12624,6 +12691,31 @@ class Launcher(QWidget):
         self._settings_dialog.raise_()
         self._settings_dialog.activateWindow()
 
+    def _mas_toggle_fullscreen(self, on):
+        """MAS 融合模式：切换全屏页面/隐藏所有卡片。
+        
+        on=True: 启动 MAS 主界面（从 vendor/auto-mas 提取的 FastAPI 后端 + PySide6 前端）
+        on=False: 恢复原有助手卡片视图
+        """
+        if on and getattr(self, "_mas_state_locked", True):
+            QMessageBox.information(
+                self.window(), "AUTO-MAS 任务编排",
+                "请先在设置页启用 AUTO-MAS 功能。")
+            return
+        
+        if on:
+            # TODO: 初始化并显示 MAS 全屏界面（FastAPI 后端 + PySide6 前端）
+            # 暂时作为占位符：只显示一个简单的提示窗口
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.information(
+                self.window(), "AUTO-MAS 任务编排",
+                "即将在此处显示 MAS 原生界面（任务列表、调度台、脚本管理）。\n"
+                "后端引擎将自动启动并常驻后台。")
+            # 真正实现时：self.mas_widget.show(); stack.hide()
+        else:
+            # TODO: 关闭 MAS 全屏界面
+            # 真正实现时：self.mas_widget.hide(); stack.show()
+            pass
 
     def run_game_scan(self):
         """手动点「🔍 扫描游戏」或启动 1.2s 后自动触发。只扫尚未装好助手的 key。"""
