@@ -81,6 +81,11 @@ AUTO-MAS 的后端**（AGPL-3.0，锁 commit、保留上游 LICENSE 与 NOTICE�
   —— 那是「随时可清」的目录，装用户配置会丢；旧版写在 `.cache/auto-mas` 的会自动搬过来。
 - 缺 Python 3.12 环境时只有这一页标「不可用」，其余助手的安装/更新/启动完全不受影响。
 
+> 📦 **打包相关**：AUTO-MAS 自带 Python 环境实测 449 MB、后端源码 57.7 MB，
+> 打包版如何处理（含「打包版会回落 sys.executable 再开一个启动器」这个已修的坑）
+> 与 **AGPL-3.0 分发红线**，见
+> [wiki/AUTO-MAS-打包与许可证评估.md](./wiki/AUTO-MAS-打包与许可证评估.md)。
+
 ### 覆盖的游戏也不同（关键）
 
 AUTO-MAS 的脚本适配器为 `general / M9A / MAA / MaaEnd / Okww / SRC`：

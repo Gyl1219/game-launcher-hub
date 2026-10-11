@@ -113,6 +113,27 @@ chk("5c) config 里不再有 auto-mas 卡片条目",
     str([a.get("key") for a in launcher.APPS]))
 chk("5d) 菜单 key 常量未被改动", KEY == "auto-mas-menu", KEY)
 
+# ---------- 6) 优雅降级：缺 Python 3.12 时只有 MAS 页报不可用 ----------
+# 这是交接文档的验收项之一：「缺少 Python3.12 时仅该功能报错，其余功能正常」。
+orig_cands = launcher._auto_mas_python_candidates
+launcher._auto_mas_python_candidates = lambda root=None: []
+try:
+    page2 = launcher.MasPage()          # 独立实例，不污染 win.mas_page 的状态
+    page2.start_backend()
+    app.processEvents()
+    chk("6) 缺解释器 → failed 且提示说清原因",
+        page2._state == "failed" and "Python 3.12" in page2._detail,
+        "%s | %s" % (page2._state, page2._detail[:70]))
+    chk("6b) 缺解释器时不留下后台线程/进程",
+        page2._worker is None or page2._worker._proc is None)
+    chk("6c) 该状态下界面仍可渲染", page2._bodies["service"].count() > 1)
+finally:
+    launcher._auto_mas_python_candidates = orig_cands
+win.switch_to("overview")
+app.processEvents()
+chk("6d) 其它页面完全不受影响",
+    win.stack.currentWidget() is win.overview_page)
+
 print("\n通过 %d / 失败 %d" % (len(OK), len(FAIL)))
 for f in FAIL:
     print("   FAILED:", f)

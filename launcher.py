@@ -9494,7 +9494,9 @@ AUTO_MAS_VENDOR = os.path.join(LAUNCHER_DIR, "vendor", "auto-mas")
 def auto_mas_paths():
     """定位 AUTO-MAS 的后端源码与解释器。
 
-    返回 (repo_dir, python_exe)；任一项不存在返回 ("", "")。
+    返回 (repo_dir, python_exe)；找不到后端源码时返回 ("", "")，
+    **源码在但没有可用解释器时返回 (repo, "")** —— 这两种情况给用户的
+    提示完全不同（前者「没集成」、后者「缺 Python 3.12 环境」）。
 
     优先级：
       1) 本仓库的 vendor 副本（vendor/auto-mas，见其 NOTICE.md）——自包含，
@@ -9507,8 +9509,7 @@ def auto_mas_paths():
         for py in _auto_mas_python_candidates():
             if py and os.path.isfile(py):
                 return AUTO_MAS_VENDOR, py
-        return AUTO_MAS_VENDOR, sys.executable
-
+        return AUTO_MAS_VENDOR, ""
     # 2) 本机独立安装（D:\AUTO-MAS 或 launcher 同级）
     for root in (r"D:\AUTO-MAS", os.path.join(os.path.dirname(LAUNCHER_DIR), "AUTO-MAS")):
         repo = os.path.join(root, "repo")
@@ -9517,7 +9518,7 @@ def auto_mas_paths():
         for py in _auto_mas_python_candidates(root):
             if py and os.path.isfile(py):
                 return repo, py
-        return repo, sys.executable
+        return repo, ""
     return "", ""
 
 
@@ -9526,12 +9527,19 @@ def _auto_mas_python_candidates(root=None):
 
     AUTO-MAS 依赖较重且锁 Python 3.12，用它自带解释器最稳；
     独立安装缺失时才回退到启动器自身的解释器（可能版本不符，会走优雅降级）。
+
+    ⚠ **打包版（frozen）绝不能回落到 `sys.executable`**：onefile 打包后它就是
+    启动器自己的 `game-launcher-hub.exe`，拿它去 `Popen([exe, main.py])` 会
+    再开一个启动器窗口（或直接报参数错），而不是拉起后端。打包版没有随包
+    Python（AUTO-MAS 自带环境实测 449 MB，不可能塞进 112 MB 的单文件 exe），
+    所以这条路径必须老老实实返回「没有可用解释器」，由界面降级提示。
     """
     cands = []
     if root:
         cands.append(os.path.join(root, "environment", "python", "python.exe"))
     cands.append(r"D:\AUTO-MAS\environment\python\python.exe")
-    cands.append(sys.executable)
+    if not getattr(sys, "frozen", False):
+        cands.append(sys.executable)
     return cands
 
 
@@ -12807,9 +12815,15 @@ class MasPage(QWidget):
         if self._state in ("starting", "ready", "stopping"):
             return
         repo, py = auto_mas_paths()
-        if not (repo and py):
+        if not repo:
             self._set_state("failed",
-                            "未找到 AUTO-MAS 后端（vendor/auto-mas 或本机安装缺失）")
+                            "未找到 AUTO-MAS 后端（vendor/auto-mas 与本机安装都缺失）")
+            return
+        if not py:
+            self._set_state("failed",
+                            "找到后端源码，但没有可用的 Python 3.12 解释器。"
+                            "AUTO-MAS 自带解释器约 449 MB，不随启动器打包；"
+                            "请安装 AUTO-MAS（或用源码运行时指定其 environment/python）。")
             return
         self._home = auto_mas_home()
         try:

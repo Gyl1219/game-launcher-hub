@@ -223,6 +223,36 @@ chk("5j) 队列卡显示定时项与完成后动作",
     "23:00" in qct and "完成后关机" in qct and "每日首次" in qct,
     qct.replace("\n", " / ")[:140])
 
+# ================= 6) 打包版（frozen）解释器回落必须被禁掉 =================
+# 真实坑：PyInstaller onefile 打包后 sys.executable == game-launcher-hub.exe，
+# 若回落到它，Popen([exe, main.py]) 会再开一个启动器窗口而不是后端。
+old_frozen = getattr(sys, "frozen", None)
+old_cands = launcher._auto_mas_python_candidates
+try:
+    sys.frozen = True
+    cands = launcher._auto_mas_python_candidates()
+    chk("6) 打包版不回落到 sys.executable", sys.executable not in cands, str(cands))
+    chk("6b) 打包版候选里不含任何解释器（本机没装 AUTO-MAS 时就是这条路径）",
+        all(not c.endswith("python.exe") or "AUTO-MAS" in c for c in cands), str(cands))
+    # 模拟「后端源码在、但一个解释器都没有」：必须返回 (repo, "")，由界面降级提示，
+    # 而不是拿空路径去 Popen（旧实现会回落 sys.executable → 再开一个启动器）
+    launcher._auto_mas_python_candidates = lambda root=None: []
+    repo2, py2 = launcher.auto_mas_paths()
+    chk("6c) 无解释器时返回 (repo, '')",
+        bool(repo2) and py2 == "", "repo=%r py=%r" % (repo2, py2))
+finally:
+    launcher._auto_mas_python_candidates = old_cands
+    if old_frozen is None:
+        try:
+            del sys.frozen
+        except Exception:
+            pass
+    else:
+        sys.frozen = old_frozen
+chk("6d) 还原后开发路径仍能拿到解释器",
+    bool(launcher._auto_mas_python_candidates()),
+    str(launcher._auto_mas_python_candidates()))
+
 print("\n通过 %d / 失败 %d" % (len(OK), len(FAIL)))
 for f in FAIL:
     print("   FAILED:", f)
