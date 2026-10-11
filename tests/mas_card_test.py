@@ -41,32 +41,67 @@ started = []
 page.start_backend = lambda: started.append(True)
 page._auto_started = False
 
-# ---------- 1) 入口接线：菜单 → stack 页 ----------
-chk("1) 侧栏出现 AUTO-MAS 菜单", KEY in win.sidebar._buttons)
-chk("1b) 菜单文案正确",
-    win.sidebar._buttons[KEY]._label.text() == "AUTO-MAS 任务编排"
-    if KEY in win.sidebar._buttons else False)
-chk("1c) 菜单图标文件存在",
-    os.path.isfile(os.path.join(launcher.ASSETS_DIR, "auto-mas.png")),
-    os.path.join(launcher.ASSETS_DIR, "auto-mas.png"))
-chk("1d) 页面已入 stack 索引", KEY in win._page_index)
-win.switch_to(KEY)
+# ---------- 1) 入口接线：总览页右上角按钮 → stack 页 ----------
+# 用户实机反馈：MAS 是「管助手本体」的编排插件，不该与游戏助手平级摆侧栏，
+# 入口改到总览页右上角（与「扫描游戏」同排，带状态灯）。
+chk("1) 侧栏不再有 AUTO-MAS 项", KEY not in win.sidebar._buttons,
+    str(list(win.sidebar._buttons)))
+chk("1b) 侧栏只列游戏助手 + 总览 + 设置",
+    set(win.sidebar._buttons) == {"overview", "settings"} |
+    {a.get("key") for a in launcher.LIVE_APPS},
+    str(list(win.sidebar._buttons)))
+ov = win.overview_page
+chk("1c) 总览页有 MAS 入口按钮", hasattr(ov, "mas_btn"))
+chk("1d) 按钮文案正确", ov.mas_btn.text() == "AUTO-MAS 任务编排", ov.mas_btn.text())
+chk("1e) 入口带状态灯与定位说明",
+    hasattr(ov, "mas_dot") and ov.mas_cap.text().startswith("编排插件"),
+    ov.mas_cap.text())
+chk("1f) 入口默认可见（mas_enabled 默认 true）", ov.mas_box.isVisibleTo(ov))
+chk("1g) 卡片网格下方点明了层级",
+    "不是又一个助手" in ov.grid_foot.text(), ov.grid_foot.text()[:60])
+chk("1h) 页面已入 stack 索引", KEY in win._page_index)
+
+# 点入口按钮 → 切到 MAS 页
+ov.mas_btn.click()
 app.processEvents()
-chk("1e) 点菜单真的切到该页",
+chk("1i) 点入口真的切到该页",
     win.stack.currentIndex() == win._page_index[KEY],
     "current=%d" % win.stack.currentIndex())
-chk("1f) 页面就是 MasPage 实例", win.stack.currentWidget() is page)
-chk("1g) 首次进入页面自动拉起后端（WeGame 式常驻）",
+chk("1j) 页面就是 MasPage 实例", win.stack.currentWidget() is page)
+chk("1k) 进入编排页后侧栏无高亮（它没有对应导航项）",
+    all(not b._selected for b in win.sidebar._buttons.values()),
+    str({k: b._selected for k, b in win.sidebar._buttons.items()}))
+chk("1l) 首次进入页面自动拉起后端（WeGame 式常驻）",
     started == [True], "start_backend 调用 %d 次" % len(started))
-chk("1h) 自动启动只做一次（切走再回来不重复拉起）",
-    (lambda: (win.switch_to("overview"), win.switch_to(KEY),
-              app.processEvents(), len(started) == 1)[-1])(),
+
+# 状态灯：由 MasPage.sig_status 推送，而不是自己轮询
+page._set_state("ready", "v5.6.2")
+chk("1m) 状态灯随后端状态更新",
+    "运行中" in ov.mas_cap.text(), ov.mas_cap.text())
+page._set_state("failed", "boom")
+chk("1n) 失败态显示「不可用」", "不可用" in ov.mas_cap.text(), ov.mas_cap.text())
+page._set_state("stopped", "已停止")
+chk("1o) 停止态显示「未启动」", "未启动" in ov.mas_cap.text(), ov.mas_cap.text())
+ov.set_mas_available(False)
+app.processEvents()
+chk("1p) mas_enabled=false 时入口整块隐藏", not ov.mas_box.isVisibleTo(ov))
+ov.set_mas_available(True)
+app.processEvents()
+chk("1q) 重新启用后入口回来", ov.mas_box.isVisibleTo(ov))
+
+# 切回总览：不崩，高亮回到总览
+win.switch_to("overview")
+app.processEvents()
+chk("1r) 切回总览正常且侧栏高亮回到总览",
+    win.stack.currentWidget() is ov and win.sidebar._buttons["overview"]._selected)
+chk("1s) 再次进入不重复拉起后端",
+    (win.switch_to(KEY), app.processEvents(), len(started) == 1)[-1],
     "start_backend 调用 %d 次" % len(started))
 
-# ---------- 2) 四个分段视图 ----------
-chk("2) 视图数 = 4", page.views.count() == 4, str(page._seg_index))
+# ---------- 2) 五个分段视图（实时任务日志 + 队列/脚本/日志/服务信息）----------
+chk("2) 视图数 = 5", page.views.count() == 5, str(page._seg_index))
 chk("2b) 分段键齐全",
-    set(page._seg_index) == {"queue", "scripts", "log", "service"},
+    set(page._seg_index) == {"live", "queue", "scripts", "log", "service"},
     str(list(page._seg_index)))
 for key, idx in page._seg_index.items():
     page._on_seg(key)

@@ -9176,6 +9176,16 @@ class SideBar(QWidget):
             b.set_selected(k == key)
         self.sig_changed.emit(key)
 
+    def clear_selection(self):
+        """取消所有导航项高亮。
+
+        给「不在侧栏里的页面」用：AUTO-MAS 编排页从总览页右上角进入，它没有
+        对应的侧栏项；若不清掉高亮，侧栏会一直停在「总览」造成位置错觉。
+        """
+        self._current = None
+        for b in self._buttons.values():
+            b.set_selected(False)
+
 
 class OverviewCard(CardWidget):
     """总览页的轻量状态卡：只读展示 + 一个快捷按钮。
@@ -11332,9 +11342,14 @@ class ReservedSection(QWidget):
 
 
 class OverviewPage(QWidget):
-    """总览页：横幅轮播 + 榜单 + 正式助手卡片网格 + 下方预约区（整页可滚动）。"""
+    """总览页：横幅轮播 + 榜单 + 正式助手卡片网格 + 下方预约区（整页可滚动）。
+
+    AUTO-MAS 的入口在**右上角**（不放进卡片网格、也不占侧栏）：
+    它是「管这些助手本体」的编排插件，不是第 7 个游戏助手，摆平级会误导。
+    """
 
     sig_open_detail = Signal(str)
+    sig_open_mas = Signal()          # 点右上角「AUTO-MAS 任务编排」
 
     def __init__(self, apps, cards, on_scan=None, reserved=None):
         super().__init__()
@@ -11342,6 +11357,7 @@ class OverviewPage(QWidget):
         self._cards = cards
         self._reserved = list(reserved or [])
         self.overview_cards = []
+        self._mas_state = "off"
 
         # 整页放进滚动区：预约条目有几十条，不下滑就看不到，不能让页面无限长
         outer = QVBoxLayout(self)
@@ -11362,6 +11378,30 @@ class OverviewPage(QWidget):
             "总览：点卡片进入详情页，或直接点卡内按钮快速操作。状态每 5 秒自动刷新。")
         hint.setWordWrap(True)
         top.addWidget(hint, stretch=1)
+
+        # 右上角：AUTO-MAS 入口（状态灯 + 按钮 + 定位说明），与「扫描游戏」同排
+        self.mas_box = QWidget()
+        mb = QHBoxLayout(self.mas_box)
+        mb.setContentsMargins(0, 0, 0, 0)
+        mb.setSpacing(8)
+        self.mas_dot = QLabel("●")
+        self.mas_dot.setFixedWidth(12)
+        self.mas_dot.setStyleSheet("color:#8a8d96; font-size:14px;")
+        mb.addWidget(self.mas_dot)
+        self.mas_btn = PushButton("AUTO-MAS 任务编排")
+        self.mas_btn.setFixedHeight(32)
+        self.mas_btn.setCursor(Qt.PointingHandCursor)
+        self.mas_btn.clicked.connect(self.sig_open_mas)
+        mb.addWidget(self.mas_btn)
+        self.mas_cap = CaptionLabel("编排插件 · 未启动")
+        self.mas_cap.setStyleSheet("color:#8a8d96;")
+        mb.addWidget(self.mas_cap)
+        top.addWidget(self.mas_box)
+        self.mas_box.setToolTip(
+            "AUTO-MAS 不是游戏助手，是「管这些助手」的多账号任务编排插件：\n"
+            "帮你把已装好的助手按队列/定时跑起来，看状态与日志。\n"
+            "入口在这里而不放侧栏，是因为它与 6 个游戏助手不是同一层级。")
+
         self.scan_btn = PushButton("🔍 扫描游戏")
         self.scan_btn.setFixedHeight(32)
         self.scan_btn.setCursor(Qt.PointingHandCursor)
@@ -11395,6 +11435,15 @@ class OverviewPage(QWidget):
             self.overview_cards.append(oc)
             grid.addWidget(oc, i // 3, i % 3)
         root.addLayout(grid)
+
+        # 网格下方点明层级：上面这些是「游戏助手本体」，右上角那个是编排插件
+        # （用户反馈：MAS 和游戏助手不是同一层级，摆在侧栏/网格里会误导）
+        self.grid_foot = CaptionLabel(
+            "以上 %d 个是游戏助手本体；右上角「AUTO-MAS 任务编排」是管它们的编排插件"
+            "（多账号队列 / 定时 / 日志），不是又一个助手。" % len(self.overview_cards))
+        self.grid_foot.setStyleSheet("color:#8a8d96;")
+        self.grid_foot.setWordWrap(True)
+        root.addWidget(self.grid_foot)
 
         # 下方的预约区：只展示、投票，不提供安装
         if self._reserved:
@@ -11476,6 +11525,38 @@ class OverviewPage(QWidget):
     def _on_stats_done(self, repos):
         try:
             self.rank_rail.set_github(repos or {})
+        except Exception:
+            pass
+
+    def set_mas_available(self, on):
+        """mas_enabled=false 时整块入口隐藏（功能未启用，不给假入口）。"""
+        try:
+            self.mas_box.setVisible(bool(on))
+            self.grid_foot.setVisible(bool(on))
+        except Exception:
+            pass
+
+    def set_mas_status(self, state, detail=""):
+        """更新右上角状态灯与说明（由 MasPage.sig_status 推送，不额外轮询）。"""
+        self._mas_state = state or "off"
+        color = {"off": "#8a8d96", "stopped": "#8a8d96", "starting": "#EF9F27",
+                 "ready": "#639922", "stopping": "#EF9F27",
+                 "failed": "#E24B4A"}.get(self._mas_state, "#8a8d96")
+        text = {"off": "编排插件 · 未启用", "stopped": "编排插件 · 未启动",
+                "starting": "编排插件 · 启动中…", "ready": "编排插件 · 运行中",
+                "stopping": "编排插件 · 停止中…",
+                "failed": "编排插件 · 不可用"}.get(self._mas_state, "编排插件")
+        try:
+            self.mas_dot.setStyleSheet("color:%s; font-size:14px;" % color)
+            self.mas_cap.setText(text)
+            self.mas_cap.setStyleSheet(
+                "color:%s;" % (color if self._mas_state == "ready" else "#8a8d96"))
+            tip = ("AUTO-MAS 不是游戏助手，是「管这些助手」的多账号任务编排插件：\n"
+                   "帮你把已装好的助手按队列/定时跑起来，看状态与日志。\n"
+                   "入口在这里而不放侧栏，是因为它与 6 个游戏助手不是同一层级。")
+            if detail:
+                tip += "\n\n当前：%s（%s）" % (text, detail)
+            self.mas_box.setToolTip(tip)
         except Exception:
             pass
 
@@ -12327,6 +12408,278 @@ class MasApiBatchWorker(QThread):
         self.sig_done.emit(out)
 
 
+# ===== AUTO-MAS 实时事件通道（手写 RFC6455 客户端） =====
+# 上游的主 WebSocket（vendor/auto-mas/app/core/ws/）是它唯一的**实时**通道：
+# 任务日志与脚本状态只在这里推，HTTP 侧只有"某一刻的快照"。
+# 契约（已读源码核实）：
+#   · GET /api/core/ws，无鉴权、无子协议，消息为统一信封 {"id","type","data"}；
+#   · 服务端每 20 秒发 ping（uvicorn ws_ping_interval=20 / ws_ping_timeout=20），
+#     **客户端必须回 pong**，否则 20 秒后连接被判死；
+#   · 同一时刻只允许一条主连接，新连接会用 4001 + "replaced-by-new-connection"
+#     把旧连接踢掉 —— 收到 4001 必须**停止重连**（上游前端就是这个约定，
+#     否则两边会互相把对方踢下线）。
+#
+# 为什么手写而不用 PySide6.QtWebSockets（本机实测该模块存在）：
+#   1) 本项目「零新依赖」原则：requirements 只列实测被 import 的第三方包，
+#      而 Qt 模块在 PyInstaller 里还要额外收插件；
+#   2) 只有 127.0.0.1 的明文 ws://，不需要 TLS / 代理 / 子协议 / 扩展协商；
+#   3) QThread + 阻塞 recv 的模型与 ServiceWorker 一致，不必为 QWebSocket 造事件循环；
+#   4) 编解码是纯函数，可以被单元测试直接钉死（tests/mas_ws_test.py）。
+MAS_WS_PATH = "/api/core/ws"
+MAS_WS_STALL_SEC = 90                       # 单帧读不齐的容忍上限（服务端 20s 心跳，够宽松）
+MAS_WS_RECONNECT_SEC = 3.0
+MAS_WS_MAX_FRAME_BYTES = 8 * 1024 * 1024    # 单帧上限，防异常帧把内存吃光
+MAS_WS_CLOSE_REPLACED = 4001                # 被其它前端接管
+MAS_WS_LIVE_TEXT_CAP = 120 * 1024           # 每个任务在实时页里保留的日志字符上限
+MAS_WS_LIVE_RENDER_MS = 250                 # 增量日志合并渲染间隔
+
+
+def _ws_accept_key(key):
+    """按 RFC6455 计算 Sec-WebSocket-Accept，用于校验服务端握手。"""
+    raw = (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")
+    return base64.b64encode(hashlib.sha1(raw).digest()).decode("ascii")
+
+
+def _ws_build_frame(payload, opcode=0x1, mask=True):
+    """构造一个 WebSocket 帧（客户端 → 服务端必须掩码，RFC6455 §5.3）。"""
+    if isinstance(payload, str):
+        payload = payload.encode("utf-8")
+    n = len(payload)
+    header = bytearray()
+    header.append(0x80 | (opcode & 0x0F))       # FIN=1 + opcode
+    flag = 0x80 if mask else 0x00
+    if n < 126:
+        header.append(flag | n)
+    elif n < 65536:
+        header.append(flag | 126)
+        header += struct.pack(">H", n)
+    else:
+        header.append(flag | 127)
+        header += struct.pack(">Q", n)
+    if not mask:
+        return bytes(header) + payload
+    key = os.urandom(4)
+    masked = bytes(b ^ key[i % 4] for i, b in enumerate(payload))
+    return bytes(header) + key + masked
+
+
+def _ws_read_exact(sock, n, on_idle=None, stall_sec=MAS_WS_STALL_SEC):
+    """从 socket 精确读 n 字节。
+
+    超时（socket.timeout）**不能**当成「这一帧结束了」—— 半帧丢掉会让整条
+    连接后面的帧全部错位。所以超时只在没读满时重试，靠 on_idle 回调
+    （返回真即中止）保证线程能被停下来，靠 stall_sec 防真死等。
+    """
+    buf = bytearray()
+    last = time.time()
+    while len(buf) < n:
+        try:
+            chunk = sock.recv(n - len(buf))
+        except socket.timeout:
+            if on_idle is not None and on_idle():
+                raise ConnectionError("已请求停止")
+            if time.time() - last > stall_sec:
+                raise ConnectionError("读取停滞超过 %ds" % stall_sec)
+            continue
+        if not chunk:
+            raise ConnectionError("连接已被对端关闭")
+        buf += chunk
+        last = time.time()
+    return bytes(buf)
+
+
+def _ws_read_frame(sock, on_idle=None):
+    """读一帧，返回 (fin, opcode, payload)。
+
+    服务端 → 客户端的帧按规范不掩码，但掩码分支一并实现：
+    假后端/中间件的实现差异不该让整个实时日志不可用。
+    """
+    b0, b1 = _ws_read_exact(sock, 2, on_idle)
+    fin = bool(b0 & 0x80)
+    opcode = b0 & 0x0F
+    masked = bool(b1 & 0x80)
+    n = b1 & 0x7F
+    if n == 126:
+        n = struct.unpack(">H", _ws_read_exact(sock, 2, on_idle))[0]
+    elif n == 127:
+        n = struct.unpack(">Q", _ws_read_exact(sock, 8, on_idle))[0]
+    if n > MAS_WS_MAX_FRAME_BYTES:
+        raise ValueError("帧过大：%d 字节" % n)
+    key = _ws_read_exact(sock, 4, on_idle) if masked else b""
+    data = _ws_read_exact(sock, n, on_idle) if n else b""
+    if masked:
+        data = bytes(b ^ key[i % 4] for i, b in enumerate(data))
+    return fin, opcode, data
+
+
+class MasEventClient(QThread):
+    """AUTO-MAS 主 WebSocket 客户端：断线自动重连，收到 4001 主动让位。
+
+    状态机：connecting → connected →（closed | error）→ 重连 … → stopped
+    唯一例外是 4001：说明官方界面（或另一个启动器）接管了主连接，
+    此时**不再重连**，只发 yielded 让界面提示「实时日志已让位」。
+    """
+
+    sig_state = Signal(str, str)             # (state, detail)
+    sig_event = Signal(str, str, object)     # (type, id, data)
+
+    def __init__(self, port, parent=None):
+        super().__init__(parent)
+        self._port = int(port or 0)
+        self._stop = False
+        self._yielded = False
+        self._sock = None
+
+    # ---------- 主线程调用 ----------
+    def request_stop(self):
+        """请求停止（非阻塞）：置标志 + 拆 socket，让阻塞中的 recv 立刻返回。"""
+        self._stop = True
+        s = self._sock
+        if s is not None:
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+
+    # ---------- 线程内部 ----------
+    def _is_stopping(self):
+        return self._stop
+
+    def _sleep(self, seconds):
+        end = time.time() + seconds
+        while not self._stop and time.time() < end:
+            time.sleep(0.1)
+
+    def run(self):
+        if not self._port:
+            self.sig_state.emit("error", "端口未知，无法连接实时通道")
+            return
+        while not self._stop:
+            try:
+                self._connect()
+            except Exception as e:
+                if self._stop:
+                    break
+                self.sig_state.emit("error", "%s: %s" % (type(e).__name__, e))
+                self._sleep(MAS_WS_RECONNECT_SEC)
+                continue
+            self.sig_state.emit("connected", "127.0.0.1:%d" % self._port)
+            try:
+                self._recv_loop()
+            except Exception as e:
+                if not self._stop:
+                    self.sig_state.emit("error", "%s: %s" % (type(e).__name__, e))
+            if self._yielded:
+                self.sig_state.emit("yielded", "已被官方界面接管（4001），不再重连")
+                break
+            if self._stop:
+                break
+            self.sig_state.emit("closed", "连接已断开，准备重连")
+            self._sleep(MAS_WS_RECONNECT_SEC)
+        self._close_sock()
+        self.sig_state.emit("stopped", "")
+
+    def _connect(self):
+        self._close_sock()
+        s = socket.create_connection(("127.0.0.1", self._port), timeout=5)
+        try:
+            s.settimeout(1.0)
+            key = base64.b64encode(os.urandom(16)).decode("ascii")
+            req = (
+                "GET %s HTTP/1.1\r\n"
+                "Host: 127.0.0.1:%d\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                "Sec-WebSocket-Key: %s\r\n"
+                "Sec-WebSocket-Version: 13\r\n\r\n"
+            ) % (MAS_WS_PATH, self._port, key)
+            s.sendall(req.encode("ascii"))
+            head = bytearray()
+            while b"\r\n\r\n" not in head:
+                if len(head) > 16384:
+                    raise ConnectionError("握手响应异常")
+                chunk = s.recv(256)
+                if not chunk:
+                    raise ConnectionError("握手期间连接被关闭")
+                head += chunk
+            text = bytes(head).decode("latin-1")
+            status = text.split("\r\n", 1)[0]
+            if " 101" not in status:
+                raise ConnectionError("握手被拒：%s" % status.strip())
+            if _ws_accept_key(key).lower() not in text.lower():
+                raise ConnectionError("Sec-WebSocket-Accept 校验失败")
+        except Exception:
+            try:
+                s.close()
+            except Exception:
+                pass
+            raise
+        self._sock = s
+
+    def _recv_loop(self):
+        """收帧直到断开/停止。ping 必须回 pong；文本帧按信封解析后发信号。"""
+        buf = bytearray()
+        buf_opcode = 0
+        while not self._stop:
+            fin, opcode, data = _ws_read_frame(self._sock, self._is_stopping)
+            if opcode == 0x8:                       # close
+                code = struct.unpack(">H", data[:2])[0] if len(data) >= 2 else 0
+                if code == MAS_WS_CLOSE_REPLACED:
+                    self._yielded = True
+                return
+            if opcode == 0x9:                       # ping → pong（不回就等 20s 被判死）
+                self._send(_ws_build_frame(data, opcode=0xA))
+                continue
+            if opcode == 0xA:                       # pong
+                continue
+            if opcode in (0x1, 0x2):
+                buf = bytearray(data)
+                buf_opcode = opcode
+                if not fin:
+                    continue
+            elif opcode == 0x0:                     # continuation
+                buf += data
+                if not fin:
+                    continue
+            else:
+                continue
+            if buf_opcode == 0x1:
+                self._on_text(bytes(buf))
+            buf = bytearray()
+            buf_opcode = 0
+
+    def _on_text(self, raw):
+        try:
+            msg = json.loads(raw.decode("utf-8", "replace"))
+        except Exception:
+            return
+        if not isinstance(msg, dict):
+            return
+        type_ = str(msg.get("type") or "").strip()
+        tid = str(msg.get("id") or "").strip()
+        if not type_ or not tid:
+            # 上游信封（WSEnvelope）要求 id/type 非空并 strip；空的直接丢，
+            # 免得把"空事件"算进事件计数里干扰判断
+            return
+        data = msg.get("data")
+        self.sig_event.emit(type_, tid, data if isinstance(data, dict) else {})
+
+    def _send(self, payload):
+        try:
+            if self._sock is not None:
+                self._sock.sendall(payload)
+        except Exception:
+            pass
+
+    def _close_sock(self):
+        s, self._sock = self._sock, None
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+
 def _mas_short(uid):
     """uuid 太长，列表里只展示前 8 位（后端没有更友好的短名）。"""
     return (uid or "")[:8]
@@ -12626,7 +12979,12 @@ class MasPage(QWidget):
 
     生命周期：后端由本页持有的 ServiceWorker 拉起，**切页不停后端**
     （用户可能正在跑队列）；只有启动器真正退出时才优雅关闭（见 shutdown()）。
+
+    入口不在侧栏：总览页右上角的「AUTO-MAS 任务编排」按钮进来（WeGame 式插件位），
+    因为它是「管助手本体」的编排插件，与 6 个游戏助手不是同一层级。
     """
+
+    sig_status = Signal(str, str)    # (state, detail) → 总览页右上角状态灯
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -12646,6 +13004,14 @@ class MasPage(QWidget):
         self._script_data = {}       # scriptUid -> config
         self._users = {}             # scriptUid -> {"index": [...], "data": {...}}
         self._runtime = []
+        # ---- 实时事件通道（WebSocket）----
+        self._events = None          # MasEventClient
+        self._ws_state = "off"
+        self._ws_detail = ""
+        self._ws_events = 0          # 收到的事件条数（界面显示，便于判断是否真有推送）
+        self._live_tasks = {}        # taskId -> {"text","mode","name","state","info"}
+        self._live_notices = []
+        self._live_dirty = False
         # ---- 线程/目录 ----
         self._jobs = []
         self._busy = False
@@ -12724,6 +13090,7 @@ class MasPage(QWidget):
 
         # ---- 视图切换 ----
         self.seg = SegmentedWidget()
+        self.seg.addItem("live", "实时任务日志")
         self.seg.addItem("queue", "任务队列")
         self.seg.addItem("scripts", "脚本与账号")
         self.seg.addItem("log", "运行日志")
@@ -12732,20 +13099,30 @@ class MasPage(QWidget):
         root.addWidget(self.seg)
 
         self.views = QStackedWidget()
+        seg_keys = ("live", "queue", "scripts", "log", "service")
+        self.live_view = self._make_live_view()
         self.queue_view = self._make_list_view("queue")
         self.scripts_view = self._make_list_view("scripts")
         self.log_view = self._make_log_view()
         self.service_view = self._make_list_view("service")
-        for i, w in enumerate((self.queue_view, self.scripts_view,
+        for i, w in enumerate((self.live_view, self.queue_view, self.scripts_view,
                                self.log_view, self.service_view)):
             self.views.addWidget(w)
-            self._seg_index[("queue", "scripts", "log", "service")[i]] = i
+            self._seg_index[seg_keys[i]] = i
         root.addWidget(self.views, 1)
+        # 默认停在「任务队列」（编排的主战场）；实时日志是跑起来之后才看的
         self.seg.setCurrentItem("queue")
 
         self._timer = QTimer(self)
         self._timer.setInterval(AUTO_MAS_REFRESH_MS)
         self._timer.timeout.connect(self.reload)
+
+        # 实时日志的合并渲染定时器：上游按增量推日志，一次可能连来很多条，
+        # 逐条重排 QTextEdit 会拖 UI（本项目 10-07 的教训：高频小额操作累积）。
+        self._live_timer = QTimer(self)
+        self._live_timer.setSingleShot(True)
+        self._live_timer.setInterval(MAS_WS_LIVE_RENDER_MS)
+        self._live_timer.timeout.connect(self._render_live)
 
     def _make_list_view(self, key):
         """一个视图 = 顶部操作条 + 滚动列表；操作条内容每次渲染时重建。"""
@@ -12771,6 +13148,37 @@ class MasPage(QWidget):
         v.addWidget(scroll, 1)
         self._heads[key] = head
         self._bodies[key] = lay
+        return box
+
+    def _make_live_view(self):
+        """实时任务日志：接后端 WebSocket 的任务日志/状态增量。
+
+        与「运行日志」的区别：那边 tail 的是后端自己的 app.log（服务级、落盘、
+        15 秒粒度）；这里推的是**任务级**实时日志（脚本跑起来的每一行），
+        只有 WebSocket 有（上游没有对应的 HTTP 接口）。
+        """
+        box = QWidget()
+        v = QVBoxLayout(box)
+        v.setContentsMargins(4, 4, 12, 12)
+        v.setSpacing(8)
+        head = QHBoxLayout()
+        head.setContentsMargins(0, 0, 0, 0)
+        head.setSpacing(8)
+        self.live_note = CaptionLabel("实时通道未连接（先启动后端）")
+        self.live_note.setStyleSheet("color:#8a8d96;")
+        self.live_note.setWordWrap(True)
+        head.addWidget(self.live_note, 1)
+        self.live_clear_btn = PushButton("清空")
+        self.live_clear_btn.setFixedHeight(28)
+        self.live_clear_btn.setCursor(Qt.PointingHandCursor)
+        self.live_clear_btn.clicked.connect(self.clear_live)
+        head.addWidget(self.live_clear_btn)
+        v.addLayout(head)
+        self.live_edit = QTextEdit()
+        self.live_edit.setReadOnly(True)
+        self.live_edit.setStyleSheet(
+            "font-family:Consolas,'Courier New',monospace; font-size:12px;")
+        v.addWidget(self.live_edit, 1)
         return box
 
     def _make_log_view(self):
@@ -12854,6 +13262,7 @@ class MasPage(QWidget):
             self._timer.stop()
         except Exception:
             pass
+        self._stop_events()
         w = self._worker
         if w is not None and w.isRunning():
             try:
@@ -12869,8 +13278,10 @@ class MasPage(QWidget):
             self._base = ("http://127.0.0.1:%d" % self._port) if self._port else ""
             self._health = dict(getattr(w, "_health", None) or {})
             self._set_state("ready", "已就绪：%s（数据目录 %s）" % (detail, self._home))
+            self._start_events()          # 实时通道（任务日志/状态）
             self.reload()
             return
+        self._stop_events()
         self._base = ""
         self._port = 0
         if state == "failed":
@@ -12886,6 +13297,11 @@ class MasPage(QWidget):
     def _set_state(self, state, detail=""):
         self._state = state
         self._detail = detail or ""
+        # 总览页右上角的状态灯不轮询，靠这个信号推（省一次定时器 + 保证一致）
+        try:
+            self.sig_status.emit(state, self._detail)
+        except Exception:
+            pass
         color = {"stopped": "#8a8d96", "starting": "#EF9F27", "ready": "#639922",
                  "stopping": "#EF9F27", "failed": "#E24B4A"}.get(state, "#8a8d96")
         text = {"stopped": "未启动", "starting": "启动中…", "ready": "运行中",
@@ -12988,12 +13404,177 @@ class MasPage(QWidget):
                 self._users[uid] = {"index": index, "data": conf}
         self._render_all()
 
+    # ================= 实时通道（WebSocket） =================
+    def _start_events(self):
+        """后端就绪后接上实时通道。已在跑就不重复建（幂等）。"""
+        self._stop_events()
+        if not self._port:
+            return
+        try:
+            c = MasEventClient(self._port)
+            c.sig_state.connect(self._on_ws_state)
+            c.sig_event.connect(self._on_ws_event)
+            self._events = c
+            self._ws_state = "connecting"
+            self._ws_detail = ""
+            c.start()
+        except Exception as e:
+            self._events = None
+            self._ws_state = "error"
+            self._ws_detail = "%s: %s" % (type(e).__name__, e)
+        self._render_live()
+
+    def _stop_events(self):
+        """停掉实时通道（后端停止/启动器退出时调用）。
+
+        「让位」提示（4001）只在后端还活着时有意义 —— 后端真停了就回到
+        「未连接」，否则界面会一直挂着一条已经不成立的说明。
+        """
+        c = self._events
+        self._events = None
+        if c is not None:
+            try:
+                c.request_stop()
+                c.wait(3000)          # 最多等 3 秒，超时也不能挡住退出
+            except Exception:
+                pass
+        self._ws_state = "off"
+        self._ws_detail = ""
+
+    def _on_ws_state(self, state, detail):
+        # 让位（4001）之后客户端会再发一个 stopped 收尾；那个不能覆盖掉
+        # 「已被官方界面接管」的关键提示，否则用户会以为是普通断开。
+        if state == "stopped" and self._ws_state == "yielded":
+            return
+        self._ws_state = state
+        self._ws_detail = detail or ""
+        # error/closed 会由客户端自己重连，这里只更新提示，不重复建线程
+        self._live_dirty = True
+        self._live_timer.start()
+
+    def _on_ws_event(self, type_, tid, data):
+        """处理上游事件信封（type/id/data）。
+
+        上游语义（vendor/auto-mas/app/core/ws/task_manager 侧）：
+          · task.log.updated 的 data.append=True 时 log 是**新增片段**，
+            False 时是整段替换 + firstLine 有真实行号；
+          · task.created 只在 TaskManager 上发一次，带 mode/queueId/taskName；
+          · task.completed 带 outcome/error。
+        """
+        self._ws_events += 1
+        if type_ == "task.created":
+            t = self._live_task(tid)
+            t["mode"] = data.get("mode") or t.get("mode") or ""
+            t["name"] = data.get("taskName") or t.get("name") or ""
+            t["state"] = "created"
+        elif type_ == "task.log.updated":
+            t = self._live_task(tid)
+            chunk = str(data.get("log") or "")
+            if data.get("append"):
+                t["text"] = (t.get("text") or "") + chunk
+            else:
+                t["text"] = chunk
+            if len(t["text"]) > MAS_WS_LIVE_TEXT_CAP:
+                t["text"] = t["text"][-MAS_WS_LIVE_TEXT_CAP:]
+            t["seq"] = data.get("seq")
+        elif type_ == "task.info.updated":
+            t = self._live_task(tid)
+            t["info"] = data.get("task_info") or []
+            t["cycle"] = data.get("cycleNextList") or []
+        elif type_ == "task.completed":
+            t = self._live_task(tid)
+            outcome = data.get("outcome") or "?"
+            err = data.get("error")
+            t["state"] = ("完成：%s" % outcome) + (("（%s）" % err) if err else "")
+        elif type_ == "task.notice":
+            t = self._live_task(tid)
+            t["text"] = (t.get("text") or "") + "\n[%s] %s\n" % (
+                data.get("level") or "info", data.get("message") or "")
+        elif type_ == "system.notice":
+            title = data.get("title") or "系统通知"
+            lines = data.get("lines") or []
+            self._live_notices.append("%s：%s" % (title, "；".join(str(x) for x in lines)))
+        elif type_ == "backend.shutdown.ready":
+            self._live_notices.append("后端已完成关闭流程")
+        elif type_ == "frontend.close.requested":
+            self._live_notices.append("后端请求前端退出")
+        else:
+            return                    # 其它事件（更新进度/模拟器/签到）本页暂不展示
+
+        # 合并渲染：250ms 内的多条事件只重排一次 QTextEdit
+        self._live_dirty = True
+        if not self._live_timer.isActive():
+            self._live_timer.start()
+
+    def _live_task(self, task_id):
+        return self._live_tasks.setdefault(task_id or "?", {
+            "text": "", "mode": "", "name": "", "state": "running", "info": []})
+
+    def clear_live(self):
+        self._live_tasks = {}
+        self._live_notices = []
+        self._ws_events = 0
+        self._live_dirty = True
+        self._render_live()
+
+    def _live_state_text(self):
+        return {
+            "off": "未连接（先启动后端）",
+            "connecting": "连接中…",
+            "connected": "已连接，等待任务事件",
+            "closed": "连接断开，正在重连…",
+            "error": "连接异常，正在重连…",
+            "yielded": "已被官方界面接管，实时日志已让位",
+            "stopped": "已停止",
+        }.get(self._ws_state, self._ws_state)
+
+    def _render_live(self):
+        self._live_dirty = False
+        try:
+            note = "实时通道：%s" % self._live_state_text()
+            if self._ws_detail:
+                note += "（%s）" % self._ws_detail
+            note += " · 事件 %d 条 · 任务 %d 个" % (self._ws_events, len(self._live_tasks))
+            self.live_note.setText(note)
+            self.live_clear_btn.setEnabled(bool(self._live_tasks or self._live_notices))
+
+            parts = []
+            for tid, t in self._live_tasks.items():
+                head = "===== 任务 %s" % _mas_short(tid)
+                if t.get("mode"):
+                    head += " · %s" % t["mode"]
+                if t.get("name"):
+                    head += " · %s" % t["name"]
+                if t.get("state"):
+                    head += " · %s" % t["state"]
+                head += " ====="
+                body = t.get("text") or ""
+                for si in (t.get("info") or [])[:8]:
+                    body += "\n· %s：%s" % (si.get("name") or _mas_short(si.get("script_id", "")),
+                                            si.get("status") or "")
+                parts.append(head + "\n" + body)
+            if self._live_notices:
+                parts.append("===== 系统通知 =====\n" + "\n".join(self._live_notices[-50:]))
+            if not parts:
+                text = ("（还没有任务事件）\n\n"
+                        "任务日志只有 WebSocket 通道有，上游没有对应的 HTTP 接口。\n"
+                        "运行一个队列/脚本后，这里会实时滚动它的每一行输出；\n"
+                        "后端服务自身的日志（落盘）在「运行日志」分段里看。")
+            else:
+                text = "\n\n".join(parts)
+            self.live_edit.setPlainText(text)
+            sb = self.live_edit.verticalScrollBar()
+            sb.setValue(sb.maximum())
+        except Exception:
+            pass
+
     # ================= 渲染 =================
     def _render_all(self):
         self._render_queue()
         self._render_scripts()
         self._render_service()
         self._render_log()
+        self._render_live()
 
     def _script_names(self):
         out = {}
@@ -13354,15 +13935,14 @@ class Launcher(QWidget):
 
         # ===== 左侧固定侧栏 =====
         # AUTO-MAS 融合集成状态：从 config.json 读开关（默认启用）。
-        # 命名沿用 locked：locked=True 表示功能未启用、菜单不显示。
+        # 命名沿用 locked：locked=True 表示功能未启用、入口不显示。
         self._mas_state_locked = not bool(_load_cfg_safe().get("mas_enabled", True))
 
-        # 只列正式助手 + AUTO-MAS：预约条目没有安装/运行语义，不该占侧栏（否则几十条撑爆侧栏）
-        mas_apps = list(LIVE_APPS)
-        if not self._mas_state_locked:
-            mas_apps.append({"key": AUTO_MAS_MENU_KEY, "display": "AUTO-MAS 任务编排",
-                             "icon": os.path.join(ASSETS_DIR, "auto-mas.png")})
-        self.sidebar = SideBar(mas_apps)
+        # 侧栏**只列游戏助手本体**（+ 总览 + 设置）。
+        # AUTO-MAS 入口不在这里：它是「管这些助手」的编排插件，与游戏助手不是
+        # 同一层级，摆平级会让用户以为是第 7 个助手（用户实机反馈）。
+        # 入口在总览页右上角（带状态灯），仍切入同一个常驻页面。
+        self.sidebar = SideBar(list(LIVE_APPS))
         root.addWidget(self.sidebar)
         # 挂进布局后立刻按主窗口当前宽度校正折叠态（启动即窄窗也能正确收起）
         self.sidebar.auto_adapt(self.width())
@@ -13395,6 +13975,14 @@ class Launcher(QWidget):
         # 3b) AUTO-MAS 融合页（原生界面，见文件上方 MasPage）
         #     常驻 stack：切页不销毁，后端进程也不会因为离开页面被停掉。
         self.mas_page = MasPage()
+        # 入口接线：总览页右上角按钮 → 切到 MAS 页；MAS 状态 → 总览页状态灯。
+        # 状态用信号推、不轮询，所以两边永远一致且不增加定时器。
+        self.overview_page.sig_open_mas.connect(
+            lambda: self.switch_to(AUTO_MAS_MENU_KEY))
+        self.mas_page.sig_status.connect(self.overview_page.set_mas_status)
+        self.overview_page.set_mas_available(not self._mas_state_locked)
+        self.overview_page.set_mas_status(
+            "stopped" if not self._mas_state_locked else "off")
 
         # 4) 按「总览 → 三个游戏 → AUTO-MAS」顺序入栈，全部常驻
         #    设置不放 stack：点侧栏「设置」弹独立 SettingsDialog（见 switch_to），
@@ -13509,7 +14097,11 @@ class Launcher(QWidget):
         if idx is None:
             return
         self.stack.setCurrentIndex(idx)
-        self.sidebar.select(key)  # 内部有幂等守卫，不会递归
+        if key == AUTO_MAS_MENU_KEY:
+            # 编排页没有侧栏项：清掉高亮，否则侧栏会一直停在「总览」造成错觉
+            self.sidebar.clear_selection()
+        else:
+            self.sidebar.select(key)  # 内部有幂等守卫，不会递归
 
     def _open_settings_dialog(self):
         """弹出设置独立窗（单例复用；已开则置顶激活，不重复创建）。"""
