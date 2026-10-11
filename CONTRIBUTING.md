@@ -2,7 +2,15 @@
 
 感谢你想改进这个项目！先花 5 分钟读完本文，能避开这里踩过的所有坑。
 
-本项目是**单文件 PySide6 桌面应用**（`launcher.py`，约 1.2 万行），GPL-3.0 开源。
+本项目是**单文件 PySide6 桌面应用**（`launcher.py`，约 1.4 万行），GPL-3.0 开源。
+
+> ⚠️ **许可证硬约束（动 AUTO-MAS 相关代码前必读）**
+> `vendor/auto-mas/` 是 [AUTO-MAS](https://cnb.cool/AUTO-MAS-Project/AUTO-MAS.git) 的
+> **AGPL-3.0** 后端源码（vendor 方式内嵌，锁 commit、**不改上游一行**，来源与约束见
+> `vendor/auto-mas/NOTICE.md`）。AGPL 与 GPL-3.0 **不兼容**：本仓库当前是 GPL-3.0，
+> 只满足「不分发」前提。**对外分发含 AUTO-MAS 的产物前，必须先把本项目改为 AGPL-3.0
+> （或双许可）**，并同步改 `LICENSE` / `README` / `spec` 与发布页说明。
+> 提 PR 时也不要修改 `vendor/auto-mas/` 内任何文件（要修就向上游提）。
 
 ---
 
@@ -237,6 +245,8 @@ fix(overview): 排行榜字号随栏宽缩放
 | `ProcScanner` / `HeartBeat` | 进程检测单例与统一心跳 |
 | `NavButton` / `SideBar` | 左侧导航（含折叠与随窗口缩放） |
 | `AppCard` | 单个助手的详情页卡片 |
+| `ServiceWorker` / `auto_mas_paths` / `auto_mas_home` | AUTO-MAS 后端监督、定位与数据目录 |
+| `MasPage` / `MasApiBatchWorker` / `mas_api_request` | AUTO-MAS 融合页（原生前端，HTTP 全在后台线程） |
 | `OverviewPage` / `BannerCarousel` / `RankRail` | 总览页、海报轮播、排行榜 |
 | `SettingsPage` / `SettingsDialog` | 设置（独立窗口） |
 

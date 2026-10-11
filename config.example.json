@@ -88,7 +88,9 @@
       "website": "https://maaend.com/"
     }
   ],
+  "_comment_mas": "AUTO-MAS 任务编排（融合集成）。mas_enabled=false 时侧栏不显示该页、也不会拉起后端；auto_mas_home 留空则用启动器目录下的 auto-mas/（后端把账号、队列、脚本配置、历史与日志全写在这里，属于用户数据，别指向临时目录）。",
   "mas_enabled": true,
+  "auto_mas_home": "",
   "telemetry": {
     "enabled": true,
     "ping": false,

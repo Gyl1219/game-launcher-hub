@@ -56,9 +56,10 @@ from PySide6.QtWidgets import (
 )
 from qfluentwidgets import (
     setTheme, Theme, CardWidget, IconWidget, StrongBodyLabel,
-    CaptionLabel, PushButton, ComboBox, FluentIcon, IndeterminateProgressBar,
+    CaptionLabel, BodyLabel, PushButton, PrimaryPushButton, ComboBox,
+    FluentIcon, IndeterminateProgressBar,
     LineEdit, InfoBar, InfoBarPosition, RoundMenu, Action,
-    TransparentToolButton, SearchLineEdit,
+    TransparentToolButton, SearchLineEdit, SegmentedWidget,
 )
 
 
@@ -70,7 +71,7 @@ from qfluentwidgets import (
 
 # 启动器自身版本（打包版 / 源码版共用）。发新版时只改这一处，
 # 显示在「设置」页页脚，便于报 bug 时说清自己在跑哪个版本。
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 # ===== 应用配置（从 config.json 加载，避免硬编码路径） =====
 # 打包后（PyInstaller）两个目录必须分开算，否则图标全找不到：
@@ -5515,11 +5516,6 @@ class AppCard(CardWidget):
             return self._rebuild_lite_body()
         if self.app.get("generic"):
             return self._rebuild_generic_body()
-        # AUTO-MAS：不是「某个助手」，而是多账号任务编排后端服务。
-        # 形态是「服务卡」——启动/停止后端，显示健康状态，不参与版本更新体系。
-        if self.app.get("key") == AUTO_MAS_KEY:
-            return self._rebuild_mas_body()
-
         self.data = load_app_json(self.app["app_json"])
         self.profile = get_current_profile(self.data)
         # 三态：
@@ -5908,226 +5904,6 @@ class AppCard(CardWidget):
         else:
             self.status_label.setText("未检测到本地安装")
             self._build_uninstalled_actions()
-
-    def _rebuild_mas_body(self):
-        """AUTO-MAS 服务卡：启动/停止后端 + 健康状态灯。
-
-        与其它卡片形态并列，但**不参与版本更新体系**（没有 app_json/working），
-        只关心后端进程是否活着、health 是否就绪。
-        """
-        self._lite = False
-        self._generic = False
-        self._mas = True
-        self._mas_worker = None
-        self._mas_state = "stopped"
-
-        # 先定位后端（下面的 _installed 依赖它，顺序不能颠倒）
-        repo, py = auto_mas_paths()
-        self._mas_repo, self._mas_py = repo, py
-
-        # 必设：refresh_data / snapshot / refresh_badge 都会读这些字段，
-        # MAS 卡没有 app.json 可走，必须自己给出「已安装」语义
-        # （vendor 后端在 = 可启动，即视为已装；否则降级为不可用）。
-        # 漏设会直接 AttributeError 崩掉整张卡（真实事故）。
-        self._installed = bool(repo)
-        self._host_ready = False
-        self._host_actual = ""
-        self._install_dir = ""
-        self.data = {}
-        self.profile = {}
-
-        # 复用卡片既有骨架：清空动态区后往 body_box 里加（与 lite/generic 同套路）
-        self.clear_body()
-        lay = self.body_box
-
-        # 头部徽章：这是「服务」不是「助手」，别显示未安装/版本
-        self.ver_tag.setText("服务")
-        self.ver_tag.setStyleSheet(
-            "background-color:#455a64; color:#ffffff; border-radius:6px; "
-            "padding:2px 8px; font-size:11px;")
-        self.badge.setText("AUTO-MAS")
-        self.badge.setStyleSheet(
-            "background-color:#5d4037; color:#ffffff; border-radius:9px; "
-            "padding:3px 12px; font-size:12px; font-weight:600;")
-        self.status_label.setText("多账号任务编排后端")
-        self.profile_tag.clear()
-        self.profile_tag.setVisible(False)
-
-        # 状态行
-        row_st = QHBoxLayout()
-        row_st.setSpacing(8)
-        self.mas_dot = QLabel("●")
-        self.mas_dot.setFixedWidth(14)
-        lay_hint = QLabel("后端服务")
-        row_st.addWidget(self.mas_dot)
-        row_st.addWidget(lay_hint)
-        row_st.addStretch(1)
-        self.mas_state = CaptionLabel("未启动")
-        row_st.addWidget(self.mas_state)
-        lay.addLayout(row_st)
-
-        self.mas_detail = CaptionLabel("")
-        self.mas_detail.setWordWrap(True)
-        self.mas_detail.setStyleSheet("color:#8a8d96; font-size:12px;")
-        lay.addWidget(self.mas_detail)
-
-        # 按钮行
-        row_btn = QHBoxLayout()
-        row_btn.setSpacing(8)
-        self.mas_start_btn = PushButton("启动后端")
-        self.mas_start_btn.setFixedHeight(32)
-        self.mas_start_btn.setCursor(Qt.PointingHandCursor)
-        self.mas_start_btn.clicked.connect(self._mas_start)
-        row_btn.addWidget(self.mas_start_btn)
-
-        self.mas_stop_btn = PushButton("停止后端")
-        self.mas_stop_btn.setFixedHeight(32)
-        self.mas_stop_btn.setCursor(Qt.PointingHandCursor)
-        self.mas_stop_btn.setEnabled(False)
-        self.mas_stop_btn.clicked.connect(self._mas_stop)
-        row_btn.addWidget(self.mas_stop_btn)
-
-        # 桌面版（Electron 前端）入口：后端只是引擎，完整功能在桌面版界面里
-        self.mas_open_btn = PushButton("打开主界面")
-        self.mas_open_btn.setFixedHeight(32)
-        self.mas_open_btn.setCursor(Qt.PointingHandCursor)
-        self.mas_open_btn.clicked.connect(self._mas_open_desktop)
-        row_btn.addWidget(self.mas_open_btn)
-        self._mas_desktop_found = bool(auto_mas_desktop_exe())
-        if not self._mas_desktop_found:
-            self.mas_open_btn.setToolTip(
-                "未找到 AUTO-MAS 桌面版，可在 config.json 用 auto_mas_desktop 指定路径")
-        row_btn.addStretch(1)
-        lay.addLayout(row_btn)
-
-        if not repo:
-            # 依赖缺失：仅本卡降级，其余功能不受影响
-            self._mas_set_state("failed", "未找到 AUTO-MAS 后端（vendor 缺失）")
-            self.mas_start_btn.setEnabled(False)
-        else:
-            self._mas_set_state("stopped", "已就绪，点「启动后端」拉起服务")
-
-    def _mas_set_state(self, state, detail=""):
-        """更新状态灯与文案。state: stopped/starting/ready/failed"""
-        self._mas_state = state
-        # ready 时把端口带上：用户可在浏览器打开 /api/core/health 自查
-        if state == "ready" and detail:
-            port = getattr(self, "_mas_worker_port", 0)
-            if port:
-                detail += " · 端口 %d" % port
-        colors = {"stopped": "#888780", "starting": "#E65100",
-                  "ready": "#2E7D32", "failed": "#C62828"}
-        texts = {"stopped": "未启动", "starting": "启动中…",
-                 "ready": "运行中", "failed": "不可用"}
-        if hasattr(self, "mas_dot"):
-            self.mas_dot.setStyleSheet("color:%s; font-size:14px;"
-                                       % colors.get(state, "#888780"))
-            self.mas_state.setText(texts.get(state, state))
-            self.mas_detail.setText(detail or "")
-
-    def _mas_start(self):
-        if getattr(self, "_mas_worker", None) is not None \
-                and self._mas_worker.isRunning():
-            return
-        repo, py = getattr(self, "_mas_repo", ""), getattr(self, "_mas_py", "")
-        if not repo:
-            self._mas_set_state("failed", "未找到 AUTO-MAS 后端")
-            return
-        workdir = os.path.join(LAUNCHER_CACHE_DIR, "auto-mas")
-        try:
-            os.makedirs(workdir, exist_ok=True)
-        except Exception:
-            workdir = LAUNCHER_CACHE_DIR
-        w = ServiceWorker(repo, py, workdir, parent=self)
-        w.sig_state.connect(self._mas_on_state)
-        self._mas_worker = w
-        self.mas_start_btn.setEnabled(False)
-        self.mas_stop_btn.setEnabled(True)
-        self._mas_set_state("starting", "正在拉起后端…")
-        w.start()
-
-    def _mas_stop(self):
-        w = getattr(self, "_mas_worker", None)
-        if w is not None:
-            w.request_stop()
-        self.mas_stop_btn.setEnabled(False)
-        self._mas_set_state("stopped", "正在停止…")
-
-    def _mas_on_state(self, state, detail):
-        if state == "ready":
-            self.mas_stop_btn.setEnabled(True)
-            w = getattr(self, "_mas_worker", None)
-            self._mas_worker_port = getattr(w, "_port", 0) if w else 0
-        elif state in ("stopped", "failed"):
-            self.mas_start_btn.setEnabled(True)
-            self.mas_stop_btn.setEnabled(False)
-            if state == "failed":
-                self.mas_stop_btn.setEnabled(False)
-        self._mas_set_state(state, detail)
-
-    def _mas_open_desktop(self):
-        """「打开主界面」：拉起 AUTO-MAS 桌面版（Electron 前端）。
-
-        冲突处理：桌面版自带 runtime，会自己再拉一个后端（默认端口 36163）。
-        若我们监督的后端还活着，等于两个后端同时读写同一份数据目录
-        （重复跑任务、配置互踩）。所以运行中时必须先确认停掉我们的后端再开；
-        后端未运行则直接拉起桌面版。
-        """
-        exe = auto_mas_desktop_exe()
-        if not exe:
-            QMessageBox.information(
-                self.window(), "打开 AUTO-MAS",
-                "未找到 AUTO-MAS 桌面版（AUTO-MAS.exe）。\n"
-                "安装后会自动识别；也可在 config.json 用 "
-                "auto_mas_desktop 指定路径。")
-            return
-        if getattr(self, "_mas_state", "") in ("starting", "ready"):
-            r = QMessageBox.question(
-                self.window(), "打开 AUTO-MAS",
-                "AUTO-MAS 桌面版会自带并启动它自己的后端。\n"
-                "当前由启动器监督的后端若继续运行，两者会同时读写同一份\n"
-                "数据目录（可能重复跑任务、配置互踩）。\n\n"
-                "先停止启动器监督的后端，再打开桌面版？",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
-            if r != QMessageBox.Yes:
-                return
-            w = getattr(self, "_mas_worker", None)
-            if w is not None:
-                w.request_stop()
-            self.mas_stop_btn.setEnabled(False)
-            # 等后端真正退出再拉起桌面版（close 通常 1~2 秒）
-            self._mas_open_pending = exe
-            self._mas_open_deadline = time.time() + 20
-            QTimer.singleShot(500, self._mas_open_poll)
-            return
-        try:
-            subprocess.Popen([exe], cwd=os.path.dirname(exe))
-        except Exception as e:
-            QMessageBox.warning(self.window(), "打开 AUTO-MAS",
-                                "拉起桌面版失败：%s" % e)
-
-    def _mas_open_poll(self):
-        """轮询等监督后端退出干净后再拉起桌面版（最多 20 秒）。"""
-        exe = getattr(self, "_mas_open_pending", "")
-        if not exe:
-            return
-        w = getattr(self, "_mas_worker", None)
-        if w is not None and w.isRunning():
-            if time.time() > getattr(self, "_mas_open_deadline", 0):
-                self._mas_open_pending = ""
-                QMessageBox.warning(
-                    self.window(), "打开 AUTO-MAS",
-                    "旧后端 20 秒未退出，已取消打开桌面版。")
-                return
-            QTimer.singleShot(400, self._mas_open_poll)
-            return
-        self._mas_open_pending = ""
-        self._mas_open_deadline = 0
-        try:
-            subprocess.Popen([exe], cwd=os.path.dirname(exe))
-        except Exception as e:
-            QMessageBox.warning(self.window(), "打开 AUTO-MAS",
-                                "拉起桌面版失败：%s" % e)
 
     def _rebuild_generic_body(self):
         """generic 模式重建：独立 exe 程序（非 ok-script、非奇想盒形态）。
@@ -7424,16 +7200,6 @@ class AppCard(CardWidget):
         self.changelog_text.setMinimumHeight(max(120, doc_h + extra))
 
     def refresh_data(self):
-        # AUTO-MAS 服务卡：没有 app_json，安装态 = vendor 后端是否可用。
-        # 必须在这里拦住，否则会掉进下面读 app_json 的分支（MAS 的 app_json 为空），
-        # 而 _installed 若未初始化就 AttributeError 崩卡（真实事故）。
-        if getattr(self, "_mas", False):
-            now_ok = bool(getattr(self, "_mas_repo", ""))
-            if now_ok != self._installed:
-                self._installed = now_ok
-                self.rebuild_body()
-            return
-
         # lite 模式：无 app_json 可读，只维护「安装态 + 运行态」
         if self.app.get("lite") or self.app.get("generic"):
             exe = self.app.get("exe", "") or ""
@@ -12434,6 +12200,1049 @@ class SettingsPage(QWidget):
             QMessageBox.information(self, "已保存", msg)
 
 
+# ===== AUTO-MAS 融合界面（启动器原生前端） =====
+# 融合形态（用户确认的 WeGame「助手插件」模式）：AUTO-MAS 不再是与 6 个助手并列的
+# 独立卡片，而是启动器里的一个原生页面 —— 侧栏「AUTO-MAS 任务编排」，主体是
+# 「后端服务控制 + 任务队列 / 脚本与账号 / 运行日志 / 服务信息」。
+#
+# 与上游的边界（硬约束，见 vendor/auto-mas/NOTICE.md）：
+#   · 不改上游任何源码，只走它原生的「外部监督器协议」拉起 FastAPI 后端；
+#   · 不引入 Electron 前端，本页就是它的替代前端；
+#   · 账号/队列/脚本一律读后端 HTTP，不直接读写它的配置文件 —— 后端才是配置的
+#     唯一写者，绕过它写盘会和内存态打架（改了不生效、或下次保存被覆盖）。
+#
+# 线程模型（沿用本项目 10-07 的铁律）：
+#   · ServiceWorker(QThread) 管子进程（拉起 → 健康检查 → close → 兜底杀进程树）；
+#   · 所有 HTTP 都进 MasApiBatchWorker(QThread)，UI 线程绝不 urllib；
+#   · 一次刷新 = 一个批次线程，在飞期间不发第二次（防重入、防线程堆积）。
+
+AUTO_MAS_MENU_KEY = "auto-mas-menu"
+AUTO_MAS_LEGACY_HOME = os.path.join(LAUNCHER_CACHE_DIR, "auto-mas")
+AUTO_MAS_API_TIMEOUT = 12
+AUTO_MAS_API_MAX_BYTES = 4 * 1024 * 1024
+AUTO_MAS_LOG_TAIL_BYTES = 128 * 1024
+AUTO_MAS_REFRESH_MS = 15000
+
+# 可新建的脚本类型（上游 ScriptCreateIn.type 的 14 个取值，schema.py:5041）。
+# 只做「按类型新建」，路径/账号等细节仍需在官方界面里补全 —— 那部分是几十个
+# 分组、上百个字段的动态表单，硬搬到本页只会做出一个半残的表单。
+MAS_SCRIPT_TYPES = [
+    ("MaaEnd", "MaaEnd（终末地）"),
+    ("OkNte", "OK-NTE（异环）"),
+    ("Okww", "OK-WW（鸣潮）"),
+    ("ZzzOd", "ZzzOd（绝区零一条龙）"),
+    ("Whimbox", "奇想盒（无限暖暖）"),
+    ("BetterGI", "BetterGI（原神）"),
+    ("MAA", "MAA（明日方舟）"),
+    ("M9A", "M9A（重返未来 1999）"),
+    ("HSR", "HSR（崩坏：星穹铁道）"),
+    ("SRC", "SRC（星穹铁道 SRC）"),
+    ("BAAH", "BAAH（蔚蓝档案）"),
+    ("MSS", "MSS（明日方舟森空岛）"),
+    ("MaaFW", "MaaFW（通用 MaaFramework）"),
+    ("General", "通用脚本（外部程序）"),
+]
+
+
+def auto_mas_home():
+    """AUTO-MAS 的用户数据根目录（= 后端进程的 cwd）。
+
+    后端把 config/（账号、队列、脚本配置）、data/data.db、debug/app.log、history/
+    全写在这里，所以**不能**放 .cache —— 那是「随时可清」的目录，用户辛苦配好的
+    账号与队列一次清缓存就没了。路径优先级：config.json 的 auto_mas_home >
+    启动器目录下的 auto-mas/。
+
+    旧版本（v1.2.0 之前）把数据写在 .cache/auto-mas，首次发现新目录里还没有
+    config/ 而旧目录有，就整体搬过来（旧目录保留，不删）。
+    """
+    cfg = _load_cfg_safe()
+    raw = str(cfg.get("auto_mas_home") or "").strip()
+    home = os.path.abspath(raw) if raw else os.path.join(LAUNCHER_DIR, "auto-mas")
+    legacy = os.path.abspath(AUTO_MAS_LEGACY_HOME)
+    try:
+        if (home != legacy
+                and not os.path.isdir(os.path.join(home, "config"))
+                and os.path.isdir(os.path.join(legacy, "config"))):
+            shutil.copytree(legacy, home, dirs_exist_ok=True)
+    except Exception:
+        pass          # 搬迁失败不影响使用：后端会在新目录里重建一套配置
+    return home
+
+
+def mas_api_request(base, path, payload=None, timeout=AUTO_MAS_API_TIMEOUT):
+    """调一次 AUTO-MAS 后端 API，返回 (ok, data_or_message)。
+
+    查询类接口也走 POST：上游全部用 `Body(...)` 解析，GET 会 422，所以只要
+    payload 不为 None 就发 JSON（查询传 `{}` 即「取全部」）。响应体超过上限
+    直接判失败 —— 后端异常时可能回一大坨 HTML/堆栈，不该塞进 UI 也不该卡解析。
+    """
+    if not base:
+        return False, "后端未运行"
+    url = base.rstrip("/") + path
+    try:
+        if payload is None:
+            req = urllib.request.Request(url, method="GET")
+        else:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            req = urllib.request.Request(
+                url, data=body, method="POST",
+                headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read(AUTO_MAS_API_MAX_BYTES + 1)
+        if len(raw) > AUTO_MAS_API_MAX_BYTES:
+            return False, "响应体过大（>%d 字节）" % AUTO_MAS_API_MAX_BYTES
+        return True, json.loads(raw.decode("utf-8", "replace") or "{}")
+    except urllib.error.HTTPError as e:
+        return False, "HTTP %d" % e.code
+    except Exception as e:
+        return False, "%s: %s" % (type(e).__name__, e)
+
+
+class MasApiBatchWorker(QThread):
+    """后台批量调用后端 API：一次刷新里的所有 HTTP 都在这里顺序做完。
+
+    【Qt 铁律】run() 里只做 HTTP/纯逻辑，绝不触碰任何 QWidget；
+    整批结果通过 sig_done 回主线程（dict: name -> (ok, data_or_message)）。
+    """
+
+    sig_done = Signal(object)
+
+    def __init__(self, base, calls, parent=None):
+        super().__init__(parent)
+        self._base = base
+        self._calls = list(calls or [])
+
+    def run(self):
+        out = {}
+        for name, path, payload in self._calls:
+            out[name] = mas_api_request(self._base, path, payload)
+        self.sig_done.emit(out)
+
+
+def _mas_short(uid):
+    """uuid 太长，列表里只展示前 8 位（后端没有更友好的短名）。"""
+    return (uid or "")[:8]
+
+
+def _mas_clear_body(lay):
+    """清空列表容器：保留末尾的 stretch 占位，删掉所有行控件。"""
+    while lay.count() > 1:
+        item = lay.takeAt(0)
+        w = item.widget()
+        if w is not None:
+            w.setParent(None)
+            w.deleteLater()
+
+
+def _mas_clear_head(lay):
+    """清空操作条布局（连 stretch 一起）——按钮每次渲染都重建，先全清再加。"""
+    while lay.count():
+        item = lay.takeAt(0)
+        w = item.widget()
+        if w is not None:
+            w.setParent(None)
+            w.deleteLater()
+
+
+def _mas_menu_at(btn, menu):
+    """在按钮正下方弹出菜单（用按钮自己的坐标，不依赖全局鼠标位置）。"""
+    try:
+        menu.exec(btn.mapToGlobal(QPoint(0, btn.height())))
+    except Exception:
+        pass
+
+
+def _mas_add_body(lay, w):
+    """把行控件插到 stretch 之前（列表从上往下长）。"""
+    lay.insertWidget(max(0, lay.count() - 1), w)
+
+
+def _mas_hint(text):
+    """一段灰色提示卡片（后端未启动 / 空列表时用）。"""
+    box = CardWidget()
+    v = QVBoxLayout(box)
+    v.setContentsMargins(16, 14, 16, 14)
+    lbl = CaptionLabel(text)
+    lbl.setWordWrap(True)
+    lbl.setStyleSheet("color:#8a8d96;")
+    v.addWidget(lbl)
+    return box
+
+
+def _mas_tail(path, max_bytes):
+    """读文本文件最后 max_bytes 字节，返回 (文本, 说明)。
+
+    从尾部按字节读、再丢掉可能被截半的第一行 —— 否则多字节 UTF-8 会被
+    切成乱码（日志里有大量中文）。
+    """
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if size > max_bytes:
+                f.seek(size - max_bytes)
+                f.readline()
+            raw = f.read()
+        return raw.decode("utf-8", "replace"), ""
+    except FileNotFoundError:
+        return "", "还没有日志文件"
+    except Exception as e:
+        return "", "读取日志失败：%s" % e
+
+
+class _MasKVRow(QWidget):
+    """服务信息里的一行「标签: 值」（值可选中复制）。"""
+
+    def __init__(self, key, value, parent=None):
+        super().__init__(parent)
+        h = QHBoxLayout(self)
+        h.setContentsMargins(16, 5, 16, 5)
+        h.setSpacing(12)
+        kl = CaptionLabel(str(key))
+        kl.setFixedWidth(96)
+        kl.setStyleSheet("color:#8a8d96;")
+        h.addWidget(kl)
+        vl = BodyLabel(str(value))
+        vl.setWordWrap(True)
+        vl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        h.addWidget(vl, 1)
+
+
+class _MasQueueCard(CardWidget):
+    """一条调度队列：名称/模式/定时 + 队列项与定时项摘要 + 运行/停止/添加脚本/删除。"""
+
+    sig_run = Signal(str, bool)      # (queueId, is_cycle)
+    sig_stop = Signal(str)
+    sig_add_item = Signal(str, object)   # (queueId, 触发按钮) → 上层在按钮下方弹菜单
+    sig_delete = Signal(str)         # queueId
+
+    def __init__(self, uid, info, items, times, running_task="",
+                 script_names=None, parent=None):
+        super().__init__(parent)
+        info = info or {}
+        script_names = script_names or {}
+        self._is_cycle = bool(info.get("CycleEnabled"))
+        v = QVBoxLayout(self)
+        v.setContentsMargins(16, 12, 14, 12)
+        v.setSpacing(6)
+
+        top = QHBoxLayout()
+        top.setSpacing(10)
+        top.addWidget(StrongBodyLabel(info.get("Name") or ("队列 " + _mas_short(uid))))
+        mode = CaptionLabel(self._mode_text(info))
+        mode.setStyleSheet("color:#8a8d96;")
+        top.addWidget(mode)
+        top.addStretch(1)
+
+        add_btn = PushButton("＋ 添加脚本")
+        add_btn.setFixedHeight(30)
+        add_btn.setCursor(Qt.PointingHandCursor)
+        add_btn.clicked.connect(lambda: self.sig_add_item.emit(uid, add_btn))
+        top.addWidget(add_btn)
+
+        del_btn = PushButton("删除队列")
+        del_btn.setFixedHeight(30)
+        del_btn.setCursor(Qt.PointingHandCursor)
+        del_btn.clicked.connect(lambda: self.sig_delete.emit(uid))
+        top.addWidget(del_btn)
+
+        if running_task:
+            btn = PushButton("停止运行")
+            btn.clicked.connect(lambda: self.sig_stop.emit(running_task))
+        else:
+            # 上游约束：循环队列只能以 CycleRun 启动（且同一循环队列不许重复启动），
+            # 定时队列则以 AutoProxy 跑一轮。用错模式会被后端直接拒绝（ValueError）。
+            btn = PrimaryPushButton("启动循环" if self._is_cycle else "立即运行")
+            btn.clicked.connect(
+                lambda: self.sig_run.emit(uid, self._is_cycle))
+        btn.setFixedHeight(30)
+        btn.setCursor(Qt.PointingHandCursor)
+        top.addWidget(btn)
+        v.addLayout(top)
+
+        lines = []
+        for it in items or []:
+            sc = ((it.get("Info") or {}).get("ScriptId")) or ""
+            nm = script_names.get(sc) or (("脚本 " + _mas_short(sc)) if sc else "未选择脚本")
+            lines.append(nm + "（" + self._schedule_text(it.get("Schedule") or {}) + "）")
+        for ts in times or []:
+            ti = ts.get("Info") or {}
+            lines.append("定时 %s · %s" % (ti.get("Time") or "?",
+                                        "已启用" if ti.get("Enabled") else "已停用"))
+        if not lines:
+            lines.append("还没有队列项或定时项")
+        for ln in lines[:8]:
+            lbl = CaptionLabel("· " + ln)
+            lbl.setStyleSheet("color:#8a8d96;")
+            v.addWidget(lbl)
+        if len(lines) > 8:
+            more = CaptionLabel("· 另有 %d 项…" % (len(lines) - 8))
+            more.setStyleSheet("color:#8a8d96;")
+            v.addWidget(more)
+
+    @staticmethod
+    def _mode_text(info):
+        parts = []
+        if info.get("CycleEnabled"):
+            parts.append("循环队列")
+        parts.append("定时开启" if info.get("TimeEnabled") else "定时关闭")
+        parts.append({"Never": "不随启动运行", "Always": "启动即运行",
+                      "DailyFirst": "每日首次"}.get(info.get("StartUpMode") or "", ""))
+        parts.append({"Shutdown": "完成后关机", "ShutdownForce": "完成后强制关机",
+                      "Reboot": "完成后重启", "Hibernate": "完成后休眠",
+                      "Sleep": "完成后睡眠", "KillSelf": "完成后退出自身",
+                      "Logoff": "完成后注销"}.get(info.get("AfterAccomplish") or "", ""))
+        return " · ".join(p for p in parts if p)
+
+    # 星期中文化：直接显示 Monday,Tuesday… 又长又难看，队列卡一行放不下
+    _DAY_CN = {"Monday": "周一", "Tuesday": "周二", "Wednesday": "周三",
+               "Thursday": "周四", "Friday": "周五", "Saturday": "周六",
+               "Sunday": "周日"}
+
+    @staticmethod
+    def _schedule_text(sch):
+        if not sch.get("Enabled"):
+            return "不参与循环"
+        if sch.get("Mode") == "interval":
+            txt = "每 %s 分钟" % (sch.get("IntervalMinutes") if sch.get("IntervalMinutes")
+                                is not None else "?")
+        else:
+            days = [str(d) for d in (sch.get("Days") or [])]
+            if len(days) >= 7:
+                day_txt = "每天"
+            else:
+                day_txt = "、".join(_MasQueueCard._DAY_CN.get(d, d[:3]) for d in days) or "每天"
+            txt = "%s %s" % (day_txt, sch.get("Time") or "")
+        nra = str(sch.get("NextRunAt") or "")
+        # 后端对「还没排下次运行」的项给的是 2000-01-01 占位值，照显会误导用户
+        if nra and not nra.startswith("2000-01-01"):
+            txt += "，下次 " + nra
+        return txt.strip()
+
+
+class _MasRuntimeCard(CardWidget):
+    """一个正在运行的任务：模式 + 关联脚本状态 + 日志尾部 + 中止。"""
+
+    sig_stop = Signal(str)
+
+    def __init__(self, task, parent=None):
+        super().__init__(parent)
+        t = task or {}
+        v = QVBoxLayout(self)
+        v.setContentsMargins(16, 12, 14, 12)
+        v.setSpacing(6)
+
+        title = "任务 " + _mas_short(t.get("taskId", ""))
+        if t.get("queueId"):
+            title += " · 队列任务"
+        title += " · " + str(t.get("mode") or "?")
+        if t.get("isCycle"):
+            title += " · 循环"
+        if t.get("stopping"):
+            title += " · 正在停止"
+
+        top = QHBoxLayout()
+        top.setSpacing(10)
+        top.addWidget(StrongBodyLabel(title))
+        top.addStretch(1)
+        btn = PushButton("中止")
+        btn.setFixedHeight(30)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.clicked.connect(lambda: self.sig_stop.emit(t.get("taskId", "")))
+        top.addWidget(btn)
+        v.addLayout(top)
+
+        for si in (t.get("task_info") or [])[:10]:
+            lbl = CaptionLabel("· %s：%s" % (
+                si.get("name") or _mas_short(si.get("script_id", "")),
+                si.get("status") or ""))
+            lbl.setStyleSheet("color:#8a8d96;")
+            v.addWidget(lbl)
+        log = (t.get("log") or "").strip()
+        if log:
+            lbl = CaptionLabel("\n".join(log.splitlines()[-4:]))
+            lbl.setWordWrap(True)
+            lbl.setStyleSheet("color:#8a8d96; font-size:11px;")
+            v.addWidget(lbl)
+
+
+class _MasScriptCard(CardWidget):
+    """一个脚本配置 + 它下面的账号（当前只读展示：写配置需要完整表单，后续版本再做）。
+
+    ⚠️ 脱敏红线：上游的读接口（/api/scripts/get、/api/scripts/user/get）默认
+    `toDict(if_decrypt=True)`，会把 DPAPI 解密后的**明文密码/令牌**一起返回
+    （Info.Password、MirrorChyanCDK、各类 Token…）。所以这里只能白名单取字段
+    （名称/类型/ID），**绝不能**把整个配置字典丢进 UI，否则等于把用户凭据
+    打印到屏幕上。
+    """
+
+    def __init__(self, uid, index_item, data, user_index, user_data, parent=None):
+        super().__init__(parent)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(16, 12, 14, 12)
+        v.setSpacing(6)
+        info = (data or {}).get("Info") or {}
+        name = info.get("Name") or _mas_short(uid)
+
+        top = QHBoxLayout()
+        top.setSpacing(10)
+        top.addWidget(StrongBodyLabel(str(name)))
+        cap = CaptionLabel("%s · ID %s" % ((index_item or {}).get("type") or "?",
+                                           _mas_short(uid)))
+        cap.setStyleSheet("color:#8a8d96;")
+        top.addWidget(cap)
+        top.addStretch(1)
+        v.addLayout(top)
+
+        users = []
+        for it in user_index or []:
+            u = it.get("uid", "")
+            ui = ((user_data or {}).get(u) or {}).get("Info") or {}
+            users.append(ui.get("Name") or _mas_short(u))
+        if users:
+            for nm in users[:10]:
+                lbl = CaptionLabel("· 账号 " + str(nm))
+                lbl.setStyleSheet("color:#8a8d96;")
+                v.addWidget(lbl)
+            if len(users) > 10:
+                more = CaptionLabel("· 另有 %d 个账号…" % (len(users) - 10))
+                more.setStyleSheet("color:#8a8d96;")
+                v.addWidget(more)
+        else:
+            lbl = CaptionLabel("· 还没有账号")
+            lbl.setStyleSheet("color:#8a8d96;")
+            v.addWidget(lbl)
+
+
+class MasPage(QWidget):
+    """AUTO-MAS 任务编排页（启动器原生界面）。
+
+    生命周期：后端由本页持有的 ServiceWorker 拉起，**切页不停后端**
+    （用户可能正在跑队列）；只有启动器真正退出时才优雅关闭（见 shutdown()）。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # ---- 后端状态 ----
+        self._worker = None
+        self._state = "stopped"      # stopped/starting/ready/stopping/failed
+        self._detail = ""
+        self._port = 0
+        self._base = ""              # http://127.0.0.1:<port>，未就绪时为空
+        self._health = {}
+        self._auto_started = False
+        # ---- 数据缓存（全部来自后端 HTTP）----
+        self._queues = {}            # queueUid -> Info dict
+        self._items = {}             # queueUid -> [QueueItem]
+        self._times = {}             # queueUid -> [TimeSet]
+        self._scripts = []           # [ScriptIndexItem]
+        self._script_data = {}       # scriptUid -> config
+        self._users = {}             # scriptUid -> {"index": [...], "data": {...}}
+        self._runtime = []
+        # ---- 线程/目录 ----
+        self._jobs = []
+        self._busy = False
+        self._home = auto_mas_home()
+        self._log_path = os.path.join(self._home, "debug", "app.log")
+        self._bodies = {}
+        self._heads = {}
+        self._seg_index = {}
+        self._build_ui()
+        self._render_all()
+
+    # ================= 界面搭建 =================
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(28, 22, 28, 22)
+        root.setSpacing(14)
+
+        # ---- 顶部：后端服务条 ----
+        bar = CardWidget()
+        bl = QVBoxLayout(bar)
+        bl.setContentsMargins(18, 14, 16, 14)
+        bl.setSpacing(8)
+
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        self.dot = QLabel("●")
+        self.dot.setFixedWidth(14)
+        self.dot.setStyleSheet("color:#8a8d96; font-size:15px;")
+        row.addWidget(self.dot)
+        row.addWidget(StrongBodyLabel("AUTO-MAS 任务编排"))
+        self.state_lbl = CaptionLabel("未启动")
+        self.state_lbl.setStyleSheet("color:#8a8d96;")
+        row.addWidget(self.state_lbl)
+        row.addStretch(1)
+
+        self.start_btn = PrimaryPushButton("启动后端")
+        self.start_btn.setFixedHeight(32)
+        self.start_btn.setCursor(Qt.PointingHandCursor)
+        self.start_btn.clicked.connect(self.start_backend)
+        row.addWidget(self.start_btn)
+
+        self.stop_btn = PushButton("停止后端")
+        self.stop_btn.setFixedHeight(32)
+        self.stop_btn.setCursor(Qt.PointingHandCursor)
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self.stop_backend)
+        row.addWidget(self.stop_btn)
+
+        self.refresh_btn = PushButton("刷新")
+        self.refresh_btn.setFixedHeight(32)
+        self.refresh_btn.setCursor(Qt.PointingHandCursor)
+        self.refresh_btn.clicked.connect(self.reload)
+        row.addWidget(self.refresh_btn)
+
+        self.open_desk_btn = PushButton("官方界面")
+        self.open_desk_btn.setFixedHeight(32)
+        self.open_desk_btn.setCursor(Qt.PointingHandCursor)
+        self._desk_exe = auto_mas_desktop_exe()
+        if self._desk_exe:
+            self.open_desk_btn.setToolTip(
+                "打开 AUTO-MAS 官方桌面端（Electron）。它读自己的安装目录配置，"
+                "与本页的数据目录不是同一套。")
+            self.open_desk_btn.clicked.connect(self._open_desktop)
+        else:
+            self.open_desk_btn.setEnabled(False)
+            self.open_desk_btn.setToolTip(
+                "未找到 AUTO-MAS.exe；可在 config.json 用 auto_mas_desktop 指定路径")
+        row.addWidget(self.open_desk_btn)
+        bl.addLayout(row)
+
+        self.detail_lbl = CaptionLabel("")
+        self.detail_lbl.setWordWrap(True)
+        self.detail_lbl.setStyleSheet("color:#8a8d96;")
+        bl.addWidget(self.detail_lbl)
+        root.addWidget(bar)
+
+        # ---- 视图切换 ----
+        self.seg = SegmentedWidget()
+        self.seg.addItem("queue", "任务队列")
+        self.seg.addItem("scripts", "脚本与账号")
+        self.seg.addItem("log", "运行日志")
+        self.seg.addItem("service", "服务信息")
+        self.seg.currentItemChanged.connect(self._on_seg)
+        root.addWidget(self.seg)
+
+        self.views = QStackedWidget()
+        self.queue_view = self._make_list_view("queue")
+        self.scripts_view = self._make_list_view("scripts")
+        self.log_view = self._make_log_view()
+        self.service_view = self._make_list_view("service")
+        for i, w in enumerate((self.queue_view, self.scripts_view,
+                               self.log_view, self.service_view)):
+            self.views.addWidget(w)
+            self._seg_index[("queue", "scripts", "log", "service")[i]] = i
+        root.addWidget(self.views, 1)
+        self.seg.setCurrentItem("queue")
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(AUTO_MAS_REFRESH_MS)
+        self._timer.timeout.connect(self.reload)
+
+    def _make_list_view(self, key):
+        """一个视图 = 顶部操作条 + 滚动列表；操作条内容每次渲染时重建。"""
+        box = QWidget()
+        v = QVBoxLayout(box)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(8)
+        head = QHBoxLayout()
+        head.setContentsMargins(4, 0, 12, 0)
+        head.setSpacing(8)
+        v.addLayout(head)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        holder = QWidget()
+        lay = QVBoxLayout(holder)
+        lay.setContentsMargins(4, 4, 12, 12)
+        lay.setSpacing(10)
+        lay.addStretch(1)
+        scroll.setWidget(holder)
+        v.addWidget(scroll, 1)
+        self._heads[key] = head
+        self._bodies[key] = lay
+        return box
+
+    def _make_log_view(self):
+        box = QWidget()
+        v = QVBoxLayout(box)
+        v.setContentsMargins(4, 4, 12, 12)
+        v.setSpacing(8)
+        self.log_note = CaptionLabel("")
+        self.log_note.setStyleSheet("color:#8a8d96;")
+        self.log_note.setWordWrap(True)
+        v.addWidget(self.log_note)
+        self.log_edit = QTextEdit()
+        self.log_edit.setReadOnly(True)
+        self.log_edit.setStyleSheet(
+            "font-family:Consolas,'Courier New',monospace; font-size:12px;")
+        v.addWidget(self.log_edit, 1)
+        return box
+
+    def _on_seg(self, key):
+        idx = self._seg_index.get(key)
+        if idx is not None:
+            self.views.setCurrentIndex(idx)
+
+    # ================= 页面可见性 =================
+    def showEvent(self, event):
+        """首次进入本页：自动拉起后端（常驻到启动器退出）；并开始定时刷新。"""
+        super().showEvent(event)
+        if not self._auto_started:
+            self._auto_started = True
+            if bool(_load_cfg_safe().get("mas_enabled", True)):
+                self.start_backend()
+        self._timer.start()
+        self.reload()
+
+    def hideEvent(self, event):
+        # 页面不可见就停刷新：没必要每 15 秒为看不见的界面发 HTTP
+        self._timer.stop()
+        super().hideEvent(event)
+
+    # ================= 后端生命周期 =================
+    def start_backend(self):
+        if self._state in ("starting", "ready", "stopping"):
+            return
+        repo, py = auto_mas_paths()
+        if not (repo and py):
+            self._set_state("failed",
+                            "未找到 AUTO-MAS 后端（vendor/auto-mas 或本机安装缺失）")
+            return
+        self._home = auto_mas_home()
+        try:
+            os.makedirs(self._home, exist_ok=True)
+        except Exception as e:
+            self._set_state("failed", "数据目录不可用：%s" % e)
+            return
+        old = self._worker
+        w = ServiceWorker(repo, py, self._home)
+        w.sig_state.connect(self._on_worker_state)
+        self._worker = w
+        self._set_state("starting", "正在拉起后端…（首次启动要初始化配置，约 10~30 秒）")
+        w.start()
+        if old is not None and not old.isRunning():
+            old.deleteLater()
+
+    def stop_backend(self):
+        w = self._worker
+        if w is None or not w.isRunning():
+            self._set_state("stopped", "后端未运行")
+            return
+        w.request_stop()
+        self._set_state("stopping", "正在停止后端…（先走 close 接口，超时再杀进程树）")
+
+    def shutdown(self):
+        """启动器退出前回收后端（Job Object 是兜底，正常路径仍要优雅关闭）。"""
+        try:
+            self._timer.stop()
+        except Exception:
+            pass
+        w = self._worker
+        if w is not None and w.isRunning():
+            try:
+                w.request_stop()
+                w.wait(AUTO_MAS_CLOSE_TIMEOUT_SEC * 1000 + 5000)
+            except Exception:
+                pass
+
+    def _on_worker_state(self, state, detail):
+        if state == "ready":
+            w = self._worker
+            self._port = int(getattr(w, "_port", 0) or 0)
+            self._base = ("http://127.0.0.1:%d" % self._port) if self._port else ""
+            self._health = dict(getattr(w, "_health", None) or {})
+            self._set_state("ready", "已就绪：%s（数据目录 %s）" % (detail, self._home))
+            self.reload()
+            return
+        self._base = ""
+        self._port = 0
+        if state == "failed":
+            self._health = {}
+            self._set_state("failed", detail)
+        elif state == "stopped":
+            self._health = {}
+            self._set_state("stopped", detail or "后端已停止")
+        else:                                   # starting
+            self._set_state("starting", detail)
+        self._render_all()
+
+    def _set_state(self, state, detail=""):
+        self._state = state
+        self._detail = detail or ""
+        color = {"stopped": "#8a8d96", "starting": "#EF9F27", "ready": "#639922",
+                 "stopping": "#EF9F27", "failed": "#E24B4A"}.get(state, "#8a8d96")
+        text = {"stopped": "未启动", "starting": "启动中…", "ready": "运行中",
+                "stopping": "停止中…", "failed": "不可用"}.get(state, state)
+        self.dot.setStyleSheet("color:%s; font-size:15px;" % color)
+        if state == "ready" and self._port:
+            self.state_lbl.setText("%s · 端口 %d" % (text, self._port))
+        else:
+            self.state_lbl.setText(text)
+        self.detail_lbl.setText(self._detail)
+        self.start_btn.setEnabled(state in ("stopped", "failed"))
+        self.stop_btn.setEnabled(state in ("starting", "ready"))
+        self.refresh_btn.setEnabled(state == "ready" and not self._busy)
+
+    # ================= 数据刷新 =================
+    def reload(self):
+        """重画全部视图；后端就绪时再异步拉一轮数据。"""
+        self._render_all()
+        if not self._base or self._busy:
+            return
+        self._busy = True
+        self.refresh_btn.setEnabled(False)
+        calls = [
+            ("queues", "/api/queue/get", {}),
+            ("scripts", "/api/scripts/get", {}),
+            ("runtime", "/api/dispatch/runtime-snapshot", None),
+        ]
+        self._stage(calls, self._on_primary, final=False)
+
+    def _stage(self, calls, cb, final):
+        """发起一批 HTTP（后台线程）；cb 在主线程被调用。"""
+        w = MasApiBatchWorker(self._base, calls, self)
+        self._jobs.append(w)
+        w.sig_done.connect(lambda res, _w=w: self._on_stage(_w, res, cb, final))
+        w.start()
+
+    def _on_stage(self, w, res, cb, final):
+        if w in self._jobs:
+            self._jobs.remove(w)
+        try:
+            w.deleteLater()
+        except Exception:
+            pass
+        try:
+            cb(res or {})
+        finally:
+            if final:
+                self._busy = False
+                self.refresh_btn.setEnabled(self._state == "ready")
+
+    def _on_primary(self, res):
+        ok, data = res.get("queues", (False, ""))
+        if ok and isinstance(data, dict):
+            index = data.get("index") or []
+            conf = data.get("data") or {}
+            self._queues = {}
+            for it in index:
+                uid = it.get("uid", "")
+                self._queues[uid] = (conf.get(uid) or {}).get("Info") or {}
+        ok, data = res.get("scripts", (False, ""))
+        if ok and isinstance(data, dict):
+            self._scripts = data.get("index") or []
+            self._script_data = data.get("data") or {}
+        ok, data = res.get("runtime", (False, ""))
+        if ok and isinstance(data, dict):
+            self._runtime = data.get("tasks") or []
+        self._render_all()
+
+        # 第二段：队列项/定时项/账号（数量都很小，一次批次发完）
+        calls = []
+        for uid in list(self._queues):
+            calls.append(("items:" + uid, "/api/queue/item/get", {"queueId": uid}))
+            calls.append(("times:" + uid, "/api/queue/time/get", {"queueId": uid}))
+        for it in self._scripts:
+            uid = it.get("uid", "")
+            calls.append(("users:" + uid, "/api/scripts/user/get", {"scriptId": uid}))
+        if not calls:
+            self._busy = False
+            self.refresh_btn.setEnabled(self._state == "ready")
+            return
+        self._stage(calls, self._on_secondary, final=True)
+
+    def _on_secondary(self, res):
+        self._items = {}
+        self._times = {}
+        self._users = {}
+        for key, (ok, data) in res.items():
+            if not ok or not isinstance(data, dict):
+                continue
+            index = data.get("index") or []
+            conf = data.get("data") or {}
+            if key.startswith("items:"):
+                uid = key[6:]
+                self._items[uid] = [conf.get(i.get("uid", "")) or {} for i in index]
+            elif key.startswith("times:"):
+                uid = key[6:]
+                self._times[uid] = [conf.get(i.get("uid", "")) or {} for i in index]
+            elif key.startswith("users:"):
+                uid = key[6:]
+                self._users[uid] = {"index": index, "data": conf}
+        self._render_all()
+
+    # ================= 渲染 =================
+    def _render_all(self):
+        self._render_queue()
+        self._render_scripts()
+        self._render_service()
+        self._render_log()
+
+    def _script_names(self):
+        out = {}
+        for it in self._scripts:
+            uid = it.get("uid", "")
+            info = (self._script_data.get(uid) or {}).get("Info") or {}
+            out[uid] = info.get("Name") or _mas_short(uid)
+        return out
+
+    def _render_queue(self):
+        lay = self._bodies["queue"]
+        head = self._heads["queue"]
+        _mas_clear_body(lay)
+        _mas_clear_head(head)
+        if not self._base:
+            _mas_add_body(lay, _mas_hint(
+                "后端未运行：点上方「启动后端」后，这里会列出调度队列、队列项与下次运行时间。"
+                "\n数据目录：%s" % self._home))
+            return
+        new_btn = PushButton("＋ 新建队列")
+        new_btn.setFixedHeight(30)
+        new_btn.setCursor(Qt.PointingHandCursor)
+        new_btn.clicked.connect(self.new_queue)
+        head.addWidget(new_btn)
+        head.addStretch(1)
+
+        running = {}
+        for t in self._runtime:
+            qid = t.get("queueId")
+            if qid:
+                running[qid] = t.get("taskId", "")
+        others = [t for t in self._runtime if not t.get("queueId")]
+        for t in others:
+            card = _MasRuntimeCard(t)
+            card.sig_stop.connect(self.stop_task)
+            _mas_add_body(lay, card)
+        if not self._queues:
+            _mas_add_body(lay, _mas_hint(
+                "还没有调度队列。点左上「＋ 新建队列」建一条，再点队列上的"
+                "「＋ 添加脚本」把脚本排进去，然后「立即运行」即可跑一轮。"))
+        names = self._script_names()
+        for uid, info in self._queues.items():
+            card = _MasQueueCard(uid, info, self._items.get(uid, []),
+                                 self._times.get(uid, []),
+                                 running.get(uid, ""), names)
+            card.sig_run.connect(self.run_queue)
+            card.sig_stop.connect(self.stop_task)
+            card.sig_add_item.connect(self.pick_script_for_queue)
+            card.sig_delete.connect(self.delete_queue)
+            _mas_add_body(lay, card)
+
+    def _render_scripts(self):
+        lay = self._bodies["scripts"]
+        head = self._heads["scripts"]
+        _mas_clear_body(lay)
+        _mas_clear_head(head)
+        if not self._base:
+            _mas_add_body(lay, _mas_hint(
+                "后端未运行：点上方「启动后端」后，这里会列出脚本配置与其下的账号。"))
+            return
+        add_btn = PushButton("＋ 添加脚本")
+        add_btn.setFixedHeight(30)
+        add_btn.setCursor(Qt.PointingHandCursor)
+        add_btn.clicked.connect(lambda: self._pick_from_menu(
+            add_btn, "添加脚本（类型）", list(MAS_SCRIPT_TYPES), self.add_script))
+        head.addWidget(add_btn)
+        head.addStretch(1)
+
+        if not self._scripts:
+            _mas_add_body(lay, _mas_hint(
+                "还没有脚本配置。点左上「＋ 添加脚本」按游戏选类型即可新建；"
+                "新建后还需要在 AUTO-MAS 官方界面里补全游戏路径与账号才能实际跑。"))
+            return
+        for it in self._scripts:
+            uid = it.get("uid", "")
+            u = self._users.get(uid) or {}
+            _mas_add_body(lay, _MasScriptCard(
+                uid, it, self._script_data.get(uid) or {},
+                u.get("index") or [], u.get("data") or {}))
+
+    def _render_service(self):
+        lay = self._bodies["service"]
+        _mas_clear_body(lay)
+        repo, py = auto_mas_paths()
+        h = self._health or {}
+        rows = [
+            ("状态", self._detail or self.state_lbl.text()),
+            ("后端版本", h.get("version") or "—"),
+            ("提交", h.get("commit") or "—"),
+            ("协议版本", h.get("protocol") if h.get("protocol") is not None else "—"),
+            ("后台初始化", h.get("backgroundStatus") or "—"),
+            ("监听端口", self._port or "—"),
+            ("后端源码", repo or "未找到"),
+            ("后端解释器", py or "未找到"),
+            ("数据目录", self._home),
+            ("日志文件", self._log_path),
+        ]
+        box = CardWidget()
+        bv = QVBoxLayout(box)
+        bv.setContentsMargins(4, 8, 4, 8)
+        bv.setSpacing(2)
+        for k, val in rows:
+            bv.addWidget(_MasKVRow(k, val))
+        _mas_add_body(lay, box)
+
+        for warn in (h.get("backgroundWarnings") or [])[:20]:
+            _mas_add_body(lay, _mas_hint("后台警告：" + str(warn)))
+        if h.get("backgroundError"):
+            _mas_add_body(lay, _mas_hint("后台初始化失败：" + str(h.get("backgroundError"))))
+        if not self._base and self._state in ("stopped", "failed"):
+            _mas_add_body(lay, _mas_hint(
+                "后端未运行。缺 Python 3.12 运行环境时本页会标为「不可用」，"
+                "但不影响其它助手的安装/更新/启动。"))
+
+    def _render_log(self):
+        text, note = _mas_tail(self._log_path, AUTO_MAS_LOG_TAIL_BYTES)
+        self.log_note.setText(
+            "后端日志：%s%s" % (self._log_path, ("（%s）" % note) if note else ""))
+        if not text:
+            text = note or "（还没有日志）"
+        self.log_edit.setPlainText(text)
+        sb = self.log_edit.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    # ================= 动作 =================
+    def run_queue(self, queue_id, is_cycle=False):
+        # mode 必须按队列类型选：循环队列只认 CycleRun，定时队列走 AutoProxy 跑一轮。
+        # 选错后端会直接抛 ValueError 并把 code=500 塞回 OutBase（HTTP 仍是 200）。
+        self._post_action("/api/dispatch/start",
+                          {"mode": "CycleRun" if is_cycle else "AutoProxy",
+                           "taskId": queue_id},
+                          "已请求启动循环队列" if is_cycle else "已请求运行队列")
+
+    def stop_task(self, task_id):
+        if not task_id:
+            return
+        self._post_action("/api/dispatch/stop", {"taskId": task_id}, "已请求中止任务")
+
+    # ---------- 新建/删除（真正的写操作，全部走后端 API）----------
+    def _build_pick_menu(self, title, pairs, on_pick):
+        """构造一个「选一项」菜单（与 exec 分开，便于测试直接触发 action）。"""
+        menu = RoundMenu(title=title, parent=self)
+        for value, label in pairs:
+            act = Action(FluentIcon.ADD, str(label))
+            act.triggered.connect(lambda _=False, v=value: on_pick(v))
+            menu.addAction(act)
+        return menu
+
+    def _pick_from_menu(self, btn, title, pairs, on_pick):
+        _mas_menu_at(btn, self._build_pick_menu(title, pairs, on_pick))
+
+    def pick_script_for_queue(self, queue_id, btn=None):
+        """给队列挑一个脚本加为队列项（没有脚本时提示先去添加）。"""
+        names = self._script_names()
+        pairs = [(it.get("uid", ""),
+                  names.get(it.get("uid", "")) or _mas_short(it.get("uid", "")))
+                 for it in self._scripts]
+        if not pairs:
+            self._toast("没有脚本", "请先到「脚本与账号」页添加脚本", error=True)
+            return
+        self._pick_from_menu(btn or self, "添加到队列", pairs,
+                             lambda script_id: self.add_item_to_queue(queue_id, script_id))
+
+    def new_queue(self):
+        self._post_action("/api/queue/add", {}, "已新建一条调度队列")
+
+    def delete_queue(self, queue_id):
+        name = (self._queues.get(queue_id) or {}).get("Name") or _mas_short(queue_id)
+        try:
+            ok = QMessageBox.question(
+                self.window(), "删除队列",
+                "确定删除队列「%s」？队列项与定时项会一起删除。" % name,
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes
+        except Exception:
+            ok = False
+        if not ok:
+            return
+        self._post_action("/api/queue/delete", {"queueId": queue_id},
+                          "已删除队列「%s」" % name)
+
+    def add_item_to_queue(self, queue_id, script_id):
+        """两步：先 item/add 建空项拿到 id，再 item/update 把 ScriptId 写进去。
+
+        上游没有「带初值新建队列项」的接口（item/add 只吃 queueId），所以必须两步；
+        第一步失败时第二步不能发（会写到一个不存在的项上）。
+        """
+        if not self._base:
+            self._toast("后端未运行", "请先启动 AUTO-MAS 后端", error=True)
+            return
+        calls = [("add", "/api/queue/item/add", {"queueId": queue_id})]
+        w = MasApiBatchWorker(self._base, calls, self)
+        self._jobs.append(w)
+        w.sig_done.connect(
+            lambda res, _w=w: self._on_item_created(_w, res, queue_id, script_id))
+        w.start()
+
+    def _on_item_created(self, w, res, queue_id, script_id):
+        if w in self._jobs:
+            self._jobs.remove(w)
+        try:
+            w.deleteLater()
+        except Exception:
+            pass
+        ok, data = (res or {}).get("add", (False, ""))
+        item_id = (data or {}).get("queueItemId") if isinstance(data, dict) else ""
+        if not (ok and item_id and int((data or {}).get("code", 200) or 200) == 200):
+            msg = (data or {}).get("message") if isinstance(data, dict) else data
+            self._toast("添加失败", str(msg or "后端返回异常"), error=True)
+            return
+        self._post_action("/api/queue/item/update",
+                          {"queueId": queue_id, "queueItemId": item_id,
+                           "data": {"Info": {"ScriptId": script_id}}},
+                          "已把脚本加入队列")
+
+    def add_script(self, type_key):
+        self._post_action("/api/scripts/add", {"type": type_key},
+                          "已新建脚本（还需在官方界面补全路径/账号）")
+
+    def _post_action(self, path, payload, ok_msg):
+        if not self._base:
+            self._toast("后端未运行", "请先启动 AUTO-MAS 后端", error=True)
+            return
+        w = MasApiBatchWorker(self._base, [("action", path, payload)], self)
+        self._jobs.append(w)
+        w.sig_done.connect(lambda res, _w=w: self._on_action(_w, res, ok_msg))
+        w.start()
+
+    def _on_action(self, w, res, ok_msg):
+        if w in self._jobs:
+            self._jobs.remove(w)
+        try:
+            w.deleteLater()
+        except Exception:
+            pass
+        ok, data = (res or {}).get("action", (False, ""))
+        if ok and isinstance(data, dict) and int(data.get("code", 200) or 200) == 200:
+            self._toast("已下发", ok_msg)
+            QTimer.singleShot(800, self.reload)
+            return
+        msg = data.get("message") if isinstance(data, dict) else data
+        self._toast("操作失败", str(msg or "后端返回异常"), error=True)
+
+    def _toast(self, title, content, error=False):
+        try:
+            if error:
+                InfoBar.error(title, content, duration=4000, parent=self,
+                              position=InfoBarPosition.TOP_RIGHT)
+            else:
+                InfoBar.success(title, content, duration=2500, parent=self,
+                                position=InfoBarPosition.TOP_RIGHT)
+        except Exception:
+            pass
+
+    def _open_desktop(self):
+        exe = getattr(self, "_desk_exe", "") or auto_mas_desktop_exe()
+        if not exe:
+            self._toast("未找到", "未找到 AUTO-MAS 桌面版（AUTO-MAS.exe）", error=True)
+            return
+        # 官方桌面端会自带并启动它自己的后端（正式版端口 36163）；我们监督的后端
+        # 走注入端口，两者不抢端口。但它读自己的安装目录配置，与本页数据目录不同。
+        run_exe(self.window(), exe)
+
+
 def _make_scroll_page(child, max_width=900):
     """把内容包成标准的「滚动区 + 水平居中 + 最大宽」页面。
 
@@ -12537,7 +13346,8 @@ class Launcher(QWidget):
         # 只列正式助手 + AUTO-MAS：预约条目没有安装/运行语义，不该占侧栏（否则几十条撑爆侧栏）
         mas_apps = list(LIVE_APPS)
         if not self._mas_state_locked:
-            mas_apps.append({"key": "auto-mas-menu", "display": "AUTO-MAS 任务编排"})
+            mas_apps.append({"key": AUTO_MAS_MENU_KEY, "display": "AUTO-MAS 任务编排",
+                             "icon": os.path.join(ASSETS_DIR, "auto-mas.png")})
         self.sidebar = SideBar(mas_apps)
         root.addWidget(self.sidebar)
         # 挂进布局后立刻按主窗口当前宽度校正折叠态（启动即窄窗也能正确收起）
@@ -12568,12 +13378,17 @@ class Launcher(QWidget):
         # 3) 设置页
         self.settings_page = SettingsPage()
 
-        # 4) 按「总览 → 三个游戏」顺序入栈，全部常驻
+        # 3b) AUTO-MAS 融合页（原生界面，见文件上方 MasPage）
+        #     常驻 stack：切页不销毁，后端进程也不会因为离开页面被停掉。
+        self.mas_page = MasPage()
+
+        # 4) 按「总览 → 三个游戏 → AUTO-MAS」顺序入栈，全部常驻
         #    设置不放 stack：点侧栏「设置」弹独立 SettingsDialog（见 switch_to），
         #    独立窗尺寸自定、可自由缩放，内容长也只是窗内滚动，不挤压主窗口布局。
         self._add_page("overview", self.overview_page)
         for key, card in game_pages:
             self._add_page(key, _make_scroll_page(card))
+        self._add_page(AUTO_MAS_MENU_KEY, self.mas_page)
         self._settings_dialog = None  # 惰性创建，复用同一实例
 
         root.addWidget(self.stack, stretch=1)
@@ -12629,10 +13444,18 @@ class Launcher(QWidget):
         super().changeEvent(event)
 
     def closeEvent(self, event):
-        """退出：停心跳并回收扫描线程，避免 "QThread: Destroyed while running"。"""
+        """退出：停心跳、回收扫描线程、优雅关闭 AUTO-MAS 后端。
+
+        后端不清会留孤儿 python 进程（Job Object 只在句柄关闭时兜底，
+        正常退出路径必须显式走 close 接口）。
+        """
         try:
             heartbeat().set_enabled(False)
             proc_scanner().shutdown()
+        except Exception:
+            pass
+        try:
+            self.mas_page.shutdown()
         except Exception:
             pass
         super().closeEvent(event)
@@ -12656,7 +13479,7 @@ class Launcher(QWidget):
         """切到指定页面（侧栏点击、总览页点卡片两条路径共用）。
 
         "settings" 特殊：不切 stack，弹独立设置窗口（非模态，可与主窗口并存）。
-        "auto-mas-menu" 特殊：MAS 融合页面不是子页面，而是启动器的主内容区替换。
+        其余（含 AUTO-MAS 融合页）都是 stack 里的常驻页，切页只改索引不销毁控件。
         """
         if key == "settings":
             self._open_settings_dialog()
@@ -12667,21 +13490,12 @@ class Launcher(QWidget):
                     self.sidebar.select(k)
                     break
             return
-        
-        if key == "auto-mas-menu":
-            # MAS 融合模式：直接切入 MAS 主界面，其他所有助手被隐藏
-            self._mas_toggle_fullscreen(True)
-            return
-        
+
         idx = self._page_index.get(key)
         if idx is None:
             return
         self.stack.setCurrentIndex(idx)
         self.sidebar.select(key)  # 内部有幂等守卫，不会递归
-        
-        # 如果切回总览/游戏卡片，关闭 MAS 全屏
-        if key == "overview" or key in self.cards:
-            self._mas_toggle_fullscreen(False)
 
     def _open_settings_dialog(self):
         """弹出设置独立窗（单例复用；已开则置顶激活，不重复创建）。"""
@@ -12690,32 +13504,6 @@ class Launcher(QWidget):
         self._settings_dialog.show()
         self._settings_dialog.raise_()
         self._settings_dialog.activateWindow()
-
-    def _mas_toggle_fullscreen(self, on):
-        """MAS 融合模式：切换全屏页面/隐藏所有卡片。
-        
-        on=True: 启动 MAS 主界面（从 vendor/auto-mas 提取的 FastAPI 后端 + PySide6 前端）
-        on=False: 恢复原有助手卡片视图
-        """
-        if on and getattr(self, "_mas_state_locked", True):
-            QMessageBox.information(
-                self.window(), "AUTO-MAS 任务编排",
-                "请先在设置页启用 AUTO-MAS 功能。")
-            return
-        
-        if on:
-            # TODO: 初始化并显示 MAS 全屏界面（FastAPI 后端 + PySide6 前端）
-            # 暂时作为占位符：只显示一个简单的提示窗口
-            from PySide6.QtWidgets import QMessageBox
-            QMessageBox.information(
-                self.window(), "AUTO-MAS 任务编排",
-                "即将在此处显示 MAS 原生界面（任务列表、调度台、脚本管理）。\n"
-                "后端引擎将自动启动并常驻后台。")
-            # 真正实现时：self.mas_widget.show(); stack.hide()
-        else:
-            # TODO: 关闭 MAS 全屏界面
-            # 真正实现时：self.mas_widget.hide(); stack.show()
-            pass
 
     def run_game_scan(self):
         """手动点「🔍 扫描游戏」或启动 1.2s 后自动触发。只扫尚未装好助手的 key。"""
@@ -12888,6 +13676,8 @@ def main():
     win.show()
     # 退出兜底：非经 Launcher.closeEvent 的路径（如 app.quit()）也要回收线程
     app.aboutToQuit.connect(_on_app_quit)
+    # MAS 后端同样要兜底回收（不关会留下孤儿 python 进程）
+    app.aboutToQuit.connect(win.mas_page.shutdown)
     sys.exit(app.exec())
 
 

@@ -1,16 +1,19 @@
 # -*- coding: utf-8 -*-
-"""端到端验证：AUTO-MAS 卡片真的出现在界面、按钮真的能拉起后端。
+"""AUTO-MAS 融合页：入口接线 + 分段视图 + 空态渲染 + 动作安全（不启后端）。
 
-这是与「ServiceWorker 单独跑通」的关键区别：证明它装进车里能开。
+历史上这个文件名下测的是「MAS 独立卡片」；e4372d4 起 MAS 改成启动器原生页面
+（侧栏菜单 + 常驻 stack 页），旧卡片形态的代码已整体移除，本测试随之改为验页面。
+
+真后端的端到端在 mas_data_test.py；反复刷新的崩溃回归在 mas_polling_test.py。
 """
-import os, sys, io, time, subprocess
+import os, sys, io
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import launcher
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 app = QApplication.instance() or QApplication(sys.argv)
 OK, FAIL = [], []
@@ -19,88 +22,96 @@ OK, FAIL = [], []
 def chk(n, c, extra=""):
     (OK if c else FAIL).append(n)
     print(("PASS  " if c else "FAIL  ") + n + (("  | " + extra) if extra else ""))
+    sys.stdout.flush()
 
 
-# 1) 配置里有 auto-mas
-keys = [a["key"] for a in launcher.APPS]
-chk("1) 配置包含 auto-mas", "auto-mas" in keys, str(keys))
+# 模态框必须 mock：离屏环境下真弹会阻塞事件循环（旧测试踩过这个坑）
+QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.No)
+QMessageBox.information = staticmethod(lambda *a, **k: QMessageBox.Ok)
 
-# 2) vendor 优先定位
-repo, py = launcher.auto_mas_paths()
-chk("2) 定位到 vendor 副本", repo.endswith("vendor\\auto-mas"),
-    "repo=%s" % repo)
-chk("2b) 解释器可用", bool(py and os.path.isfile(py)), py)
-
-# 3) 主窗口能建、卡片存在
 win = launcher.Launcher()
 win.show()
 app.processEvents()
-chk("3) 主窗口构建成功", win is not None)
-chk("3b) auto-mas 卡片已创建", "auto-mas" in win.cards, str(list(win.cards.keys())))
+page = win.mas_page
+KEY = launcher.AUTO_MAS_MENU_KEY
 
-card = win.cards.get("auto-mas")
-if card:
-    chk("3c) 走 MAS 形态分支", getattr(card, "_mas", False) is True)
-    chk("3d) 有启动按钮", hasattr(card, "mas_start_btn"))
-    chk("3e) 按钮可点（依赖齐时）", card.mas_start_btn.isEnabled(),
-        "初始状态=%s" % card._mas_state)
-    chk("3f) 停按钮初始禁用", not card.mas_stop_btn.isEnabled())
+# 本测试不起真后端：把启动动作换成记录桩（自动启动的接线在下面单独断言，
+# 这样既验了「进页面会自动拉起后端」，又不会真起进程拖慢测试）。
+started = []
+page.start_backend = lambda: started.append(True)
+page._auto_started = False
 
-    # 4) 真点「启动后端」→ 等 ready
-    card._mas_start()
-    end = time.time() + 120
-    while time.time() < end:
-        app.processEvents()
-        if getattr(card, "_mas_state", "") in ("ready", "failed"):
-            break
-        time.sleep(0.3)
-    st = getattr(card, "_mas_state", "")
-    chk("4) 点启动后进入 ready", st == "ready", "状态=%s 详情=%s"
-        % (st, card.mas_detail.text() if hasattr(card, "mas_detail") else ""))
+# ---------- 1) 入口接线：菜单 → stack 页 ----------
+chk("1) 侧栏出现 AUTO-MAS 菜单", KEY in win.sidebar._buttons)
+chk("1b) 菜单文案正确",
+    win.sidebar._buttons[KEY]._label.text() == "AUTO-MAS 任务编排"
+    if KEY in win.sidebar._buttons else False)
+chk("1c) 菜单图标文件存在",
+    os.path.isfile(os.path.join(launcher.ASSETS_DIR, "auto-mas.png")),
+    os.path.join(launcher.ASSETS_DIR, "auto-mas.png"))
+chk("1d) 页面已入 stack 索引", KEY in win._page_index)
+win.switch_to(KEY)
+app.processEvents()
+chk("1e) 点菜单真的切到该页",
+    win.stack.currentIndex() == win._page_index[KEY],
+    "current=%d" % win.stack.currentIndex())
+chk("1f) 页面就是 MasPage 实例", win.stack.currentWidget() is page)
+chk("1g) 首次进入页面自动拉起后端（WeGame 式常驻）",
+    started == [True], "start_backend 调用 %d 次" % len(started))
+chk("1h) 自动启动只做一次（切走再回来不重复拉起）",
+    (lambda: (win.switch_to("overview"), win.switch_to(KEY),
+              app.processEvents(), len(started) == 1)[-1])(),
+    "start_backend 调用 %d 次" % len(started))
 
-    if st == "ready":
-        chk("4b) 停按钮已启用", card.mas_stop_btn.isEnabled())
-        pid = card._mas_worker._proc.pid if card._mas_worker and card._mas_worker._proc else None
-        chk("4c) 后端进程已拉起", bool(pid), "pid=%s" % pid)
+# ---------- 2) 四个分段视图 ----------
+chk("2) 视图数 = 4", page.views.count() == 4, str(page._seg_index))
+chk("2b) 分段键齐全",
+    set(page._seg_index) == {"queue", "scripts", "log", "service"},
+    str(list(page._seg_index)))
+for key, idx in page._seg_index.items():
+    page._on_seg(key)
+    if page.views.currentIndex() != idx:
+        chk("2c) 分段 %s 可切" % key, False, "idx=%d" % page.views.currentIndex())
+chk("2c) 四个分段都能切", True)
 
-        # 5) 点「停止后端」→ 进程退出
-        card._mas_stop()
-        end = time.time() + 60
-        while time.time() < end:
-            app.processEvents()
-            if getattr(card, "_mas_state", "") == "stopped":
-                break
-            time.sleep(0.3)
-        chk("5) 点停止后回到 stopped",
-            getattr(card, "_mas_state", "") == "stopped",
-            "状态=%s" % getattr(card, "_mas_state", ""))
-        if pid:
-            # 注意时序：_mas_state 变 stopped 时进程**正在退出**，实际退出约需 1s
-            # （实测 poll 在 t=1.0s 时变 0）。必须等进程真正结束再断言，
-            # 否则会误判成"进程残留"。
-            w = getattr(card, "_mas_worker", None)
-            exited = False
-            for _ in range(30):
-                app.processEvents()
-                if w is None or w._proc is None or w._proc.poll() is not None:
-                    exited = True
-                    break
-                time.sleep(0.3)
-            chk("5b) 后端进程已退出", exited,
-                "rc=%s" % (w._proc.poll() if w and w._proc else "?"))
-            alive = subprocess.run(["tasklist", "/FI", "PID eq %d" % pid, "/NH"],
-                                   capture_output=True, text=True,
-                                   encoding="utf-8", errors="replace",
-                                   timeout=20).stdout
-            chk("5c) 进程表中已无该 pid", str(pid) not in alive, "pid=%s" % pid)
+# ---------- 3) 空态：界面必须有内容 ----------
+chk("3) 未启动时状态 stopped", page._state == "stopped", page._state)
+chk("3b) 队列视图有提示卡", page._bodies["queue"].count() > 1,
+    "count=%d" % page._bodies["queue"].count())
+chk("3c) 脚本视图有提示卡", page._bodies["scripts"].count() > 1,
+    "count=%d" % page._bodies["scripts"].count())
+chk("3d) 服务信息有内容", page._bodies["service"].count() > 1,
+    "count=%d" % page._bodies["service"].count())
+chk("3e) 日志页显示日志路径", "app.log" in page.log_note.text(),
+    page.log_note.text()[:90])
+chk("3f) 数据目录是 launcher 下的 auto-mas（不是 .cache）",
+    "auto-mas" in page._home and ".cache" not in page._home, page._home)
 
-# 6) 无孤儿
-time.sleep(1.5)
-out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq python.exe", "/FO", "CSV", "/NH"],
-                     capture_output=True, text=True, encoding="utf-8",
-                     errors="replace", timeout=20).stdout
-orph = [l for l in out.splitlines() if "AUTO-MAS" in l]
-chk("6) 无 AUTO-MAS 孤儿进程", not orph, "残留 %d" % len(orph))
+# ---------- 4) 后端未运行时点动作：只提示不崩 ----------
+err = None
+try:
+    page.run_queue("no-such-queue", False)
+    page.run_queue("no-such-queue", True)
+    page.stop_task("no-such-task")
+    page.stop_task("")
+    page.new_queue()
+    page.delete_queue("no-such-queue")           # 确认框 mock 成 No → 不该发请求
+    page.add_script("OkNte")
+    page.pick_script_for_queue("no-such-queue")  # 没有脚本 → 只提示
+    app.processEvents()
+except Exception as e:
+    err = "%s: %s" % (type(e).__name__, e)
+chk("4) 后端未运行时动作不崩", err is None, err or "")
+
+# ---------- 5) 防回归：旧卡片形态死代码必须已清除 ----------
+card = win.cards[list(win.cards)[0]] if win.cards else None
+chk("5) AppCard 不再有 _mas 成员", card is not None and not hasattr(card, "_mas"))
+chk("5b) AppCard 不再有 _rebuild_mas_body",
+    card is not None and not hasattr(card, "_rebuild_mas_body"))
+chk("5c) config 里不再有 auto-mas 卡片条目",
+    "auto-mas" not in [a.get("key") for a in launcher.APPS],
+    str([a.get("key") for a in launcher.APPS]))
+chk("5d) 菜单 key 常量未被改动", KEY == "auto-mas-menu", KEY)
 
 print("\n通过 %d / 失败 %d" % (len(OK), len(FAIL)))
 for f in FAIL:

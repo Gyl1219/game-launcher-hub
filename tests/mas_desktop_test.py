@@ -1,66 +1,114 @@
 # -*- coding: utf-8 -*-
-"""验证「打开主界面」按钮与桌面版定位、端口显示。"""
-import os, sys, io, time
+"""AUTO-MAS 融合页：「官方界面」入口 + 数据目录选址/迁移。
+
+历史上这个文件名下测的是卡片上的「打开主界面」按钮；页面化之后按钮搬到
+MasPage 顶部服务条，本测试随之迁移，并补上 auto_mas_home() 的两条硬约束：
+  1) 数据必须落在 launcher/auto-mas（.cache 是「随时可清」的目录，装账号配置会丢）；
+  2) 旧版遗留在 .cache/auto-mas 的数据要能自动搬过来。
+
+不真的启动 Electron 桌面端（沙盒跑不了 GUI，且会拉起第二个后端）。
+"""
+import os, sys, io, shutil, tempfile
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import launcher
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 app = QApplication.instance() or QApplication(sys.argv)
 OK, FAIL = [], []
+TMPDIRS = []
 
 
 def chk(n, c, extra=""):
     (OK if c else FAIL).append(n)
     print(("PASS  " if c else "FAIL  ") + n + (("  | " + extra) if extra else ""))
+    sys.stdout.flush()
 
 
-# 1) 桌面版定位
+QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.No)
+QMessageBox.information = staticmethod(lambda *a, **k: QMessageBox.Ok)
+
+# ---------- 1) 桌面版定位 ----------
 exe = launcher.auto_mas_desktop_exe()
-chk("1) 找到 AUTO-MAS 桌面版", bool(exe) and os.path.isfile(exe), exe or "未找到")
+chk("1) auto_mas_desktop_exe 返回路径或空串（不抛异常）",
+    isinstance(exe, str), repr(exe))
+if exe:
+    chk("1b) 返回的路径真实存在", os.path.isfile(exe), exe)
+else:
+    print("      （本机没装 AUTO-MAS 桌面端，跳过路径存在性断言）")
 
-# 2) 卡片有「打开主界面」按钮
+# ---------- 2) 页面按钮接线 ----------
 win = launcher.Launcher()
 win.show()
 app.processEvents()
-card = win.cards.get("auto-mas")
-chk("2) 卡片有 mas_open_btn", hasattr(card, "mas_open_btn"))
-chk("2b) 按钮文案", card.mas_open_btn.text() == "打开主界面",
-    card.mas_open_btn.text())
-chk("2c) 找到桌面版时按钮可点", card.mas_open_btn.isEnabled())
+page = win.mas_page
+chk("2) 页面有「官方界面」按钮", hasattr(page, "open_desk_btn"))
+chk("2b) 按钮文案", page.open_desk_btn.text() == "官方界面",
+    page.open_desk_btn.text())
+chk("2c) 按钮可用性与探测结果一致",
+    page.open_desk_btn.isEnabled() == bool(exe),
+    "enabled=%s exe=%r" % (page.open_desk_btn.isEnabled(), exe))
+chk("2d) 探测结果缓存在实例上", hasattr(page, "_desk_exe"))
 
-# 3) ready 后详情带端口
-card._mas_start()
-end = time.time() + 120
-while time.time() < end:
-    app.processEvents()
-    if getattr(card, "_mas_state", "") in ("ready", "failed"):
-        break
-    time.sleep(0.3)
-detail = card.mas_detail.text()
-port = getattr(card, "_mas_worker_port", 0)
-chk("3) ready 详情含端口", "端口" in detail and str(port) in detail,
-    "detail=%r port=%s" % (detail, port))
+# 打开动作：把 run_exe 换成记录桩，避免真拉起第二个后端
+calls = []
+orig_run_exe = launcher.run_exe
+launcher.run_exe = lambda parent, e, *a, **k: calls.append(e) or True
+try:
+    page._open_desktop()
+    if exe:
+        chk("2e) 有桌面版时调用 run_exe 打开它", calls == [exe], str(calls))
+    else:
+        chk("2e) 无桌面版时只提示不调用", calls == [], str(calls))
+finally:
+    launcher.run_exe = orig_run_exe
 
-# 4) 停后端（不真开桌面版——offscreen 下弹窗会阻塞，直接验证等待逻辑存在）
-card._mas_stop()
-end = time.time() + 30
-while time.time() < end:
-    app.processEvents()
-    if getattr(card, "_mas_state", "") == "stopped":
-        break
-    time.sleep(0.3)
-chk("4) 停止成功", getattr(card, "_mas_state", "") == "stopped")
+# ---------- 3) 数据目录选址 ----------
+home = launcher.auto_mas_home()
+chk("3) 默认数据目录在 launcher 下", os.path.normcase(home).startswith(
+    os.path.normcase(os.path.abspath(launcher.LAUNCHER_DIR))), home)
+chk("3b) 默认目录不含 .cache（用户数据不能放可清目录）",
+    ".cache" not in home, home)
+chk("3c) 页面用的就是同一目录",
+    os.path.normcase(page._home) == os.path.normcase(home), page._home)
 
-# 5) _mas_open_desktop / _mas_open_poll 方法存在
-chk("5) 打开逻辑已接线", hasattr(card, "_mas_open_desktop")
-    and hasattr(card, "_mas_open_poll"))
+# ---------- 4) 旧数据目录迁移（.cache/auto-mas → auto-mas/）----------
+tmp_new = tempfile.mkdtemp(prefix="mas_home_new_")
+tmp_old = tempfile.mkdtemp(prefix="mas_home_old_")
+TMPDIRS += [tmp_new, tmp_old]
+os.makedirs(os.path.join(tmp_old, "config"), exist_ok=True)
+with io.open(os.path.join(tmp_old, "config", "QueueConfig.json"), "w",
+             encoding="utf-8") as f:
+    f.write('{"instances": []}')
+orig_legacy = launcher.AUTO_MAS_LEGACY_HOME
+orig_cfg = launcher._load_cfg_safe
+launcher.AUTO_MAS_LEGACY_HOME = tmp_old
+launcher._load_cfg_safe = lambda: {"auto_mas_home": tmp_new}
+try:
+    got = launcher.auto_mas_home()
+    chk("4) 配置里指定的目录生效",
+        os.path.normcase(got) == os.path.normcase(os.path.abspath(tmp_new)), got)
+    chk("4b) 旧数据已搬迁过来",
+        os.path.isfile(os.path.join(tmp_new, "config", "QueueConfig.json")),
+        os.path.join(tmp_new, "config", "QueueConfig.json"))
+    # 已有 config/ 时不该再覆盖（幂等，避免每次启动都搬运）
+    marker = os.path.join(tmp_new, "config", "KEEP.txt")
+    with io.open(marker, "w", encoding="utf-8") as f:
+        f.write("keep")
+    launcher.auto_mas_home()
+    chk("4c) 已有数据时不再重复搬运", os.path.isfile(marker))
+finally:
+    launcher.AUTO_MAS_LEGACY_HOME = orig_legacy
+    launcher._load_cfg_safe = orig_cfg
+    for d in TMPDIRS:
+        shutil.rmtree(d, ignore_errors=True)
 
 print("\n通过 %d / 失败 %d" % (len(OK), len(FAIL)))
 for f in FAIL:
     print("   FAILED:", f)
-sys.stdout.flush(); sys.stderr.flush()
+sys.stdout.flush()
+sys.stderr.flush()
 os._exit(1 if FAIL else 0)
