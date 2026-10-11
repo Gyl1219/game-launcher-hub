@@ -89,6 +89,24 @@ v1.3.0 已修：`_auto_mas_python_candidates()` 在 `sys.frozen` 为真时不再
 3. 若走路线 B，先做一次**离线实测**：把 `environment/python` 之外的依赖装进独立 venv，
    量出真实体积与安装耗时，再决定是否剔除 `res/` 中的 Web 前端素材。
 
+## 5.1 安装 / 卸载（已实现，v1.3.0）
+
+用户反馈：「有些用户只有一个号不用这个 mas」→ MAS 定位成**可选组件**，
+编排页新增「组件（安装/卸载）」分段，与其它助手同构。
+
+| 动作 | 实现 | 依据 |
+|---|---|---|
+| 取包 | `AUTO-MAS-Setup-<ver>-x64.zip`，CNB 优先、GitHub 回退（复用仓库既有的 `_resolve_release_asset`） | 上游 `app/services/update.py:357/374` |
+| 安装 | 解压 → 调官方安装程序，参数 `/SP- /SILENT /NOCANCEL /FORCECLOSEAPPLICATIONS /LANG=Chinese /DIR=<目录>` | 照抄上游自己的更新流程 `update.py:703-711` |
+| 卸载 | 读注册表 `UninstallString` → 带 `/S` 静默 | 本机实测 `D:\AUTO-MAS\unins000.exe` |
+| 体积 | zip 约 116 MB；装完约 1.9 GB（含 449 MB 的 Python 运行环境） | v5.6.2 实测 |
+
+两条刻意的设计：
+1. **不自己复制安装文件**——安装路径、注册表项、开始菜单快捷方式全交给官方安装程序，
+   自己实现只会得到一个「装了但卸不掉」的半吊子。
+2. **卸载只移除程序本体**，启动器自己的编排数据（`auto-mas/` 下的队列/账号/历史）保留不动，
+   想连它们一起清需要用户手动删目录（这也是卸载确认框里写明的话）。
+
 ## 6. 打包后自测清单（每次改动都要跑）
 
 ```powershell

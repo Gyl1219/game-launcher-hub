@@ -44,7 +44,11 @@ need = ["_state", "_detail", "_port", "_base", "_health", "_queues", "_items",
         "_times", "_scripts", "_script_data", "_users", "_runtime", "_jobs",
         "_busy", "_home", "_log_path", "_bodies", "_heads", "_seg_index",
         "_timer", "_worker", "dot", "state_lbl", "detail_lbl", "start_btn",
-        "stop_btn", "refresh_btn", "seg", "views", "log_edit", "log_note"]
+        "stop_btn", "refresh_btn", "seg", "views", "log_edit", "log_note",
+        # 实时通道与安装/卸载的状态字段（同样会在轮询渲染里被读到）
+        "_events", "_ws_state", "_ws_detail", "_ws_events", "_live_tasks",
+        "_live_notices", "_live_dirty", "_live_timer", "live_edit", "live_note",
+        "_setup_card", "_setup_worker", "_setup_busy", "_setup_target"]
 missing = [f for f in need if not hasattr(page, f)]
 chk("1) 状态字段齐备", not missing, "缺: %s" % missing)
 

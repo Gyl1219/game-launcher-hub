@@ -98,10 +98,10 @@ chk("1s) 再次进入不重复拉起后端",
     (win.switch_to(KEY), app.processEvents(), len(started) == 1)[-1],
     "start_backend 调用 %d 次" % len(started))
 
-# ---------- 2) 五个分段视图（实时任务日志 + 队列/脚本/日志/服务信息）----------
-chk("2) 视图数 = 5", page.views.count() == 5, str(page._seg_index))
+# ---------- 2) 六个分段视图（实时日志 + 队列/脚本/日志/组件/服务信息）----------
+chk("2) 视图数 = 6", page.views.count() == 6, str(page._seg_index))
 chk("2b) 分段键齐全",
-    set(page._seg_index) == {"live", "queue", "scripts", "log", "service"},
+    set(page._seg_index) == {"live", "queue", "scripts", "log", "setup", "service"},
     str(list(page._seg_index)))
 for key, idx in page._seg_index.items():
     page._on_seg(key)

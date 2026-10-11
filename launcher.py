@@ -1425,6 +1425,14 @@ def _desktop_dir():
     return ""
 
 
+def _strip_quotes(s):
+    """去掉首尾成对引号（注册表 UninstallString 常写成 "X:\\a\\b.exe"）。"""
+    s = str(s or "").strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        return s[1:-1].strip()
+    return s
+
+
 def _norm_path_text(s):
     """路径文本归一化：分隔符统一成 / 再小写。
 
@@ -2156,6 +2164,247 @@ class ZipAppWorker(QThread):
 
         self.progress.emit("完成")
         self.done.emit(tag or _zipapp_version(self.app) or "")
+
+
+# ===== AUTO-MAS 的安装 / 卸载（与其它助手同构的"下载—安装—卸载"链路） =====
+# 为什么也要有：单账号用户根本用不上多账号编排，不该被它占着；所以必须能装、能卸。
+#
+# 关键事实（都已实测/读上游源码核实）：
+#   · 官方发布的是 **zip**，不是 NSIS exe：
+#       AUTO-MAS-Setup-<ver>-x64.zip（v5.6.2 实测 116,397,556 字节）
+#     解压后得到 AUTO-MAS-Setup.exe，再按 Inno Setup 参数静默装（上游自己就是这么更新：
+#     app/services/update.py:703-711，参数 /SP- /SILENT /NOCANCEL
+#     /FORCECLOSEAPPLICATIONS /LANG=Chinese /DIR=<cwd>）。
+#   · 下载源有两个（上游 update.py:357/374）：GitHub 与 CNB（国内快），
+#     另有自建站 https://data.auto-mas.top/... 但那是上游的兜底，不在这里用。
+#   · 卸载走注册表里的 UninstallString（本机实测：D:\AUTO-MAS\unins000.exe）。
+#
+# ⚠ 许可证：这里只是**引导用户下载官方安装包**并调用官方安装程序，
+#   不内置、不分发 AUTO-MAS 的二进制（与把它打进自己的 exe 是两回事）。
+#   但装完之后本机就有了 AGPL-3.0 的程序，分发本启动器前仍需处理许可证，
+#   见 wiki/AUTO-MAS-打包与许可证评估.md。
+AUTO_MAS_RELEASE_REPO = "AUTO-MAS-Project/AUTO-MAS"
+AUTO_MAS_ASSET_GLOB = "AUTO-MAS-Setup-*-x64.zip"
+AUTO_MAS_SITE = "https://auto-mas.top/"
+
+
+def auto_mas_latest_release():
+    """查官方最新正式版 → (tag, 下载URL, 文件名, 大小字节)。查不到返回空串元组。
+
+    CNB 优先（国内快），失败回退 GitHub —— 与仓库里其它助手的取包逻辑同构
+    （_resolve_release_asset）。复用它即可，不另写一套。
+    """
+    url, name, tag = _resolve_release_asset(AUTO_MAS_RELEASE_REPO,
+                                           AUTO_MAS_ASSET_GLOB)
+    return (tag or "", url or "", name or "", 0)
+
+
+def auto_mas_install_dir():
+    """AUTO-MAS 的安装目录（与其它助手同构：install_root/<名字>）。
+
+    config.json 的 auto_mas_install 可覆盖；默认 <install_root>/AUTO-MAS。
+    注意与 auto_mas_home()（编排数据目录）区分：
+      · 这里放的是**程序本体**（exe + 449MB 的 Python 环境），卸载时会被官方卸载程序清掉；
+      · 那边放的是**用户数据**（队列/账号/历史），卸载本体不影响它。
+    """
+    cfg = _load_cfg_safe()
+    raw = str(cfg.get("auto_mas_install") or "").strip()
+    if raw:
+        return os.path.abspath(raw)
+    root = str(cfg.get("install_root") or "").strip()
+    if root:
+        return os.path.join(root.replace("/", os.sep), "AUTO-MAS")
+    return os.path.join(LAUNCHER_DIR, "AUTO-MAS")
+
+
+def auto_mas_installed_info():
+    """读注册表确认 AUTO-MAS 是否已安装 → dict 或 {}。
+
+    只读查询，绝不做任何卸载动作。键名与其它助手的卸载逻辑同源
+    （_iter_uninstall_entries 遍历同样的 3 个 Uninstall 键）。
+    """
+    import winreg
+    for hive, path in (
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_CURRENT_USER,  r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+    ):
+        try:
+            root = winreg.OpenKey(hive, path)
+        except OSError:
+            continue
+        i = 0
+        while True:
+            try:
+                sub = winreg.EnumKey(root, i)
+                i += 1
+            except OSError:
+                break
+            try:
+                k = winreg.OpenKey(root, sub)
+            except OSError:
+                continue
+
+            def _q(n, _k=k):
+                try:
+                    v, _ = winreg.QueryValueEx(_k, n)
+                    return str(v)
+                except OSError:
+                    return ""
+
+            name = _q("DisplayName")
+            if "auto-mas" not in name.lower() and "auto mas" not in name.lower():
+                continue
+            return {
+                "name": name,
+                "version": _q("DisplayVersion"),
+                "location": _q("InstallLocation"),
+                "uninstall": _q("UninstallString"),
+                "size_kb": _q("EstimatedSize"),
+                "publisher": _q("Publisher"),
+            }
+    return {}
+
+
+class MasSetupWorker(QThread):
+    """AUTO-MAS 安装：下官方 zip → 解压 → 调官方安装程序（静默）→ 等它落地。
+
+    刻意**复用官方安装程序**而不自己复制文件：安装路径、注册表项、卸载入口、
+    开始菜单快捷方式全由它负责，我们重复实现一遍只会做出一个"装了但卸不掉"
+    的半吊子（上游 update.py:701-714 自己更新时也是这个做法）。
+    """
+
+    progress = Signal(str)
+    percent = Signal(int)
+    done = Signal(str)     # 装到的版本
+    failed = Signal(str)
+
+    def __init__(self, target_dir, parent=None):
+        super().__init__(parent)
+        self.target_dir = target_dir
+        self._cancelled = False
+        self._last_pct = -1
+
+    def cancel(self):
+        self._cancelled = True
+
+    def is_cancelled(self):
+        return self._cancelled
+
+    def is_paused(self):
+        return False
+
+    def on_bytes(self, done, total):
+        if total:
+            pct = int(done * 100 / total)
+            if pct != self._last_pct:
+                self._last_pct = pct
+                self.percent.emit(pct)
+                self.progress.emit("%d%%（%s / %s）"
+                                   % (pct, _human_size(done), _human_size(total)))
+        else:
+            self.percent.emit(-1)
+            self.progress.emit("已下载 %s" % _human_size(done))
+
+    def run(self):
+        tag, url, name, _sz = auto_mas_latest_release()
+        if not url:
+            self.failed.emit("未能从官方发布页找到安装包（网络不通或仓库暂未发布）。")
+            return
+        try:
+            os.makedirs(self.target_dir, exist_ok=True)
+        except OSError as e:
+            self.failed.emit("无法创建安装目录 %s：%s" % (self.target_dir, e))
+            return
+
+        zpath = os.path.join(self.target_dir, "_mas_setup_tmp.zip")
+        self.progress.emit("正在下载 %s…" % (name or "安装包"))
+        st, msg = _download_chunked(url, zpath, self)
+        if st == "cancelled":
+            self._cleanup(zpath)
+            self.failed.emit("已取消")
+            return
+        if st != "done":
+            self._cleanup(zpath)
+            self.failed.emit("下载失败：%s" % msg)
+            return
+        if self._cancelled:
+            self._cleanup(zpath)
+            self.failed.emit("已取消")
+            return
+
+        self.progress.emit("正在解压…")
+        try:
+            with zipfile.ZipFile(zpath) as zf:
+                zf.extractall(self.target_dir)
+        except Exception as e:
+            self._cleanup(zpath)
+            self.failed.emit("解压失败：%s" % e)
+            return
+        self._cleanup(zpath)
+
+        setup = os.path.join(self.target_dir, "AUTO-MAS-Setup.exe")
+        if not os.path.isfile(setup):
+            self.failed.emit("解压后没找到 AUTO-MAS-Setup.exe（安装包结构可能与预期不同）。")
+            return
+
+        # 参数照抄上游自己的更新流程（app/services/update.py:703-711）：
+        # /SILENT 只显示进度不弹选项；/NOCANCEL 防用户中途取消留下半装状态；
+        # /FORCECLOSEAPPLICATIONS 关掉占用文件的旧进程；/DIR 钉死安装目录。
+        self.progress.emit("正在安装（官方安装程序，约 1~3 分钟）…")
+        try:
+            subprocess.Popen(
+                [setup, "/SP-", "/SILENT", "/NOCANCEL",
+                 "/FORCECLOSEAPPLICATIONS", "/LANG=Chinese",
+                 "/DIR=%s" % self.target_dir],
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            ).wait()
+        except Exception as e:
+            self.failed.emit("启动安装程序失败：%s" % e)
+            return
+
+        # 注册表落地需要一点时间，给 20 秒轮询（装完立刻读会读不到）
+        for _ in range(20):
+            if self._cancelled:
+                break
+            info = auto_mas_installed_info()
+            if info.get("uninstall"):
+                self.progress.emit("完成")
+                self.done.emit(info.get("version") or tag or "")
+                return
+            time.sleep(1)
+        self.failed.emit(
+            "安装程序已运行，但注册表里没看到 AUTO-MAS。\n"
+            "若装到了其它目录，可在 config.json 用 auto_mas_desktop / "
+            "auto_mas_home 指定。")
+
+    def _cleanup(self, path):
+        try:
+            if path and os.path.isfile(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+
+class _MasRunWorker(QThread):
+    """跑一个外部程序并回报退出码（卸载用：官方卸载程序是 GUI 进程，不能直接等）。
+
+    单独抽出来是因为：卸载程序可能弹确认框，等待时间不可控，
+    不能放在 MasSetupWorker（它有下载/解压语义）里。
+    """
+
+    done = Signal(int)
+
+    def __init__(self, args, parent=None):
+        super().__init__(parent)
+        self._args = list(args)
+
+    def run(self):
+        try:
+            rc = subprocess.Popen(self._args).wait()
+        except Exception:
+            rc = -1
+        self.done.emit(rc)
 
 
 class GenericUpdateCheckWorker(QThread):
@@ -12880,6 +13129,88 @@ class _MasQueueCard(CardWidget):
         return txt.strip()
 
 
+class _MasSetupCard(CardWidget):
+    """安装状态卡：未装给「安装」，已装显示版本/目录并给「卸载」。
+
+    其它助手卡片都有装/卸两条路（WeGame 式），MAS 也得有：
+    单账号用户根本用不上多账号编排，不该被一个用不上的功能占着。
+    """
+
+    sig_install = Signal()
+    sig_uninstall = Signal()
+
+    def __init__(self, info, target_dir, busy=False, parent=None):
+        super().__init__(parent)
+        info = info or {}
+        v = QVBoxLayout(self)
+        v.setContentsMargins(16, 14, 14, 14)
+        v.setSpacing(8)
+        self.installed = bool(info.get("uninstall"))
+
+        top = QHBoxLayout()
+        top.setSpacing(10)
+        title = ("AUTO-MAS 已安装" if self.installed
+                 else "AUTO-MAS 尚未安装（可选组件）")
+        top.addWidget(StrongBodyLabel(title))
+        if self.installed and info.get("version"):
+            cap = CaptionLabel(info["version"])
+            cap.setStyleSheet("color:#639922;")
+            top.addWidget(cap)
+        top.addStretch(1)
+
+        if self.installed:
+            btn = PushButton("卸载")
+            btn.clicked.connect(self.sig_uninstall)
+        else:
+            btn = PrimaryPushButton("安装 AUTO-MAS")
+            btn.clicked.connect(self.sig_install)
+        btn.setFixedHeight(32)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setEnabled(not busy)
+        self.main_btn = btn
+        top.addWidget(btn)
+        v.addLayout(top)
+
+        if self.installed:
+            loc = info.get("location") or ""
+            if loc:
+                lbl = CaptionLabel("安装位置：%s" % loc)
+                lbl.setWordWrap(True)
+                lbl.setStyleSheet("color:#8a8d96;")
+                v.addWidget(lbl)
+            note = CaptionLabel(
+                "卸载走官方卸载程序（注册表 UninstallString），会连它的"
+                "安装目录、开始菜单快捷方式与注册表项一起清掉。"
+                "本启动器自己的编排数据（auto-mas/ 下的队列/账号）不受影响。")
+        else:
+            note = CaptionLabel(
+                "只在你有多账号 / 定时轮转需求时才需要它。"
+                "点「安装」会下载官方安装包（约 116 MB）并调用官方安装程序静默安装到："
+                "%s。装完本页即可直接用。" % target_dir)
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#8a8d96;")
+        v.addWidget(note)
+
+        self.bar = IndeterminateProgressBar()
+        self.bar.setFixedHeight(4)
+        self.bar.setVisible(busy)
+        v.addWidget(self.bar)
+
+        self.status = CaptionLabel("")
+        self.status.setWordWrap(True)
+        self.status.setStyleSheet("color:#8a8d96;")
+        v.addWidget(self.status)
+
+    def set_busy(self, on, text=""):
+        self.main_btn.setEnabled(not on)
+        self.bar.setVisible(bool(on))
+        self.main_btn.setText("安装中…" if (on and not self.installed)
+                              else ("卸载中…" if on else
+                                    ("卸载" if self.installed else "安装 AUTO-MAS")))
+        if text:
+            self.status.setText(text)
+
+
 class _MasRuntimeCard(CardWidget):
     """一个正在运行的任务：模式 + 关联脚本状态 + 日志尾部 + 中止。"""
 
@@ -13013,6 +13344,10 @@ class MasPage(QWidget):
         self._live_notices = []
         self._live_dirty = False
         # ---- 线程/目录 ----
+        self._setup_card = None
+        self._setup_worker = None
+        self._setup_busy = False
+        self._setup_target = auto_mas_install_dir()
         self._jobs = []
         self._busy = False
         self._home = auto_mas_home()
@@ -13094,19 +13429,21 @@ class MasPage(QWidget):
         self.seg.addItem("queue", "任务队列")
         self.seg.addItem("scripts", "脚本与账号")
         self.seg.addItem("log", "运行日志")
+        self.seg.addItem("setup", "组件（安装/卸载）")
         self.seg.addItem("service", "服务信息")
         self.seg.currentItemChanged.connect(self._on_seg)
         root.addWidget(self.seg)
 
         self.views = QStackedWidget()
-        seg_keys = ("live", "queue", "scripts", "log", "service")
+        seg_keys = ("live", "queue", "scripts", "log", "setup", "service")
         self.live_view = self._make_live_view()
         self.queue_view = self._make_list_view("queue")
         self.scripts_view = self._make_list_view("scripts")
         self.log_view = self._make_log_view()
+        self.setup_view = self._make_list_view("setup")
         self.service_view = self._make_list_view("service")
         for i, w in enumerate((self.live_view, self.queue_view, self.scripts_view,
-                               self.log_view, self.service_view)):
+                               self.log_view, self.setup_view, self.service_view)):
             self.views.addWidget(w)
             self._seg_index[seg_keys[i]] = i
         root.addWidget(self.views, 1)
@@ -13568,6 +13905,161 @@ class MasPage(QWidget):
         except Exception:
             pass
 
+    # ================= 安装 / 卸载 =================
+    def _render_setup(self):
+        lay = self._bodies["setup"]
+        head = self._heads["setup"]
+        _mas_clear_body(lay)
+        _mas_clear_head(head)
+        info = auto_mas_installed_info()
+        self._setup_target = auto_mas_install_dir()
+
+        card = _MasSetupCard(info, self._setup_target, self._setup_busy)
+        card.sig_install.connect(self.install_component)
+        card.sig_uninstall.connect(self.uninstall_component)
+        self._setup_card = card
+        _mas_add_body(lay, card)
+
+        # 已装但后端跑不起来时，把"去哪下载/重装"的出口也摆出来
+        if info.get("uninstall") and self._state == "failed":
+            _mas_add_body(lay, _mas_hint(
+                "已检测到安装，但后端没能起来（%s）。\n"
+                "可以先试「卸载」再重装；安装目录：%s"
+                % (self._detail[:80], info.get("location") or self._setup_target)))
+
+        open_btn = PushButton("打开官方下载页")
+        open_btn.setFixedHeight(30)
+        open_btn.setCursor(Qt.PointingHandCursor)
+        open_btn.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl(AUTO_MAS_SITE)))
+        head.addWidget(open_btn)
+        head.addStretch(1)
+
+    def install_component(self):
+        """下载官方 zip → 解压 → 调官方安装程序静默安装。"""
+        if self._setup_busy:
+            return
+        if self._state in ("starting", "ready"):
+            self._toast("请先停止后端", "安装会覆盖程序文件，请先点「停止后端」",
+                        error=True)
+            return
+        info = auto_mas_installed_info()
+        if info.get("uninstall"):
+            self._toast("已经装好了", "要重装请先卸载", error=True)
+            return
+        target = auto_mas_install_dir()
+        try:
+            ok = QMessageBox.question(
+                self.window(), "安装 AUTO-MAS",
+                "将下载官方安装包（约 116 MB）并静默安装到：\n%s\n\n"
+                "它包含自带的 Python 3.12 运行环境（约 449 MB）。\n"
+                "只在你有多账号 / 定时轮转需求时才需要它。继续吗？" % target,
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes
+        except Exception:
+            ok = False
+        if not ok:
+            return
+
+        self._setup_busy = True
+        if self._setup_card:
+            self._setup_card.set_busy(True, "正在准备…")
+        w = MasSetupWorker(target)
+        w.progress.connect(self._on_setup_progress)
+        w.percent.connect(self._on_setup_percent)
+        w.done.connect(self._on_setup_done)
+        w.failed.connect(self._on_setup_failed)
+        self._setup_worker = w
+        w.start()
+
+    def uninstall_component(self):
+        """调官方卸载程序（注册表 UninstallString），不清用户的编排数据。"""
+        if self._setup_busy:
+            return
+        if self._state in ("starting", "ready"):
+            self._toast("请先停止后端", "卸载会删除程序文件，请先点「停止后端」",
+                        error=True)
+            return
+        info = auto_mas_installed_info()
+        cmd = info.get("uninstall") or ""
+        if not cmd:
+            self._toast("没找到卸载入口",
+                        "注册表里没有 AUTO-MAS 的卸载项，可能已被卸载过", error=True)
+            return
+        exe = _strip_quotes((cmd.split(" /")[0].strip() or cmd).strip('"'))
+        try:
+            ok = QMessageBox.question(
+                self.window(), "卸载 AUTO-MAS",
+                "将调用官方卸载程序：\n%s\n\n"
+                "这会删除它的安装目录（含自带的 Python 运行环境）与开始菜单"
+                "快捷方式。\n\n"
+                "**本启动器自己的编排数据不会被动**（%s 下的队列/账号/历史会保留），\n"
+                "想连它们一起清，请手动删除该目录。确定卸载吗？"
+                % (exe, self._home),
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes
+        except Exception:
+            ok = False
+        if not ok:
+            return
+
+        self._setup_busy = True
+        if self._setup_card:
+            self._setup_card.set_busy(True, "正在卸载…")
+        # NSIS 的静默参数：/S（大小写不敏感）。用官方卸载程序而不是自己删目录，
+        # 才能保证注册表项、快捷方式、安装的依赖登记都被正确清掉。
+        args = [exe, "/S"] if os.path.isfile(exe) else None
+        if args is None:
+            self._setup_busy = False
+            self._toast("卸载程序不见了", "找不到 %s" % exe, error=True)
+            self._render_setup()
+            return
+        w = _MasRunWorker(args)
+        w.done.connect(lambda rc: self._on_uninstall_done(rc))
+        self._setup_worker = w
+        w.start()
+
+    def _on_setup_progress(self, text):
+        if self._setup_card:
+            self._setup_card.set_busy(True, text)
+
+    def _on_setup_percent(self, _pct):
+        pass          # 进度已包含在 progress 文案里，这里只为接口完整
+
+    def _on_setup_done(self, version):
+        self._setup_busy = False
+        self._setup_worker = None
+        self._toast("安装完成", "AUTO-MAS %s 已安装" % (version or ""))
+        self._render_setup()
+        # 后端解释器路径变了，重新探测一次即可直接起
+        self._set_state("stopped", "已安装，可以点「启动后端」了")
+        self._render_all()
+
+    def _on_setup_failed(self, msg):
+        self._setup_busy = False
+        self._setup_worker = None
+        self._render_setup()
+        self._toast("安装失败", str(msg or ""), error=True)
+
+    def _on_uninstall_done(self, rc):
+        self._setup_busy = False
+        self._setup_worker = None
+        # 卸载程序返回后注册表可能还没立刻消失，轮询几秒再刷新。
+        # 注意这里**不能用 app.processEvents()**：卸载程序可能弹确认框，
+        # 在工作线程里跑事件循环会重入 UI，直接在 sleep 里等即可。
+        gone = False
+        for _ in range(15):
+            time.sleep(1)
+            if not auto_mas_installed_info().get("uninstall"):
+                gone = True
+                break
+        self._render_setup()
+        if gone or rc == 0:
+            self._toast("已卸载", "AUTO-MAS 程序本体已移除；编排数据保留在 %s" % self._home)
+        else:
+            self._toast("卸载程序已运行",
+                        "但注册表项仍在（可能它弹了确认框）。请按提示完成后再刷新。",
+                        error=True)
+        self._set_state("stopped", "组件已卸载")
+
     # ================= 渲染 =================
     def _render_all(self):
         self._render_queue()
@@ -13575,6 +14067,7 @@ class MasPage(QWidget):
         self._render_service()
         self._render_log()
         self._render_live()
+        self._render_setup()
 
     def _script_names(self):
         out = {}

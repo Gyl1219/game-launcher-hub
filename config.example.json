@@ -88,9 +88,10 @@
       "website": "https://maaend.com/"
     }
   ],
-  "_comment_mas": "AUTO-MAS 任务编排（融合集成）。mas_enabled=false 时侧栏不显示该页、也不会拉起后端；auto_mas_home 留空则用启动器目录下的 auto-mas/（后端把账号、队列、脚本配置、历史与日志全写在这里，属于用户数据，别指向临时目录）。",
+  "_comment_mas": "AUTO-MAS 任务编排（融合集成，可选组件）。mas_enabled=false 时总览页右上角的入口整块隐藏、也不拉起后端。auto_mas_home 留空则用启动器目录下的 auto-mas/（后端把账号、队列、脚本配置、历史与日志写在这里，属用户数据，卸载程序本体不会动它）；auto_mas_install 留空则装到 install_root/AUTO-MAS。",
   "mas_enabled": true,
   "auto_mas_home": "",
+  "auto_mas_install": "",
   "telemetry": {
     "enabled": true,
     "ping": false,
