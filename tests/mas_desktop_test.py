@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""AUTO-MAS 融合页：「官方界面」入口 + 数据目录选址/迁移。
+"""AUTO-MAS 融合页：「完整配置」入口（开官方客户端新窗口）+ 数据目录选址/迁移。
 
 历史上这个文件名下测的是卡片上的「打开主界面」按钮；页面化之后按钮搬到
 MasPage 顶部服务条，本测试随之迁移，并补上 auto_mas_home() 的两条硬约束：
@@ -45,8 +45,8 @@ win = launcher.Launcher()
 win.show()
 app.processEvents()
 page = win.mas_page
-chk("2) 页面有「官方界面」按钮", hasattr(page, "open_desk_btn"))
-chk("2b) 按钮文案", page.open_desk_btn.text() == "官方界面",
+chk("2) 页面有「完整配置」按钮", hasattr(page, "open_desk_btn"))
+chk("2b) 按钮文案", page.open_desk_btn.text() == "完整配置",
     page.open_desk_btn.text())
 chk("2c) 按钮可用性与探测结果一致",
     page.open_desk_btn.isEnabled() == bool(exe),

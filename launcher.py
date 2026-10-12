@@ -11650,6 +11650,8 @@ class OverviewPage(QWidget):
             "AUTO-MAS 不是游戏助手，是「管这些助手」的多账号任务编排插件：\n"
             "帮你把已装好的助手按队列/定时跑起来，看状态与日志。\n"
             "入口在这里而不放侧栏，是因为它与 6 个游戏助手不是同一层级。")
+        # 装没装由 Launcher 在挂好后告知；这里先按「已装」初始化，避免首帧闪烁
+        self._mas_installed = True
 
         self.scan_btn = PushButton("🔍 扫描游戏")
         self.scan_btn.setFixedHeight(32)
@@ -11785,6 +11787,12 @@ class OverviewPage(QWidget):
         except Exception:
             pass
 
+    def set_mas_installed(self, installed):
+        """标记本机是否已装 AUTO-MAS（决定状态栏显示「未安装」还是「未启动」）。"""
+        self._mas_installed = bool(installed)
+        # 立刻重刷一次文案（状态没变也要更新）
+        self.set_mas_status(getattr(self, "_mas_state", "stopped"))
+
     def set_mas_status(self, state, detail=""):
         """更新右上角状态灯与说明（由 MasPage.sig_status 推送，不额外轮询）。"""
         self._mas_state = state or "off"
@@ -11795,6 +11803,10 @@ class OverviewPage(QWidget):
                 "starting": "编排插件 · 启动中…", "ready": "编排插件 · 运行中",
                 "stopping": "编排插件 · 停止中…",
                 "failed": "编排插件 · 不可用"}.get(self._mas_state, "编排插件")
+        # 没装过时「stopped」要说成「未安装」，否则用户以为装了只是没启动
+        if self._mas_state in ("stopped", "off") and not getattr(self, "_mas_installed", True):
+            text = "编排插件 · 未安装（点此下载）"
+            color = "#8a8d96"
         try:
             self.mas_dot.setStyleSheet("color:%s; font-size:14px;" % color)
             self.mas_cap.setText(text)
@@ -13401,19 +13413,22 @@ class MasPage(QWidget):
         self.refresh_btn.clicked.connect(self.reload)
         row.addWidget(self.refresh_btn)
 
-        self.open_desk_btn = PushButton("官方界面")
+        self.open_desk_btn = PrimaryPushButton("完整配置")
         self.open_desk_btn.setFixedHeight(32)
         self.open_desk_btn.setCursor(Qt.PointingHandCursor)
         self._desk_exe = auto_mas_desktop_exe()
         if self._desk_exe:
             self.open_desk_btn.setToolTip(
-                "打开 AUTO-MAS 官方桌面端（Electron）。它读自己的安装目录配置，"
-                "与本页的数据目录不是同一套。")
+                "打开 AUTO-MAS 完整客户端（Electron 窗口）：\n"
+                "配账号密码、游戏路径、模拟器、定时任务等全功能都在这里。\n\n"
+                "本页负责编排与看日志，两边互补；\n"
+                "客户端读自己的安装目录配置，与本页数据目录不是同一套。")
             self.open_desk_btn.clicked.connect(self._open_desktop)
         else:
             self.open_desk_btn.setEnabled(False)
             self.open_desk_btn.setToolTip(
-                "未找到 AUTO-MAS.exe；可在 config.json 用 auto_mas_desktop 指定路径")
+                "未找到 AUTO-MAS.exe（尚未安装或装到了别处）。\n"
+                "可在 config.json 用 auto_mas_desktop 指定路径。")
         row.addWidget(self.open_desk_btn)
         bl.addLayout(row)
 
@@ -14322,13 +14337,18 @@ class MasPage(QWidget):
             pass
 
     def _open_desktop(self):
+        """打开 AUTO-MAS 完整客户端（新窗口）——全功能配置在这里做。
+
+        本 exe 只做编排；账号密码/游戏路径/模拟器/定时任务等完整表单
+        归官方客户端（Electron）。同一时刻两边都连后端时，上游只允许一条
+        主 WebSocket，本页收到 4001 会主动让位，不会互踢。
+        """
         exe = getattr(self, "_desk_exe", "") or auto_mas_desktop_exe()
         if not exe:
-            self._toast("未找到", "未找到 AUTO-MAS 桌面版（AUTO-MAS.exe）", error=True)
+            self._toast("未找到", "未找到 AUTO-MAS 客户端（AUTO-MAS.exe）", error=True)
             return
-        # 官方桌面端会自带并启动它自己的后端（正式版端口 36163）；我们监督的后端
-        # 走注入端口，两者不抢端口。但它读自己的安装目录配置，与本页数据目录不同。
         run_exe(self.window(), exe)
+        self._toast("已打开", "完整配置界面已在新窗口打开")
 
 
 def _make_scroll_page(child, max_width=900):
@@ -14468,12 +14488,12 @@ class Launcher(QWidget):
         # 3b) AUTO-MAS 融合页（原生界面，见文件上方 MasPage）
         #     常驻 stack：切页不销毁，后端进程也不会因为离开页面被停掉。
         self.mas_page = MasPage()
-        # 入口接线：总览页右上角按钮 → 切到 MAS 页；MAS 状态 → 总览页状态灯。
+        # 入口接线：总览页右上角按钮 → 按「装没装」分流；MAS 状态 → 总览页状态灯。
         # 状态用信号推、不轮询，所以两边永远一致且不增加定时器。
-        self.overview_page.sig_open_mas.connect(
-            lambda: self.switch_to(AUTO_MAS_MENU_KEY))
+        self.overview_page.sig_open_mas.connect(self._on_mas_entry)
         self.mas_page.sig_status.connect(self.overview_page.set_mas_status)
         self.overview_page.set_mas_available(not self._mas_state_locked)
+        self.overview_page.set_mas_installed(bool(auto_mas_installed_info()))
         self.overview_page.set_mas_status(
             "stopped" if not self._mas_state_locked else "off")
 
@@ -14603,6 +14623,75 @@ class Launcher(QWidget):
         self._settings_dialog.show()
         self._settings_dialog.raise_()
         self._settings_dialog.activateWindow()
+
+    def _on_mas_entry(self):
+        """点右上角 AUTO-MAS：没装就下载安装，装了就进编排页。
+
+        分流理由：首发 exe 不带 MAS（保持 112MB / GPL-3.0），
+        要用的人点一下才下增量包——不用的用户永远不会被拖着下载。
+        """
+        if auto_mas_installed_info().get("uninstall"):
+            self.switch_to(AUTO_MAS_MENU_KEY)
+            return
+        self._install_mas_then_open()
+
+    def _install_mas_then_open(self):
+        """下载安装 AUTO-MAS 增量包（走官方安装程序），装完自动进编排页。"""
+        if getattr(self, "_mas_setup_worker", None) is not None and \
+                self._mas_setup_worker.isRunning():
+            return
+        target = auto_mas_install_dir()
+        try:
+            ok = QMessageBox.question(
+                self, "安装 AUTO-MAS（可选组件）",
+                "AUTO-MAS 是多账号 / 定时轮转的编排插件，只有需要时才有必要装。\n\n"
+                "将下载官方安装包（约 116 MB）并静默安装到：\n%s\n\n"
+                "它自带 Python 3.12 运行环境（约 449 MB）。\n"
+                "单账号用户用不上，可以不装。现在安装吗？" % target,
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes
+        except Exception:
+            ok = False
+        if not ok:
+            return
+
+        self.overview_page.mas_btn.setEnabled(False)
+        self.overview_page.mas_btn.setText("安装中…")
+        self.overview_page.mas_cap.setText("编排插件 · 正在下载安装")
+        w = MasSetupWorker(target)
+        self._mas_setup_worker = w
+        w.progress.connect(self._on_mas_setup_progress)
+        w.done.connect(self._on_mas_setup_done)
+        w.failed.connect(self._on_mas_setup_failed)
+        w.start()
+
+    def _on_mas_setup_progress(self, text):
+        try:
+            self.overview_page.mas_cap.setText("编排插件 · %s" % text[:24])
+        except Exception:
+            pass
+
+    def _on_mas_setup_done(self, version):
+        self.overview_page.set_mas_installed(True)
+        self.overview_page.mas_btn.setEnabled(True)
+        self.overview_page.mas_btn.setText("AUTO-MAS 任务编排")
+        try:
+            QMessageBox.information(
+                self, "安装完成",
+                "AUTO-MAS %s 已安装。\n\n现在点右上角即可进入编排页；\n"
+                "要配账号/脚本路径，进页面后点「官方界面」打开完整客户端。"
+                % (version or ""))
+        except Exception:
+            pass
+        self.switch_to(AUTO_MAS_MENU_KEY)
+
+    def _on_mas_setup_failed(self, msg):
+        self.overview_page.mas_btn.setEnabled(True)
+        self.overview_page.mas_btn.setText("AUTO-MAS 任务编排")
+        self.overview_page.set_mas_status("stopped")
+        try:
+            QMessageBox.critical(self, "安装失败", str(msg or "未知错误"))
+        except Exception:
+            pass
 
     def run_game_scan(self):
         """手动点「🔍 扫描游戏」或启动 1.2s 后自动触发。只扫尚未装好助手的 key。"""
