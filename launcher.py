@@ -1006,6 +1006,52 @@ def _cfg_path():
     return os.path.join(LAUNCHER_DIR, "config.json")
 
 
+# ===== 遥测：首次启动时问一次（折中方案，不自作主张也不藏起来）=====
+# 为什么不默认开：默认开=替用户同意，一旦被发现就是信任崩塌（README 里
+#   "遥测默认关闭"曾经是卖点，不能偷偷改）。
+# 为什么不默认关：默认关的话数据几乎为零，作者永远不知道用户遇到什么崩溃。
+# 所以学 tubatools 的做法：**首次启动弹一次**，把"发什么/不发什么"讲清楚，
+#   用户点完就记住，之后不再打扰；想改随时能在设置页改。
+TELEMETRY_ASKED_KEY = "telemetry_asked"
+
+
+def telemetry_choice_pending():
+    """是否还没问过用户（首次启动）。已问过返回 False。"""
+    try:
+        cfg = _load_cfg_safe()
+        return not bool(cfg.get(TELEMETRY_ASKED_KEY))
+    except Exception:
+        return False
+
+
+def save_telemetry_choice(enabled, ping=None):
+    """记住用户的选择（写 config.json），并标记"已问过"。"""
+    try:
+        path = _cfg_path()
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception:
+            cfg = {}
+        t = cfg.get("telemetry")
+        if not isinstance(t, dict):
+            t = {}
+        t["enabled"] = bool(enabled)
+        if ping is not None:
+            t["ping"] = bool(ping)
+        elif enabled:
+            # 只同意错误上报、没说统计 → 按"同意"处理日活计数
+            t.setdefault("ping", True)
+        t.setdefault("endpoint", TELEMETRY_DEFAULT_ENDPOINT)
+        cfg["telemetry"] = t
+        cfg[TELEMETRY_ASKED_KEY] = True
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+
 def _save_app_field(key, field, value):
     """把某个 app 的字段写回 config.json（exe / installed_version / …）。
 
@@ -1756,10 +1802,14 @@ def mirrorchyan_latest(rid, cdk, current_version="", user_agent="WorkBuddy-OKLau
 #   3. 用本地随机生成的匿名 ID 做去重（只用于算独立用户数），不做跨会话身份关联
 #   4. 未启用 / 没配 endpoint / 发送失败 → 一律静默：不弹窗、不阻塞、不影响主流程
 #
-# config.json 形态（默认全关，行为完全不变）：
-#   "telemetry": {"enabled": false, "endpoint": "", "ping": false}
+# config.json 形态（首次启动会问一次，用户选择写回这里）：
+#   "telemetry": {"enabled": true, "endpoint": "https://glh-tele.pages.dev/collect", "ping": true}
+# 没问过之前（telemetry_asked 缺失）→ 不发送，先问用户。
 
 TELEMETRY_PAYLOAD_LIMIT = 4000
+# 默认上报端点（作者自建，Cloudflare Pages）。用户可在 config.json 覆盖，
+# 也可整段置空来"彻底不发"。
+TELEMETRY_DEFAULT_ENDPOINT = "https://glh-tele.pages.dev/collect"
 
 
 def _telemetry_cfg():
@@ -1772,9 +1822,16 @@ def _telemetry_cfg():
 
 
 def telemetry_enabled():
-    """是否启用匿名错误上报。未配置端点一律视为关闭。"""
+    """是否启用匿名错误上报。未配置端点 / 未问过用户 一律视为关闭。"""
     t = _telemetry_cfg()
-    return bool(t.get("enabled")) and bool(str(t.get("endpoint") or "").strip())
+    if not (bool(t.get("enabled")) and bool(str(t.get("endpoint") or "").strip())):
+        return False
+    # 没问过用户之前一条都不发（防"先收集后征求同意"）。
+    # 例外：开发者手动配了 endpoint + enabled 但没走过询问流程时，
+    # 用 LAUNCHER_TELEMETRY_NOASK=1 可跳过该闸门（自测/调试用）。
+    if telemetry_choice_pending() and not os.environ.get("LAUNCHER_TELEMETRY_NOASK"):
+        return False
+    return True
 
 
 def telemetry_ping_enabled():
@@ -11974,6 +12031,127 @@ class OverviewPage(QWidget):
             pass
 
 
+class TelemetryAskDialog(QDialog):
+    """首次启动问一次：要不要发匿名错误日志。
+
+    为什么单独做成对话框、而不是塞进设置页：
+      · 设置页太隐蔽 —— 绝大部分用户永远不会点开，等于永远不问你，数据永远为零；
+      · 默认开又等于替用户同意 —— 一旦被发现在偷偷上报，信任就没了。
+    所以：问一次、讲清楚、记住选择、之后只给一次"随时可改"的提示。
+
+    三个按钮的语义差别很重要：
+      · 「同意」= 崩溃日志 + 启动计数都发
+      · 「只发崩溃」= 不发启动计数（用户在意"被统计"但愿意帮忙修 bug）
+      · 「不发」= 一条都不发，只写本地日志
+    """
+
+    CHOSEN_YES = 1
+    CHOSEN_CRASH_ONLY = 2
+    CHOSEN_NO = 0
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("帮助改进游戏助手启动器（可选）")
+        self.setModal(True)
+        self.setMinimumWidth(560)
+        self.choice = self.CHOSEN_NO
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(28, 24, 28, 20)
+        root.setSpacing(14)
+
+        root.addWidget(StrongBodyLabel("要不要把崩溃信息发给作者？"))
+
+        intro = CaptionLabel(
+            "程序如果崩溃了，作者看不到任何线索，只能靠猜。"
+            "允许匿名上报的话，修 bug 会快很多。")
+        intro.setWordWrap(True)
+        root.addWidget(intro)
+
+        # 发什么 / 不发什么，必须逐条列清 —— 含糊的"匿名"没人信
+        box = CardWidget()
+        bl = QVBoxLayout(box)
+        bl.setContentsMargins(18, 14, 18, 14)
+        bl.setSpacing(8)
+
+        send = CaptionLabel(
+            "✅ 会发送：\n"
+            "   · 启动器版本号、操作系统版本、Python 版本\n"
+            "   · 崩溃的错误类型与调用栈\n"
+            "   · 一个随机生成的匿名 ID（只用于区分是不是同一个人，与硬件无关）")
+        send.setWordWrap(True)
+        bl.addWidget(send)
+
+        notsend = CaptionLabel(
+            "🚫 绝不发送：\n"
+            "   · 你的用户名、电脑名、文件路径（发送前会被替换成全大写占位符）\n"
+            "   · 任何 CDK / Token / 密码 / 邮箱\n"
+            "   · 你装了哪些游戏、玩了多久、配置内容")
+        notsend.setWordWrap(True)
+        notsend.setStyleSheet("color:#2e7d32;")
+        bl.addWidget(notsend)
+
+        root.addWidget(box)
+
+        tip = CaptionLabel(
+            "选完就记住，之后不再打扰。随时可以在「设置 → 匿名错误上报」里改。")
+        tip.setWordWrap(True)
+        tip.setStyleSheet("color:#888780; font-size:11px;")
+        root.addWidget(tip)
+
+        root.addStretch(1)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        btn_no = PushButton("不发")
+        btn_no.setFixedHeight(34)
+        btn_no.setCursor(Qt.PointingHandCursor)
+        btn_no.clicked.connect(lambda: self._pick(self.CHOSEN_NO))
+        row.addWidget(btn_no)
+
+        btn_crash = PushButton("只发崩溃日志")
+        btn_crash.setFixedHeight(34)
+        btn_crash.setCursor(Qt.PointingHandCursor)
+        btn_crash.setToolTip("上报崩溃信息，但不发送启动计数")
+        btn_crash.clicked.connect(lambda: self._pick(self.CHOSEN_CRASH_ONLY))
+        row.addWidget(btn_crash)
+
+        row.addStretch(1)
+
+        btn_yes = PrimaryPushButton("同意，帮助改进")
+        btn_yes.setFixedHeight(34)
+        btn_yes.setCursor(Qt.PointingHandCursor)
+        btn_yes.clicked.connect(lambda: self._pick(self.CHOSEN_YES))
+        row.addWidget(btn_yes)
+        root.addLayout(row)
+
+        # 关窗口 = 不发（不做"默认同意"这种小动作）
+        self.choice = self.CHOSEN_NO
+
+    def _pick(self, choice):
+        self.choice = choice
+        self.accept()
+
+
+def ask_telemetry_on_first_run(parent=None):
+    """首次启动问一次；返回是否已处理完（用户点了按钮）。"""
+    if not telemetry_choice_pending():
+        return False
+    try:
+        dlg = TelemetryAskDialog(parent)
+        dlg.exec()
+        c = dlg.choice
+        if c == TelemetryAskDialog.CHOSEN_YES:
+            save_telemetry_choice(True, ping=True)
+        elif c == TelemetryAskDialog.CHOSEN_CRASH_ONLY:
+            save_telemetry_choice(True, ping=False)
+        else:
+            save_telemetry_choice(False, ping=False)
+        return True
+    except Exception:
+        return False
+
+
 class SettingsPage(QWidget):
     """设置页：MirrorChyan CDK + 万载云反代域名的常驻表单。
 
@@ -15279,11 +15457,6 @@ def main():
         sys.__excepthook__(etype, value, tb)
 
     sys.excepthook = show_error
-    # 启动计数（仅版本号 + 匿名 ID；需 config 里 telemetry.enabled/ping 都为 true）
-    try:
-        report_ping()
-    except Exception:
-        pass
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
@@ -15300,6 +15473,21 @@ def main():
 
     win = Launcher()
     win.show()
+
+    # 首次启动：问一次要不要发匿名日志（延迟到窗口出来后再弹，别挡启动）。
+    # 问完再 report_ping —— 顺序很重要：没问过之前一条都不发，
+    # 否则就是"先收集再征求同意"，那是耍流氓。
+    def _after_startup():
+        try:
+            ask_telemetry_on_first_run(win)
+        except Exception:
+            pass
+        try:
+            report_ping()
+        except Exception:
+            pass
+
+    QTimer.singleShot(1500, _after_startup)
 
     # 第二实例被点开时：把已有窗口从最小化恢复、置前、抢焦点
     if guard is not None:

@@ -8,7 +8,7 @@
     "game-launcher-hub": ""
   },
   "wanzaiyun_proxy": "",
-  "_comment_telemetry": "可选，默认全关（行为完全不变）。开启后程序崩溃时会把『版本号+错误类型+调用栈』POST 到 endpoint 用于修 bug；ping=true 时额外发一次启动计数用于统计活跃用户。发送前会把本机路径、用户名、CDK、邮箱替换成占位符，只带一个本地随机生成的匿名ID。留空 endpoint 则即便 enabled=true 也不会发送。",
+  "_comment_telemetry": "可选，默认「首次启动问一次」。问过之后由你的选择决定：同意=崩溃日志+启动计数都发；只发崩溃=不发计数；不发=一条不发只写本地 logs/error.log。发送前会把本机路径/用户名/CDK/邮箱替换成占位符，只带一个本地随机生成的匿名ID。endpoint 留空则即便 enabled=true 也不会发送。telemetry_asked=true 表示已问过，删掉它下次启动会重新问。",
   "telemetry": {
     "enabled": false,
     "ping": false,
@@ -92,10 +92,6 @@
   "mas_enabled": true,
   "auto_mas_home": "",
   "auto_mas_install": "",
-  "telemetry": {
-    "enabled": true,
-    "ping": false,
-    "endpoint": ""
-  },
-  "sidebar_collapsed": false
+  "sidebar_collapsed": false,
+  "telemetry_asked": false
 }

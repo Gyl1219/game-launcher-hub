@@ -12,6 +12,11 @@ import os
 import sys
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
+# 这些用例只验「配好了就该发」的发送逻辑，不验首次询问流程
+# （询问流程见 telemetry_firstrun_test.py）。
+# 新版 telemetry_enabled() 会拦「还没问过用户」的情况，
+# 本文件用官方逃生阀跳过该闸门，避免把"没问过"误判成"发送坏了"。
+os.environ["LAUNCHER_TELEMETRY_NOASK"] = "1"
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import launcher  # noqa: E402
@@ -181,6 +186,34 @@ a1 = launcher._anon_id()
 a2 = launcher._anon_id()
 chk("anon_id 非空的十六进制串", bool(a1) and len(a1) >= 16)
 chk("anon_id 多次调用稳定", a1 == a2)
+
+# ---------- 7) 没问过用户之前，一条都不许发（回归：防"先收集后征求同意"）----------
+# 把逃生阀摘掉，模拟"新用户还没被问过"
+os.environ.pop("LAUNCHER_TELEMETRY_NOASK", None)
+try:
+    CFG_UNASKED = {"telemetry": {"enabled": True, "ping": True,
+                                 "endpoint": "https://x.example/collect"}}
+    with patch.object(launcher, "_load_cfg_safe", return_value=CFG_UNASKED), \
+         patch.object(launcher, "_telemetry_post", fake_post):
+        SENT.clear()
+        chk("未询问 → telemetry_enabled=False（即使配置看着是开的）",
+            launcher.telemetry_enabled() is False)
+        launcher.report_error("x", "y")
+        launcher.report_ping()
+        chk("未询问 → 崩溃与计数都不发", len(SENT) == 0)
+
+    # 问过并同意后才放行
+    CFG_ASKED = {"telemetry": {"enabled": True, "ping": True,
+                               "endpoint": "https://x.example/collect"},
+                 "telemetry_asked": True}
+    with patch.object(launcher, "_load_cfg_safe", return_value=CFG_ASKED), \
+         patch.object(launcher, "_telemetry_post", fake_post):
+        SENT.clear()
+        chk("已询问且同意 → 放行", launcher.telemetry_enabled() is True)
+        launcher.report_ping()
+        chk("已询问且同意 → ping 能发", len(SENT) == 1)
+finally:
+    os.environ["LAUNCHER_TELEMETRY_NOASK"] = "1"
 
 print("\n%d failed" % len(fails))
 sys.exit(1 if fails else 0)
