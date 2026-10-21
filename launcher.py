@@ -1867,26 +1867,168 @@ def log_error_local(kind, message, detail=""):
         pass
 
 
+def telemetry_send(payload, endpoint=None, timeout=10):
+    """**同步**发一次上报，返回 (ok, 说明)。给自测用，也给 _telemetry_post 复用。
+
+    endpoint 为 None 时读 config.json；显式传入用于自测（打本机假接收端，
+    不改用户配置）。失败不抛，只返回 (False, 原因)。
+    """
+    ep = endpoint
+    if ep is None:
+        ep = str(_telemetry_cfg().get("endpoint") or "").strip()
+    ep = str(ep or "").strip()
+    if not ep:
+        return (False, "未配置 telemetry.endpoint（数据只能落到本地 logs/error.log）")
+    try:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(
+            ep, data=data, method="POST",
+            headers={"Content-Type": "application/json",
+                     "User-Agent": "game-launcher-hub"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            r.read()
+        return (True, "已发送 %d 字节到 %s" % (len(data), ep))
+    except urllib.error.HTTPError as e:
+        return (False, "HTTP %d（端点拒收）" % e.code)
+    except Exception as e:
+        # 有的服务端 5xx 后立刻断连，urllib 拿不到状态码，只抛连接被中止；
+        # 这种情况同样是"端点没接收"，要报失败（不能当成功），但说明里点出这层含义
+        name = type(e).__name__
+        if "Aborted" in name or "Reset" in name or "refused" in str(e).lower():
+            return (False, "端点拒绝了连接/传输被中止（%s）——对方没有正常接收" % name)
+        return (False, "%s: %s" % (name, e))
+
+
 def _telemetry_post(payload):
     """在后台线程 POST 一次上报。任何失败静默。"""
     def _run():
         try:
-            ep = str(_telemetry_cfg().get("endpoint") or "").strip()
-            if not ep:
-                return
-            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            req = urllib.request.Request(
-                ep, data=data, method="POST",
-                headers={"Content-Type": "application/json",
-                         "User-Agent": "game-launcher-hub"})
-            with urllib.request.urlopen(req, timeout=10) as r:
-                r.read()
+            telemetry_send(payload)
         except Exception:
             pass
     try:
         threading.Thread(target=_run, daemon=True).start()
     except Exception:
         pass
+
+
+def telemetry_payload_sample(kind="selftest"):
+    """造一条**和真实上报同构**的样本（含故意混进去的敏感串，用来验脱敏）。
+
+    真实上报那几个字段由 report_error/report_ping 组装；这里复刻同一套键，
+    只是 detail 里塞了路径/CDK/邮箱，好让界面上能直观看到"这些确实被抹掉了"。
+    """
+    import platform
+    raw_detail = (
+        "Traceback (most recent call last):\n"
+        "  File \"%s\", line 1, in <module>\n"
+        "RuntimeError: selftest\n"
+        "path_sample=%s  cdk=%s  mail=%s"
+        % (os.path.join(LAUNCHER_DIR, "launcher.py"),
+           os.path.join(os.environ.get("USERPROFILE") or LAUNCHER_DIR, "Documents"),
+           "TEST_CDK_1234567890", "someone@example.com")
+    )
+    return {
+        "v": 1,
+        "app": "game-launcher-hub",
+        "version": APP_VERSION,
+        "anon_id": _anon_id(),
+        "kind": str(kind)[:64],
+        "message": sanitize_text("自测：这条是「发送测试」按钮发出的，不是真崩溃")[:500],
+        "detail": sanitize_text(raw_detail)[:TELEMETRY_PAYLOAD_LIMIT],
+        "os": platform.platform()[:120],
+        "py": platform.python_version()[:32],
+        "ts": int(time.time()),
+    }
+
+
+def telemetry_selftest(timeout=8):
+    """**不部署也能验通路**：起一个本机假接收端，走真实发送函数打过去，看收到了什么。
+
+    验的是整条链路：payload 组装 → 脱敏 → JSON 编码 → HTTP POST → 对端收到。
+    返回 dict：
+      ok       : 链路是否通
+      message  : 人话结论
+      received : 对端实际收到的 payload（None=没收到）
+      leaked   : 脱敏后仍残留的敏感串（应为空）
+    """
+    import http.server
+    import socketserver
+    import threading as _th
+
+    got = {}
+    done = _th.Event()
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):        # 静音，别往 stderr 刷
+            pass
+
+        def do_POST(self):
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(n) if n else b""
+                got["raw"] = raw
+                got["ctype"] = self.headers.get("Content-Type", "")
+                got["body"] = json.loads(raw.decode("utf-8", "replace") or "{}")
+            except Exception as e:
+                got["error"] = "%s: %s" % (type(e).__name__, e)
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"ok")
+            done.set()
+
+    payload = telemetry_payload_sample()
+
+    server = None
+    try:
+        server = socketserver.TCPServer(("127.0.0.1", 0), _Handler)
+        port = server.server_address[1]
+        th = _th.Thread(target=server.serve_forever, daemon=True)
+        th.start()
+
+        ok, msg = telemetry_send(payload, endpoint="http://127.0.0.1:%d/collect" % port,
+                                 timeout=timeout)
+        done.wait(2)
+
+        recv = got.get("body")
+        leaked = []
+        if recv:
+            blob = json.dumps(recv, ensure_ascii=False)
+            # 这些**不该**出现在上报内容里
+            for probe in ("TEST_CDK_1234567890", "someone@example.com",
+                          os.environ.get("USERPROFILE") or "\x00"):
+                if probe and probe in blob:
+                    leaked.append(probe)
+
+        if not ok:
+            return {"ok": False, "message": "发送失败：%s" % msg,
+                    "received": recv, "leaked": leaked}
+        if not recv:
+            return {"ok": False, "message": "发送返回成功但假接收端没收到数据（不可信）",
+                    "received": None, "leaked": leaked}
+        if leaked:
+            return {"ok": False,
+                    "message": "链路通，但**脱敏没盖住**：%s" % "、".join(leaked),
+                    "received": recv, "leaked": leaked}
+        return {
+            "ok": True,
+            "message": "链路通：假接收端收到了 %d 字节，脱敏生效（路径/CDK/邮箱都已抹掉）"
+                       % len(got.get("raw") or b""),
+            "received": recv,
+            "leaked": leaked,
+        }
+    except Exception as e:
+        return {"ok": False, "message": "%s: %s" % (type(e).__name__, e),
+                "received": None, "leaked": []}
+    finally:
+        try:
+            if server is not None:
+                server.shutdown()
+                server.server_close()
+        except Exception:
+            pass
+
 
 
 def report_error(kind, message, detail=""):
@@ -12006,7 +12148,9 @@ class SettingsPage(QWidget):
         root.addWidget(StrongBodyLabel("匿名错误上报"))
         tip_t = CaptionLabel(
             "开启后，程序崩溃时会把「版本号 + 错误类型 + 调用栈」发给作者，用于修 bug。"
-            "路径、用户名、CDK、邮箱在发送前一律替换成占位符。默认关闭。")
+            "路径、用户名、CDK、邮箱在发送前一律替换成占位符。默认关闭。\n"
+            "注意：还需在 config.json 填 telemetry.endpoint 才会真的发送；"
+            "没填的话数据只会落在本地 logs/error.log。可用下面的「发送测试上报」自检链路。")
         tip_t.setWordWrap(True)
         root.addWidget(tip_t)
 
@@ -12029,6 +12173,41 @@ class SettingsPage(QWidget):
         self.tele_tip.setStyleSheet("color:#888780; font-size:11px;")
         root.addWidget(self.tele_tip)
         self._refresh_tele_tip()
+
+        # 「发送测试」按钮：不部署服务端也能验通路。
+        # 它起一个本机假接收端，用真实发送逻辑打一条样本过去，然后回显收到的内容。
+        # 为什么需要：endpoint 留空时上报函数会**静默 return**，
+        # 界面上勾着开关却一条也发不出去——没有这个按钮就无法证明链路到底通不通。
+        row_tt = QHBoxLayout()
+        row_tt.setContentsMargins(0, 0, 24, 0)
+        self.tele_test_btn = PushButton("发送测试上报")
+        self.tele_test_btn.setFixedHeight(30)
+        self.tele_test_btn.setCursor(Qt.PointingHandCursor)
+        self.tele_test_btn.setToolTip(
+            "在本机起一个临时接收端，用真实的发送代码投递一条样例上报，\n"
+            "并回显对方实际收到的内容（含脱敏结果），用来验证整条链路。\n"
+            "不会改动你的配置，也不会把数据发到外网。")
+        self.tele_test_btn.clicked.connect(self._on_tele_selftest)
+        row_tt.addWidget(self.tele_test_btn)
+
+        self.tele_real_btn = PushButton("测试已配置的端点")
+        self.tele_real_btn.setFixedHeight(30)
+        self.tele_real_btn.setCursor(Qt.PointingHandCursor)
+        ep_now = str((self._read_cfg().get("telemetry") or {}).get("endpoint") or "").strip()
+        self.tele_real_btn.setEnabled(bool(ep_now))
+        self.tele_real_btn.setToolTip(
+            ("打真实端点：%s" % ep_now) if ep_now else
+            "config.json 里 telemetry.endpoint 为空，没有可测试的真实端点")
+        self.tele_real_btn.clicked.connect(self._on_tele_real_test)
+        row_tt.addWidget(self.tele_real_btn)
+        row_tt.addStretch(1)
+        root.addLayout(row_tt)
+
+        self.tele_test_out = CaptionLabel("")
+        self.tele_test_out.setWordWrap(True)
+        self.tele_test_out.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.tele_test_out.setStyleSheet("color:#888780; font-size:11px;")
+        root.addWidget(self.tele_test_out)
 
         # ---------- AUTO-MAS 任务编排（融合集成）----------
         root.addSpacing(18)
@@ -12148,6 +12327,67 @@ class SettingsPage(QWidget):
             return
         self.tele_ping_chk.setEnabled(self.tele_chk.isChecked())
         self._refresh_tele_tip()
+
+    # ---------- 发送测试（不部署也能验通路）----------
+    def _on_tele_selftest(self):
+        """本机假接收端验链路。放到线程里跑：最多会阻塞 8 秒，不能冻 UI。"""
+        self.tele_test_btn.setEnabled(False)
+        self.tele_test_out.setStyleSheet("color:#888780; font-size:11px;")
+        self.tele_test_out.setText("正在本机起临时接收端并投递样例…")
+
+        def _run():
+            try:
+                res = telemetry_selftest()
+            except Exception as e:
+                res = {"ok": False, "message": "%s: %s" % (type(e).__name__, e),
+                       "received": None, "leaked": []}
+            QTimer.singleShot(0, lambda: self._show_tele_result(res))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_tele_real_test(self):
+        """打 config.json 里配的真实端点（部署后才用得上）。"""
+        ep = str((self._read_cfg().get("telemetry") or {}).get("endpoint") or "").strip()
+        if not ep:
+            self.tele_test_out.setStyleSheet("color:#c0392b; font-size:11px;")
+            self.tele_test_out.setText("没有配置 telemetry.endpoint，无处可测。")
+            return
+        self.tele_real_btn.setEnabled(False)
+        self.tele_test_out.setStyleSheet("color:#888780; font-size:11px;")
+        self.tele_test_out.setText("正在向 %s 投递样例…" % ep)
+
+        def _run():
+            ok, msg = telemetry_send(telemetry_payload_sample(), endpoint=ep)
+            QTimer.singleShot(0, lambda: self._show_tele_real(ok, msg, ep))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _show_tele_real(self, ok, msg, ep):
+        self.tele_real_btn.setEnabled(True)
+        color = "#2e7d32" if ok else "#c0392b"
+        self.tele_test_out.setStyleSheet("color:%s; font-size:11px;" % color)
+        self.tele_test_out.setText(("真实端点测试成功：%s" if ok
+                                    else "真实端点测试失败：%s") % msg)
+
+    def _show_tele_result(self, res):
+        """把自测结果说人话回显：通了没、收到什么、脱敏有没有漏。"""
+        self.tele_test_btn.setEnabled(True)
+        ok = bool(res.get("ok"))
+        color = "#2e7d32" if ok else "#c0392b"
+        lines = [("✓ " if ok else "✗ ") + str(res.get("message") or "")]
+        recv = res.get("received")
+        if isinstance(recv, dict) and recv:
+            lines.append("接收端收到的字段：%s" % "、".join(sorted(recv.keys())))
+            det = str(recv.get("detail") or "")
+            if det:
+                # 只显示前几行，重点看脱敏占位符
+                brief = " / ".join(det.splitlines()[-2:])[:220]
+                lines.append("detail 脱敏后：%s" % brief)
+        leaked = res.get("leaked") or []
+        if leaked:
+            lines.append("⚠ 未抹掉的敏感串：%s" % "、".join(leaked))
+        self.tele_test_out.setStyleSheet("color:%s; font-size:11px;" % color)
+        self.tele_test_out.setText("\n".join(lines))
 
 
     def _on_mas_toggle(self, *_a):

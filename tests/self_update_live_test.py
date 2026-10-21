@@ -20,6 +20,7 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 app = QApplication([])
 
 import json  # noqa: E402
+import urllib.error  # noqa: E402
 import urllib.request  # noqa: E402
 
 REPO = "Gyl1219/game-launcher-hub"
@@ -28,8 +29,22 @@ req = urllib.request.Request(url, headers={
     "User-Agent": "game-launcher-hub",
     "Accept": "application/vnd.github+json",
 })
-with urllib.request.urlopen(req, timeout=30) as r:
-    rels = json.loads(r.read().decode())
+try:
+    with urllib.request.urlopen(req, timeout=30) as r:
+        rels = json.loads(r.read().decode())
+except urllib.error.HTTPError as e:
+    # 未登录的 GitHub API 限流（60 次/小时）到顶时会 403。
+    # 这是**外部配额**问题，不是代码坏了：跳过而不是判失败，
+    # 否则跑几次回归就必然"红"一次，久而久之没人再看结果。
+    if e.code in (403, 429):
+        print("SKIP: GitHub API 限流（HTTP %d），本次跳过联网冒烟" % e.code)
+        print("      （未登录 60 次/小时；过一会儿再跑，或配 GITHUB_TOKEN）")
+        sys.exit(0)
+    raise
+except Exception as e:
+    print("SKIP: 无法访问 GitHub API（%s: %s）——无网/被墙时跳过"
+          % (type(e).__name__, e))
+    sys.exit(0)
 
 print("远端真实 releases:")
 for x in rels:
