@@ -14825,6 +14825,194 @@ def _on_app_quit():
         pass
 
 
+# ===== 单实例运行 =====
+# 参考图吧工具箱 v1.7.1 的做法（"不再允许多开——重复启动会激活已运行的窗口"）。
+# 我们这里多开是**真实隐患**，不是洁癖：
+#   · 两个实例各持一套心跳 + 进程扫描线程，进程表要扫两遍；
+#   · 两个实例都会拉起自己的 AUTO-MAS 后端（不同随机端口），等于同机跑两个后端；
+#   · 后端只允许一条主 WebSocket，两个实例会互相用 4001 把对方踢掉，实时日志来回闪。
+# 做法：QLocalServer/QLocalSocket（Qt 自带，零新依赖，比 QSharedMemory 好在
+# 第二实例能把参数/页面意图传给第一实例）。
+# 名字带用户 sid：同一台机器上不同 Windows 用户各开一个互不干扰。
+LAUNCHER_SINGLE_INSTANCE_NAME = "game-launcher-hub-single-instance"
+
+
+def _single_instance_name():
+    """本地套接字名（带用户名，避免多用户共用一台机器时互相顶掉）。"""
+    try:
+        who = os.environ.get("USERNAME") or os.environ.get("USER") or "default"
+    except Exception:
+        who = "default"
+    safe = "".join(ch for ch in who if ch.isalnum() or ch in "-_") or "default"
+    return "%s-%s" % (LAUNCHER_SINGLE_INSTANCE_NAME, safe.lower())
+
+
+class SingleInstanceGuard(QObject):
+    """单实例守卫：用**文件独占锁**判定谁是唯一实例，用本地套接字传"唤醒"请求。
+
+    为什么用文件锁而不是只靠 QLocalServer：
+      · QLocalServer 的 listen 在 Windows 上对"崩溃残留名字"敏感，
+        且同一进程内测试时 waitFor* 不派发槽，判定容易出微妙的假结果（实测踩过）；
+      · 文件锁（msvcrt.locking）由**操作系统**保证互斥，进程崩溃时自动释放，
+        判定是确定性的、与事件循环无关。
+    套接字只负责"第二个实例告诉第一个：把我叫到前台"，失败也不影响主判定。
+    """
+
+    signalled = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._server = None
+        self._sockets = []
+        self._lock_fh = None
+
+    # ---------- 文件锁 ----------
+    def _lock_path(self):
+        d = os.path.join(LAUNCHER_DIR, ".cache")
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception:
+            d = LAUNCHER_DIR
+        return os.path.join(d, "launcher.lock")
+
+    def has_lock(self):
+        return self._lock_fh is not None
+
+    def _try_lock_file(self):
+        """独占锁住 launcher.lock。返回 True=拿到（我是唯一实例）。"""
+        path = self._lock_path()
+        try:
+            fh = open(path, "a+b")
+        except Exception:
+            return True          # 打不开锁文件就别挡用户，放行
+        try:
+            import msvcrt
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        except Exception:
+            try:
+                fh.close()
+            except Exception:
+                pass
+            return False
+        self._lock_fh = fh
+        try:
+            fh.seek(0)
+            fh.truncate()
+            fh.write(str(os.getpid()).encode("ascii"))
+            fh.flush()
+        except Exception:
+            pass
+        return True
+
+    # ---------- 套接字：只做"叫到前台" ----------
+    def start_listener(self):
+        """占住本地套接字接收后来者的 activate。失败无所谓（文件锁才是判定）。"""
+        from PySide6.QtNetwork import QLocalServer
+        name = _single_instance_name()
+        try:
+            server = QLocalServer(self)
+            QLocalServer.removeServer(name)
+            if not server.listen(name):
+                return False
+            server.newConnection.connect(self._on_new_connection)
+            self._server = server
+            return True
+        except Exception:
+            return False
+
+    def notify_existing(self, msg="activate"):
+        """告诉已在跑的实例"我被点开了"。返回 True=确实送到了。"""
+        from PySide6.QtNetwork import QLocalSocket
+        sock = QLocalSocket()
+        try:
+            sock.connectToServer(_single_instance_name())
+            if not sock.waitForConnected(400):
+                return False
+            sock.write((msg + "\n").encode("utf-8"))
+            sock.flush()
+            sock.waitForBytesWritten(400)
+            # 等 ack：服务端收到会回 ok，确保对方真收到了
+            sock.waitForReadyRead(400)
+            try:
+                sock.readAll()
+            except Exception:
+                pass
+            sock.disconnectFromServer()
+            return True
+        except Exception:
+            return False
+        finally:
+            try:
+                sock.abort()
+            except Exception:
+                pass
+
+    def try_acquire(self):
+        """True=我是第一个实例（已开始监听）；False=已有实例（已发出唤醒请求）。"""
+        if self._try_lock_file():
+            self.start_listener()
+            return True
+        self.notify_existing("activate")
+        return False
+
+    def _on_new_connection(self):
+        while self._server is not None and self._server.hasPendingConnections():
+            sock = self._server.nextPendingConnection()
+            if sock is None:
+                break
+            self._sockets.append(sock)
+            try:
+                # 数据往往晚于 accept 到达：必须靠 readyRead，不能只在 accept 时读
+                sock.readyRead.connect(lambda s=sock: self._read_from(s))
+                sock.disconnected.connect(lambda s=sock: self._cleanup(s))
+                self._read_from(sock)
+            except Exception:
+                pass
+
+    def _read_from(self, sock):
+        try:
+            raw = bytes(sock.readAll()).decode("utf-8", "replace").strip()
+        except Exception:
+            raw = ""
+        if not raw:
+            return          # 还没到：等 readyRead，不在这里断
+        try:
+            sock.write(b"ok\n")
+            sock.flush()
+        except Exception:
+            pass
+        self.signalled.emit(raw)
+
+    def _cleanup(self, sock):
+        try:
+            if sock in self._sockets:
+                self._sockets.remove(sock)
+            sock.deleteLater()
+        except Exception:
+            pass
+
+    def release(self):
+        """退出：放掉套接字与文件锁（崩溃时锁由系统自动释放）。"""
+        try:
+            if self._server is not None:
+                self._server.close()
+                self._server = None
+            from PySide6.QtNetwork import QLocalServer
+            QLocalServer.removeServer(_single_instance_name())
+        except Exception:
+            pass
+        try:
+            if self._lock_fh is not None:
+                import msvcrt
+                self._lock_fh.seek(0)
+                msvcrt.locking(self._lock_fh.fileno(), msvcrt.LK_UNLCK, 1)
+                self._lock_fh.close()
+                self._lock_fh = None
+        except Exception:
+            pass
+
+
 def main():
     # 默认不在启动时强制提权：否则每次双击都弹一次 UAC，且提权副本偶发起不来
     # 会表现为“双击没反应/打不开”。需要管理员的操作（如强制关闭）改为按需提权。
@@ -14860,8 +15048,32 @@ def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     setTheme(Theme.AUTO)
+
+    # 单实例：已有窗口在跑就把请求转过去并退出，绝不起第二个心跳/扫描/后端。
+    # 环境变量 LAUNCHER_ALLOW_MULTI=1 可临时允许多开（排查问题时用）。
+    guard = None
+    if not os.environ.get("LAUNCHER_ALLOW_MULTI"):
+        guard = SingleInstanceGuard()
+        if not guard.try_acquire():
+            # 第一实例收到后会把窗口置前；这里什么都不用做，静默退出即可
+            sys.exit(0)
+
     win = Launcher()
     win.show()
+
+    # 第二实例被点开时：把已有窗口从最小化恢复、置前、抢焦点
+    if guard is not None:
+        def _activate(_msg=""):
+            try:
+                if win.isMinimized():
+                    win.showNormal()
+                win.raise_()
+                win.activateWindow()
+            except Exception:
+                pass
+        guard.signalled.connect(_activate)
+        app.aboutToQuit.connect(guard.release)
+
     # 退出兜底：非经 Launcher.closeEvent 的路径（如 app.quit()）也要回收线程
     app.aboutToQuit.connect(_on_app_quit)
     # MAS 后端同样要兜底回收（不关会留下孤儿 python 进程）
