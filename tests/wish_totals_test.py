@@ -237,5 +237,49 @@ try:
 finally:
     launcher.WishTotalsWorker = real_wtw
 
+print("\n--- 8) 预约榜（右栏小榜）：占位 / 过滤 / 排序 / 与预约区同源 ---")
+r_apps = [
+    {"key": "maa", "display": "MAA", "icon": ""},
+    {"key": "aaa", "display": "AAA", "icon": ""},
+    {"key": "zero", "display": "零票项", "icon": ""},
+]
+rail = launcher.RankRail([], reserved_apps=r_apps)
+rail.show()
+app.processEvents()
+bw = rail.board_wish
+chk("初始占位文案（不是空榜也不是错误感）",
+    bw.empty_lbl.isVisible() and "虚位以待" in bw.empty_lbl.text(),
+    bw.empty_lbl.text())
+rail.set_wish_rows({"maa": 5, "aaa": 2, "zero": 0, "not_reserved": 9})
+app.processEvents()
+chk("0 票不进榜", not any(r[0] == "zero" for r in bw._rows), bw._rows)
+chk("不是预约条目的 key 不进榜（防串数据）",
+    not any(r[0] == "not_reserved" for r in bw._rows), bw._rows)
+chk("按票数降序，榜首是 MAA",
+    bw._rows and bw._rows[0][0] == "maa" and bw._rows[0][3] == "5 票", bw._rows)
+chk("次名 AAA 2 票", len(bw._rows) > 1 and bw._rows[1][0] == "aaa"
+    and bw._rows[1][3] == "2 票", bw._rows)
+# 同票按显示名排序
+rail.set_wish_rows({"aaa": 3, "maa": 3})
+chk("同票按显示名排序（AAA < MAA）",
+    [r[0] for r in bw._rows] == ["aaa", "maa"], bw._rows)
+# 清空回到占位
+rail.set_wish_rows({})
+app.processEvents()
+chk("清空后回到占位", bw.empty_lbl.isVisible() and not bw._rows)
+
+# 与预约区同源：预约区票数变化时回调带的是合并后的同一份
+got_counts = []
+sec4 = launcher.ReservedSection(
+    [{"key": "maa", "display": "MAA", "ecosystem": "standalone"}],
+    on_counts=lambda c: got_counts.append(dict(c)))
+launcher._wish_counts = lambda: {"maa": 2}
+sec4._totals = {"maa": 5}
+sec4.rebuild()
+chk("预约区 rebuild 时回调带合并票数", got_counts and got_counts[-1].get("maa") == 5,
+    got_counts)
+sec4._on_totals({"maa": 9})
+chk("汇总到达后回调也更新", got_counts[-1].get("maa") == 9, got_counts)
+
 print("\n%d failed" % len(fails))
 sys.exit(1 if fails else 0)
