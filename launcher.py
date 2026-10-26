@@ -11446,11 +11446,20 @@ class CatalogDownloadsWorker(QThread):
         顺带把本机目录播种给服务端（POST /download/catalog，只含公开的
         仓库 slug，无任何用户数据）—— 第一个到的用户播下种，服务端后台
         分批代拉，之后所有用户直接读现成的。
+
+        为什么只要求 endpoint 非空、不要求 telemetry_enabled：下载量是
+        GitHub 公开数据的缓存副本，读它不上传任何东西 —— 把「关遥测」
+        理解成"不想被上传"而不是"禁止看公告"（v1.3.1 首日用户实测踩过：
+        遥测关着 → 榜永远空，被当成功能坏了）。
         """
         try:
-            origin = _telemetry_origin()
-            if not origin or not telemetry_enabled():
+            # 不能用 _telemetry_origin()：它在未开遥测时返回 ""，会把读路径
+            # 一起拦掉。这里单独从 endpoint 推 origin —— 只管"有没有配端点"。
+            ep = str(_telemetry_cfg().get("endpoint") or "").strip()
+            m = re.match(r"(https?://[^/\s]+)", ep)
+            if not m:
                 return False
+            origin = m.group(1)
             slugs = [r for r, _k in _catalog_repos(self._reserved_apps, {})]
             try:
                 _post_json(origin + "/download/catalog", {"repos": slugs})
@@ -11485,6 +11494,7 @@ class CatalogDownloadsWorker(QThread):
         wish = merge_wish_counts(_load_wish_totals(), _wish_counts())
         budget = _REPO_DL_BUDGET
         fail_streak = 0
+        success = 0
         for repo, _key in _catalog_repos(self._reserved_apps, wish):
             if budget <= 0 or fail_streak >= 3:
                 break   # 连续 3 个失败多半是限流/断网，别把预算烧光
@@ -11498,9 +11508,14 @@ class CatalogDownloadsWorker(QThread):
                 fail_streak += 1
                 continue
             fail_streak = 0
+            success += 1
             stores[repo] = {"downloads": d, "fetched_at": now}
+        # 全失败时不锁满 10 分钟：网络抖一下就把榜单锁空 10 分钟，用户重启
+        # 也看不到（首日实测踩过）→ 全失败只锁 90 秒
         _save_json(_repo_downloads_path(),
-                   {"repos": stores, "attempted_at": now})
+                   {"repos": stores,
+                    "attempted_at": now if success
+                    else now - _REPO_DL_RETRY_SEC + 90})
         self.done.emit(self._by_key(stores))
 
 
@@ -11857,12 +11872,38 @@ def _windows_desc():
             return "Windows"
 
 
+class _ClickableRow(QWidget):
+    """榜单里的一行：可点击（左键松开即发信号）。
+
+    点击后 e.accept() 且**不再调父类** —— QWidget 默认把事件 ignore 掉往上传，
+    会顺带触发 RankBoard.mouseReleaseEvent 的"点标题展开/收起"，行点击和
+    展开互相打架。
+    """
+
+    clicked = Signal(str)
+
+    def __init__(self, key, parent=None):
+        super().__init__(parent)
+        self._key = key
+        self.setCursor(Qt.PointingHandCursor)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.clicked.emit(self._key)
+            e.accept()
+            return
+        super().mouseReleaseEvent(e)
+
+
 class RankBoard(QWidget):
     """一个小榜：标题行（点击展开/收起）+ Top3 或全部行。
 
     内容随栏宽缩放（apply_scale）：全屏时字号/图标/间距一起放大，
     不再只有卡片外壳变大、里面的字和图标还是默认尺寸（用户实测吐槽点）。
+    行可点击（row_clicked），由 RankRail 转发给总览页跳二级详情。
     """
+
+    row_clicked = Signal(str)
 
     # 基准：默认窗口下这块榜的宽度（约 272）对应倍率 1.0
     BASE_W = 272
@@ -11949,7 +11990,7 @@ class RankBoard(QWidget):
         rw = max(12, int(round(12 * s)))       # 名次列宽随倍率
         fs = max(12, int(round(12 * s)))       # 行文字字号随倍率
         for i, (key, name, icon, metric) in enumerate(shown):
-            row = QWidget()
+            row = _ClickableRow(key)
             h = QHBoxLayout(row)
             h.setContentsMargins(0, 0, 0, 0)
             h.setSpacing(max(6, int(round(6 * s))))
@@ -11976,6 +12017,7 @@ class RankBoard(QWidget):
             ml.setStyleSheet("font-size:%dpx;" % fs)
             h.addWidget(nl, stretch=1)
             h.addWidget(ml)
+            row.clicked.connect(self.row_clicked)
             self.rows_box.addWidget(row)
 
     def mouseReleaseEvent(self, e):
@@ -11986,7 +12028,18 @@ class RankBoard(QWidget):
 
 
 class RankRail(QWidget):
-    """右栏小榜的竖排容器：活跃度 / 星标 / 我的使用 / 预约榜。"""
+    """五块小榜的横排容器：活跃度 / 星标 / 我的使用 / 下载榜 / 预约榜。
+
+    横排 + 窄窗保护（用户定稿）：包在**横向** QScrollArea 里，内层最小宽
+    BOARD_MIN_W×5 —— 宽窗口等分铺满无滚动条；窄于保底宽自动出横向滚动条，
+    每块锁在保底宽，绝不挤压变形。滚动区高度锁定为榜单自然高度
+    （不产生嵌套纵向滚动；无纵向滚动范围时滚轮穿透给页面本身）。
+    行可点击：row_clicked(key) 转发给总览页跳二级详情 / 预约项开官网。
+    """
+
+    row_clicked = Signal(str)
+    BOARD_MIN_W = 240          # 单块榜保底宽（行内容不截断的实测值）
+    MAX_HEIGHT = 460           # 滚动区高度上限（预约榜展开多行时兜底）
 
     def __init__(self, apps, parent=None, reserved_apps=None):
         super().__init__(parent)
@@ -12002,9 +12055,19 @@ class RankRail(QWidget):
             if k:
                 self._reserved_by_key[k] = (a.get("display", k), a.get("icon", ""))
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(10)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._scroll.setStyleSheet("QScrollArea{border:none; background:transparent;}")
+        inner = QWidget()
+        inner.setStyleSheet("background:transparent;")
+        h = QHBoxLayout(inner)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(10)
         self.board_activity = RankBoard("活跃度", "近30天提交", self._apps_by_key)
         self.board_stars = RankBoard("星标数", "社区体量", self._apps_by_key)
         self.board_usage = RankBoard("我的使用", "本机启动", self._apps_by_key)
@@ -12012,16 +12075,23 @@ class RankRail(QWidget):
         self.board_downloads = RankBoard("下载榜", "release 累计", self._apps_by_key)
         # 预约榜：谁被要得多就先适配谁。还没人投时占位（不是"暂无数据"的错愕感）
         self.board_wish = RankBoard("预约榜", "我想要票数", self._reserved_by_key)
-        # 四个榜均分整栏高度（stretch=1）：全屏时左轮播涨得很高，
-        # 若这里不加权，四块只占内容自然高度、下方空一大片，左右严重失衡。
-        # 配合 RankBoard 内部的底部 addStretch，富余空间落在每块卡的底部，
-        # 行内容仍顶部对齐，不会把三行拉散。
-        for b in (self.board_activity, self.board_stars, self.board_usage,
-                  self.board_downloads, self.board_wish):
-            root.addWidget(b, 1)
+        self._boards = (self.board_activity, self.board_stars, self.board_usage,
+                        self.board_downloads, self.board_wish)
+        # 预约榜展开会列出全部投票项（几十行），横排里高度有上限 → 展开也只
+        # 放前 12 行，避免把整页撑爆；其它榜条目少，展开不设限
+        self.board_wish.expanded_limit = 12
+        for b in self._boards:
+            h.addWidget(b, 1)
+            b.installEventFilter(self)
+            b.row_clicked.connect(self.row_clicked)
+        inner.setMinimumWidth(self.BOARD_MIN_W * 5 + 10 * 4)   # 5 块 + 4 个间距
+        self._inner = inner
+        self._scroll.setWidget(inner)
+        outer.addWidget(self._scroll)
         self.set_github({})
         self.refresh_usage()
         self.set_wish_rows({})
+        self._sync_height()
 
     def set_wish_rows(self, counts):
         """预约榜：counts 为 {key: 合并票数}；只显示 ≥1 票的，按票数降序。
@@ -12041,25 +12111,36 @@ class RankRail(QWidget):
             [(k, "%d 票" % v) for v, k in rows],
             placeholder="虚位以待，快去投一票")
 
-    def resizeEvent(self, e):
-        """栏宽变化 → 按自身宽度算倍率下发给五个榜（字号/图标/间距一起缩放）。
+    def eventFilter(self, obj, event):
+        """榜单宽度变化（窗口拉伸/横排重排）→ 按自身宽算倍率 + 同步滚动区高度。
 
-        这是"全屏排行榜字和图标没变大"的根治：以前只把卡片外壳撑高，
-        里面的 18px 图标、12px 字全是写死的。现在以默认栏宽 272 为 1.0 基准，
-        按当前宽度线性放大、封顶 1.7（与侧栏那套同一思路）。
+        横排后每块榜的宽度随窗口独立变化，倍率必须按**单块自身宽**算
+        （宽 / 基准 272，1.0~1.7 档），不能再拿整栏宽度套所有榜。
+        """
+        if obj in self._boards and event.type() in (
+                QEvent.Resize, QEvent.LayoutRequest):
+            b = obj
+            try:
+                if b.width() > 0:
+                    b.apply_scale(max(1.0, min(RankBoard.MAX_SCALE,
+                                               b.width() / float(RankBoard.BASE_W))))
+            except Exception:
+                pass
+            self._sync_height()
+        return super().eventFilter(obj, event)
+
+    def _sync_height(self):
+        """滚动区高度 = 榜单自然高度（封顶 MAX_HEIGHT）。
+
+        窄窗出现横向滚动条时 +12px 给滚动条本身，避免底部被压一条缝。
         """
         try:
-            w = self.width()
-            if w > 0:
-                s = max(1.0, min(RankBoard.MAX_SCALE,
-                                 w / float(RankBoard.BASE_W)))
-                for b in (self.board_activity, self.board_stars,
-                          self.board_usage, self.board_downloads,
-                          self.board_wish):
-                    b.apply_scale(s)
+            h = max(140, min(self._inner.sizeHint().height(), self.MAX_HEIGHT))
+            if self._scroll.viewport().width() < self._inner.minimumWidth():
+                h += 12
+            self._scroll.setFixedHeight(h)
         except Exception:
             pass
-        super().resizeEvent(e)
 
     def set_github(self, repos):
         """repos: key -> {"stars": n, "commits30d": n}；缺 key / 缺字段都容忍。"""
@@ -12318,7 +12399,8 @@ class ReservedSection(QWidget):
         self._search_timer.setInterval(self.SEARCH_DELAY_MS)
         self._search_timer.timeout.connect(self.rebuild)
         self.search.textChanged.connect(self._schedule_rebuild)
-        root.addWidget(self.search)
+        # 搜索框 UI 迁到总览页顶部（布局稿定稿）；这里保留 line edit 对象作为
+        # 查询状态的载体（textChanged→防抖→rebuild 管线原样），由顶部驱动
 
         self.groups_box = QVBoxLayout()
         self.groups_box.setSpacing(10)
@@ -12452,13 +12534,22 @@ class OverviewPage(QWidget):
         root.setSpacing(16)
         scroll.setWidget(inner)
 
-        top = QHBoxLayout()
-        hint = CaptionLabel(
-            "总览：点卡片进入详情页，或直接点卡内按钮快速操作。状态每 5 秒自动刷新。")
-        hint.setWordWrap(True)
-        top.addWidget(hint, stretch=1)
+        # 第一行（布局稿定稿）：搜索输入框占主体，右侧 AUTO-MAS 入口 + 扫描按钮。
+        # 原来的「总览：点卡片…」说明文字并入卡片下方的 grid_foot，不再单占一行。
+        search_row = QHBoxLayout()
+        self.search_box = SearchLineEdit()
+        self.search_box.setPlaceholderText("搜索助手 / 预约条目（名称 / 游戏 / 生态）")
+        self.search_box.setClearButtonEnabled(True)
+        self.search_box.setFixedHeight(32)
+        # 防抖 300ms：每敲一个字都重建网格会卡，停手再过滤（与预约区同一策略）
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(300)
+        self._search_timer.timeout.connect(self._apply_search_filter)
+        self.search_box.textChanged.connect(lambda _t: self._search_timer.start())
+        search_row.addWidget(self.search_box, stretch=1)
 
-        # 右上角：AUTO-MAS 入口（状态灯 + 按钮 + 定位说明），与「扫描游戏」同排
+        # AUTO-MAS 入口（状态灯 + 按钮 + 定位说明），与「扫描游戏」同排
         self.mas_box = QWidget()
         mb = QHBoxLayout(self.mas_box)
         mb.setContentsMargins(0, 0, 0, 0)
@@ -12475,7 +12566,7 @@ class OverviewPage(QWidget):
         self.mas_cap = CaptionLabel("编排插件 · 未启动")
         self.mas_cap.setStyleSheet("color:#8a8d96;")
         mb.addWidget(self.mas_cap)
-        top.addWidget(self.mas_box)
+        search_row.addWidget(self.mas_box)
         self.mas_box.setToolTip(
             "AUTO-MAS 不是游戏助手，是「管这些助手」的多账号任务编排插件：\n"
             "帮你把已装好的助手按队列/定时跑起来，看状态与日志。\n"
@@ -12490,23 +12581,23 @@ class OverviewPage(QWidget):
             self.scan_btn.clicked.connect(on_scan)
         else:
             self.scan_btn.setEnabled(False)
-        top.addWidget(self.scan_btn)
-        root.addLayout(top)
+        search_row.addWidget(self.scan_btn)
+        root.addLayout(search_row)
 
-        # 顶部一排：左轮播（2/3）+ 右三个小榜（1/3）；榜单失败只显示「暂无数据」
-        top_row = QHBoxLayout()
-        top_row.setSpacing(16)
+        # 轮播整行（圆点/箭头/自动播放原样，只是不再与榜单分栏）
         self.carousel = BannerCarousel()
         self.carousel.sig_open_detail.connect(self.sig_open_detail)
-        top_row.addWidget(self.carousel, stretch=5)
+        root.addWidget(self.carousel)
+
+        # 五榜横排（窄窗自动出横向滚动条，见 RankRail）；行点击跳二级详情
         self.rank_rail = RankRail(apps, reserved_apps=self._reserved)
-        top_row.addWidget(self.rank_rail, stretch=2)
-        root.addLayout(top_row)
+        self.rank_rail.row_clicked.connect(self._on_rank_row_clicked)
+        root.addWidget(self.rank_rail)
         self._refresh_banner()
         self._start_stats_worker()
 
-        grid = QGridLayout()
-        grid.setSpacing(16)
+        self._card_grid = QGridLayout()
+        self._card_grid.setSpacing(16)
         for i, app in enumerate(apps):
             card = cards.get(app.get("key", ""))
             if card is None:
@@ -12514,14 +12605,18 @@ class OverviewPage(QWidget):
             oc = OverviewCard(app, card)
             oc.sig_open_detail.connect(self.sig_open_detail)
             self.overview_cards.append(oc)
-            grid.addWidget(oc, i // 3, i % 3)
-        root.addLayout(grid)
+            self._card_grid.addWidget(oc, i // 3, i % 3)
+        root.addLayout(self._card_grid)
+        # 搜索无匹配时的占位（有匹配时隐藏）
+        self._grid_empty = CaptionLabel("没有匹配的助手本体")
+        self._grid_empty.setStyleSheet("color:#8a8d96;")
+        self._grid_empty.setVisible(False)
+        root.addWidget(self._grid_empty)
 
         # 网格下方点明层级：上面这些是「游戏助手本体」，右上角那个是编排插件
         # （用户反馈：MAS 和游戏助手不是同一层级，摆在侧栏/网格里会误导）
-        self.grid_foot = CaptionLabel(
-            "以上 %d 个是游戏助手本体；右上角「AUTO-MAS 任务编排」是管它们的编排插件"
-            "（多账号队列 / 定时 / 日志），不是又一个助手。" % len(self.overview_cards))
+        self._grid_foot_total = len(self.overview_cards)
+        self.grid_foot = CaptionLabel(self._grid_foot_text(self._grid_foot_total))
         self.grid_foot.setStyleSheet("color:#8a8d96;")
         self.grid_foot.setWordWrap(True)
         root.addWidget(self.grid_foot)
@@ -12539,6 +12634,52 @@ class OverviewPage(QWidget):
         # 连接顺序上 AppCard 先注册（Launcher 先建卡后建总览页），Qt 按连接顺序
         # 调用槽，故这里刷到的必是本轮最新值，不会出现"总览滞后一拍"。
         heartbeat().tick.connect(self.refresh)
+
+    def _grid_foot_text(self, shown):
+        """卡片下方的层级说明。搜索过滤时 N 跟着变，避免文案说 6 个只显示 2 个。"""
+        return ("以上 %d 个是游戏助手本体，点卡片进详情页，状态每 5 秒自动刷新；"
+                "搜索框右侧「AUTO-MAS 任务编排」是管它们的编排插件"
+                "（多账号队列 / 定时 / 日志），不是又一个助手。" % shown)
+
+    def _apply_search_filter(self):
+        """顶部搜索 → 官方卡片过滤 + 预约区过滤（同一查询，防抖后执行）。
+
+        官方卡片对象常驻 self.overview_cards，这里只把不匹配的移出布局
+        （不可见），清空搜索即恢复 —— 不销毁重建，心跳刷新不断线。
+        """
+        q = (self.search_box.text() or "").strip().lower()
+        while self._card_grid.count():
+            it = self._card_grid.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.setVisible(False)
+        shown = 0
+        for oc in self.overview_cards:
+            a = getattr(oc, "app", {}) or {}
+            hay = " ".join([a.get("display", ""), a.get("game", ""),
+                            a.get("ecosystem", ""), a.get("key", "")]).lower()
+            if not q or q in hay:
+                self._card_grid.addWidget(oc, shown // 3, shown % 3)
+                oc.setVisible(True)
+                shown += 1
+        self._grid_empty.setVisible(shown == 0 and bool(q))
+        self.grid_foot.setText(self._grid_foot_text(shown))
+        # 预约区复用它内部的搜索框对象驱动（textChanged→防抖→rebuild 管线不变）
+        rs = getattr(self, "reserved_section", None)
+        if rs is not None:
+            rs.search.setText(self.search_box.text() or "")
+
+    def _on_rank_row_clicked(self, key):
+        """榜单行点击分流：官方助手 → 二级详情；预约条目（无详情页）→ 官网。"""
+        if key in self._cards:
+            self.sig_open_detail.emit(key)
+            return
+        for a in self._reserved:
+            if a.get("key", "") == key:
+                site = (a.get("website") or "").strip()
+                if site:
+                    QDesktopServices.openUrl(QUrl(site))
+                return
 
     def _on_wish_counts(self, counts):
         """预约区票数变了（含汇总到达）→ 同步右栏「预约榜」。"""

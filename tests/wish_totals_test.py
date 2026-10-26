@@ -191,6 +191,10 @@ chk("排序用合并票数（8 排在 1 前）", order.index("net_only") < order
     order)
 
 print("\n--- 6) 点击投票：数字当场 +1（别让用户以为按钮是假的）---")
+# record_wish 必须替身化：_vote 会写真缓存 —— 上一版没替身，测试把
+# "clickme": 13 票写进了用户实机 .cache（隔离纪律被打脸的实证）
+votes_written = []
+launcher.record_wish = lambda k: votes_written.append(k)
 sec2 = launcher.ReservedSection([{"key": "clickme", "display": "点我", "ecosystem": "standalone"}])
 sec2._totals = {}
 sec2.rebuild()
@@ -202,6 +206,8 @@ after = card._votes_label.text()
 chk("点击前 0，点击后 1（当场可见）",
     before == "0 人想要" and after == "1 人想要", (before, after))
 chk("按钮变灰已想要", card.vote_btn.text() == "已想要" and not card.vote_btn.isEnabled())
+chk("投票走了 record_wish（只写内存替身，不碰实机缓存）",
+    votes_written == ["clickme"], votes_written)
 
 print("\n--- 7) worker 门控：没开遥测/没端点，连 worker 都不建 ---")
 created = []

@@ -20,6 +20,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import launcher  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
+# 测试隔离：总览页构造会启动 CatalogDownloadsWorker（去 pages.dev 发真请求），
+# 解释器退出时线程没跑完 → Qt 崩（0xC0000409，实测 3/3 稳定复现）。
+# 本测试不关心下载榜，一律替身化，绝不真开线程。
+launcher.CatalogDownloadsWorker = type(
+    "W", (), {"__init__": lambda s, r, p=None: None,
+              "start": lambda s: None})
+
 OK, FAIL = [], []
 
 

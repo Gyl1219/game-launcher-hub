@@ -12,6 +12,7 @@
 """
 import os
 import re
+import sys
 import json
 import urllib.request
 
@@ -21,7 +22,9 @@ if not TOKEN:
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OWNER, REPO = "Gyl1219", "game-launcher-hub"
-EXE = os.path.join(HERE, "dist", "game-launcher-hub.exe")
+# 默认 dist\game-launcher-hub.exe；argv[1] 可指定别的路径
+# （dist exe 被正在运行的实例锁住时，打包到 dist_new 再从那里发）
+EXE = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "dist", "game-launcher-hub.exe")
 
 
 def _app_version():
