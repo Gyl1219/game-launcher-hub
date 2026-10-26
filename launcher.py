@@ -71,7 +71,7 @@ from qfluentwidgets import (
 
 # 启动器自身版本（打包版 / 源码版共用）。发新版时只改这一处，
 # 显示在「设置」页页脚，便于报 bug 时说清自己在跑哪个版本。
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 
 # ===== 应用配置（从 config.json 加载，避免硬编码路径） =====
 # 打包后（PyInstaller）两个目录必须分开算，否则图标全找不到：
@@ -11762,15 +11762,21 @@ class RankBoard(QWidget):
 
 
 class RankRail(QWidget):
-    """右栏三个小榜的竖排容器：活跃度 / 星标 / 我的使用。"""
+    """右栏小榜的竖排容器：活跃度 / 星标 / 我的使用 / 预约榜。"""
 
-    def __init__(self, apps, parent=None):
+    def __init__(self, apps, parent=None, reserved_apps=None):
         super().__init__(parent)
         self._apps_by_key = {}
         for a in apps:
             k = a.get("key", "")
             if k:
                 self._apps_by_key[k] = (a.get("display", k), a.get("icon", ""))
+        # 预约榜的数据源是预约条目（不在正式 apps 里），单独建一份映射
+        self._reserved_by_key = {}
+        for a in (reserved_apps or []):
+            k = a.get("key", "")
+            if k:
+                self._reserved_by_key[k] = (a.get("display", k), a.get("icon", ""))
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -11778,14 +11784,36 @@ class RankRail(QWidget):
         self.board_activity = RankBoard("活跃度", "近30天提交", self._apps_by_key)
         self.board_stars = RankBoard("星标数", "社区体量", self._apps_by_key)
         self.board_usage = RankBoard("我的使用", "本机启动", self._apps_by_key)
-        # 三个榜均分整栏高度（stretch=1）：全屏时左轮播涨得很高，
-        # 若这里不加权，三块只占内容自然高度、下方空一大片，左右严重失衡。
+        # 预约榜：谁被要得多就先适配谁。还没人投时占位（不是"暂无数据"的错愕感）
+        self.board_wish = RankBoard("预约榜", "我想要票数", self._reserved_by_key)
+        # 四个榜均分整栏高度（stretch=1）：全屏时左轮播涨得很高，
+        # 若这里不加权，四块只占内容自然高度、下方空一大片，左右严重失衡。
         # 配合 RankBoard 内部的底部 addStretch，富余空间落在每块卡的底部，
         # 行内容仍顶部对齐，不会把三行拉散。
-        for b in (self.board_activity, self.board_stars, self.board_usage):
+        for b in (self.board_activity, self.board_stars, self.board_usage,
+                  self.board_wish):
             root.addWidget(b, 1)
         self.set_github({})
         self.refresh_usage()
+        self.set_wish_rows({})
+
+    def set_wish_rows(self, counts):
+        """预约榜：counts 为 {key: 合并票数}；只显示 ≥1 票的，按票数降序。
+
+        全 0 时占位而不是空榜 —— v1.3.0 时期全是 0，摆一排 0 会让人以为坏了。
+        """
+        rows = []
+        for k, v in (counts or {}).items():
+            try:
+                v = int(v)
+            except (TypeError, ValueError):
+                continue
+            if v >= 1 and k in self._reserved_by_key:
+                rows.append((v, k))
+        rows.sort(key=lambda t: (-t[0], self._reserved_by_key.get(t[1], (t[1],))[0]))
+        self.board_wish.set_rows(
+            [(k, "%d 票" % v) for v, k in rows],
+            placeholder="虚位以待，快去投一票")
 
     def resizeEvent(self, e):
         """栏宽变化 → 按自身宽度算倍率下发给三个榜（字号/图标/间距一起缩放）。
@@ -12014,12 +12042,14 @@ class ReservedSection(QWidget):
     PAGE_SIZE = 24          # 首屏只渲染这么多，剩下的点「显示更多」再建，避免一次几百个 widget
     SEARCH_DELAY_MS = 300   # 搜索防抖：否则每敲一个字都重建全部卡片（实测 0.6s/次）
 
-    def __init__(self, apps, parent=None):
+    def __init__(self, apps, parent=None, on_counts=None):
         super().__init__(parent)
         self._apps = list(apps or [])
         self._page = self.PAGE_SIZE
         # 全网票数：先用上次缓存（可能过期，有总比 0 强），再异步刷新
         self._totals = _load_wish_totals()
+        # 合并票数变化时回调（预约榜用它同步右上角的小榜）；传 None 即不接
+        self._on_counts = on_counts
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -12091,6 +12121,12 @@ class ReservedSection(QWidget):
         shown = items[:self._page]
         counts = merge_wish_counts(self._totals, _wish_counts())
         voted = _wish_voted()
+        # 通知预约榜（右栏小榜）——传合并后的同一份数据，两处数字永远一致
+        if self._on_counts is not None:
+            try:
+                self._on_counts(counts)
+            except Exception:
+                pass
         for eco in _ECOSYSTEM_ORDER:
             group = [a for a in shown
                      if (a.get("ecosystem") or "standalone") == eco]
@@ -12214,7 +12250,7 @@ class OverviewPage(QWidget):
         self.carousel = BannerCarousel()
         self.carousel.sig_open_detail.connect(self.sig_open_detail)
         top_row.addWidget(self.carousel, stretch=5)
-        self.rank_rail = RankRail(apps)
+        self.rank_rail = RankRail(apps, reserved_apps=self._reserved)
         top_row.addWidget(self.rank_rail, stretch=2)
         root.addLayout(top_row)
         self._refresh_banner()
@@ -12243,7 +12279,8 @@ class OverviewPage(QWidget):
 
         # 下方的预约区：只展示、投票，不提供安装
         if self._reserved:
-            self.reserved_section = ReservedSection(self._reserved)
+            self.reserved_section = ReservedSection(
+                self._reserved, on_counts=self._on_wish_counts)
             root.addSpacing(8)
             root.addWidget(self.reserved_section)
 
@@ -12253,6 +12290,13 @@ class OverviewPage(QWidget):
         # 连接顺序上 AppCard 先注册（Launcher 先建卡后建总览页），Qt 按连接顺序
         # 调用槽，故这里刷到的必是本轮最新值，不会出现"总览滞后一拍"。
         heartbeat().tick.connect(self.refresh)
+
+    def _on_wish_counts(self, counts):
+        """预约区票数变了（含汇总到达）→ 同步右栏「预约榜」。"""
+        try:
+            self.rank_rail.set_wish_rows(counts)
+        except Exception:
+            pass
 
     def _refresh_banner(self):
         try:
