@@ -102,7 +102,7 @@ chk("非 GitHub 官网的条目剔除（r3）", "r3" not in keys, keys)
 chk("重复仓库只留一个", repos.count("foo/one") == 1 and keys.count("r4") == 0, repos)
 chk("slug 去掉尾斜杠", "bar/two" in repos, repos)
 
-print("\n--- 4) CatalogDownloadsWorker：预算 / TTL / 熔断 / 换算 ---  【负向对照点】")
+print("\n--- 4) CatalogDownloadsWorker：服务端优先 → 直连兜底 ---  【负向对照点】")
 real_fd = launcher._fetch_release_downloads
 # worker 拉取按**仓库 slug**（不是助手 key）：官方两个 + 预约两个
 DL = {"BnanZ0/ok-nte": 33, "ok-oldking/ok-wuthering-waves": 44,
@@ -116,43 +116,96 @@ def rec_fd(repo, max_pages=3):
     raise RuntimeError("no data %s" % repo)
 
 
-# A) 空缓存 + 预算 2 → 只拉排序前 2 个（官方两个），结果按 key 输出
+orig_origin = launcher._telemetry_origin
+orig_enabled = launcher.telemetry_enabled
+orig_post = launcher._post_json
+orig_dlget = launcher._download_totals_http_get
+
+
+def server_on(totals_obj):
+    """打开服务端路径：origin/开关/POST/GET 全部替身化。"""
+    posts = []
+    launcher._telemetry_origin = lambda: "https://glh-tele.pages.dev"
+    launcher.telemetry_enabled = lambda: True
+    launcher._post_json = lambda url, payload: posts.append(
+        (url, payload)) or 200
+    launcher._download_totals_http_get = lambda url: (
+        200, json.dumps({"downloads": totals_obj}))
+    return posts
+
+
+def server_off():
+    launcher.telemetry_enabled = lambda: False   # 服务端路径直接短路
+
+
+# A1) 服务端有数据 → 用共享缓存，不花直连配额
 calls = []
 launcher._fetch_release_downloads = rec_fd
-launcher._REPO_DL_BUDGET = 2
+posts = server_on({"BnanZ0/ok-nte": 33, "foo/one": 11})
+open(launcher._repo_downloads_path(), "w", encoding="utf-8").write(
+    json.dumps({"repos": {}, "attempted_at": 0}))
 w = launcher.CatalogDownloadsWorker(reserved)
 got = []
 w.done.connect(lambda d: got.append(dict(d)))
 w.run()
-chk("预算生效（只拉 2 个仓）", len(calls) == 2, calls)
-chk("官方优先（前两个是 ok-nte / ok-ww 的仓库）",
-    calls == ["BnanZ0/ok-nte", "ok-oldking/ok-wuthering-waves"], calls)
-chk("结果按 key 输出含官方下载量", got and got[0].get("ok-nte") == 33, got)
+chk("服务端有数据 → 直连一次都不跑", not calls, calls)
+chk("播种请求带全量 slug（公开仓库清单，无用户数据）",
+    posts and posts[0][1]["repos"][:2] == ["BnanZ0/ok-nte",
+                                           "ok-oldking/ok-wuthering-waves"],
+    posts)
+chk("服务端数据按 key 输出（官方 + 预约）",
+    got and got[0].get("ok-nte") == 33 and got[0].get("r1") == 11, got)
 
-# B) 缓存新鲜（7 天内）→ 一个都不拉，直接出缓存值
+# A2) 服务端没数据（还没拉出来）→ 自动落到直连分批
 calls = []
-open(launcher._repo_downloads_path(), "w", encoding="utf-8").write(json.dumps(
-    {"repos": {"BnanZ0/ok-nte": {"downloads": 99, "fetched_at": time.time()},
-               "foo/one": {"downloads": 11, "fetched_at": time.time()}},
-     "attempted_at": 0}))
+server_on({})
+open(launcher._repo_downloads_path(), "w", encoding="utf-8").write(
+    json.dumps({"repos": {}, "attempted_at": 0}))
+launcher._REPO_DL_BUDGET = 2
 w2 = launcher.CatalogDownloadsWorker(reserved)
 got2 = []
 w2.done.connect(lambda d: got2.append(dict(d)))
 w2.run()
-chk("TTL 按仓生效：新鲜的没拉", ("BnanZ0/ok-nte" not in calls)
-    and ("foo/one" not in calls), calls)
-chk("过期的照拉（未覆盖的仓库继续补全）",
-    "ok-oldking/ok-wuthering-waves" in calls, calls)
-chk("缓存值照常输出", got2 and got2[0].get("ok-nte") == 99 and got2[0].get("r1") == 11, got2)
+chk("服务端空 → 落到直连", len(calls) == 2, calls)
+chk("直连也按官方优先", calls[:2] == ["BnanZ0/ok-nte",
+                                      "ok-oldking/ok-wuthering-waves"], calls)
 
-# C) 10 分钟内已尝试过 → 直接出缓存不再开拉
+# A3) 服务端挂了（异常/非 200）→ 同样落到直连
 calls = []
-open(launcher._repo_downloads_path(), "w", encoding="utf-8").write(json.dumps(
-    {"repos": {}, "attempted_at": time.time()}))
+launcher._download_totals_http_get = lambda url: (500, "oops")
+open(launcher._repo_downloads_path(), "w", encoding="utf-8").write(
+    json.dumps({"repos": {}, "attempted_at": 0}))
 w3 = launcher.CatalogDownloadsWorker(reserved)
 got3 = []
 w3.done.connect(lambda d: got3.append(dict(d)))
 w3.run()
+chk("服务端 500 → 落到直连", len(calls) == 2, calls)
+
+# B) 兜底路径：缓存新鲜（7 天内）→ 该仓不拉，过期的照拉
+calls = []
+server_off()
+open(launcher._repo_downloads_path(), "w", encoding="utf-8").write(json.dumps(
+    {"repos": {"BnanZ0/ok-nte": {"downloads": 99, "fetched_at": time.time()},
+               "foo/one": {"downloads": 11, "fetched_at": time.time()}},
+     "attempted_at": 0}))
+w4 = launcher.CatalogDownloadsWorker(reserved)
+got4 = []
+w4.done.connect(lambda d: got4.append(dict(d)))
+w4.run()
+chk("TTL 按仓生效：新鲜的没拉", ("BnanZ0/ok-nte" not in calls)
+    and ("foo/one" not in calls), calls)
+chk("过期的照拉（未覆盖的仓库继续补全）",
+    "ok-oldking/ok-wuthering-waves" in calls, calls)
+chk("缓存值照常输出", got4 and got4[0].get("ok-nte") == 99 and got4[0].get("r1") == 11, got4)
+
+# C) 10 分钟内已尝试过 → 直接出缓存不再开拉（attempted_at 守卫）
+calls = []
+open(launcher._repo_downloads_path(), "w", encoding="utf-8").write(json.dumps(
+    {"repos": {}, "attempted_at": time.time()}))
+w5 = launcher.CatalogDownloadsWorker(reserved)
+got5 = []
+w5.done.connect(lambda d: got5.append(dict(d)))
+w5.run()
 chk("attempted_at 守卫：不重复开拉", not calls, calls)
 
 # D) 全部失败 → 连续 3 个就熔断（不把预算烧光）
@@ -166,12 +219,16 @@ launcher._fetch_release_downloads = always_fail
 launcher._REPO_DL_BUDGET = 25
 open(launcher._repo_downloads_path(), "w", encoding="utf-8").write(
     json.dumps({"repos": {}, "attempted_at": 0}))
-w4 = launcher.CatalogDownloadsWorker(reserved)
-got4 = []
-w4.done.connect(lambda d: got4.append(dict(d)))
-w4.run()
+w6 = launcher.CatalogDownloadsWorker(reserved)
+got6 = []
+w6.done.connect(lambda d: got6.append(dict(d)))
+w6.run()
 chk("连续 3 失败熔断（不会拉满 25 个）", len(calls) == 3, calls)
 launcher._fetch_release_downloads = real_fd
+launcher._telemetry_origin = orig_origin
+launcher.telemetry_enabled = orig_enabled
+launcher._post_json = orig_post
+launcher._download_totals_http_get = orig_dlget
 
 print("\n--- 5) RankRail 下载榜：排序 / k 格式化 / 过滤 / 占位 ---")
 rail = launcher.RankRail(

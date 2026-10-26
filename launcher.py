@@ -11051,6 +11051,43 @@ def parse_wish_totals(text):
         return {}
 
 
+def parse_download_totals(text):
+    """解析 /download/totals 响应 → {repo_slug: int}。坏数据一律空 dict。"""
+    try:
+        data = json.loads(text)
+        downloads = data.get("downloads")
+        if not isinstance(downloads, dict):
+            return {}
+        out = {}
+        for k, v in downloads.items():
+            try:
+                n = int(v)
+            except (TypeError, ValueError):
+                continue
+            if n >= 0 and isinstance(k, str) and k:
+                out[k[:120]] = n
+        return out
+    except Exception:
+        return {}
+
+
+def _download_totals_http_get(url):
+    """拉下载量汇总的 HTTP 层，独立出来给测试 monkeypatch。返回 (status, text)。"""
+    req = urllib.request.Request(url, headers={"User-Agent": "game-launcher-hub"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return r.status, r.read().decode("utf-8", "replace")
+
+
+def _post_json(url, payload):
+    """POST 一个小 JSON（播种仓库清单用）。失败抛异常，调用方自行兜底。"""
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"), method="POST",
+        headers={"User-Agent": "game-launcher-hub",
+                 "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return r.status
+
+
 def merge_wish_counts(server, local):
     """展示值 = max(全网汇总, 本机计数)。
 
@@ -11376,12 +11413,14 @@ def _catalog_downloads_by_key(stores, reserved_apps):
 
 
 class CatalogDownloadsWorker(QThread):
-    """全目录下载量：官方 6 个 + 预约里能提取到 GitHub 仓库的，逐仓拉累计下载量。
+    """全目录下载量：官方 6 个 + 预约里能提取到 GitHub 仓库的（共约 60 仓）。
 
-    为什么不塞进 GitHubStatsWorker：目录约 60 个仓库，一轮全拉会吃光
-    未认证 60 次/小时的配额。这里按预约票数排优先级、每轮最多
-    _REPO_DL_BUDGET 个、单仓 7 天 TTL —— 用几天把榜单补全；
-    设置页配了 GitHub token（5000 次/小时）则一轮全拉完。
+    路径①（优先）：遥测端点的 /download/totals —— Cloudflare 一处代拉 GitHub
+    （分批限速）后所有用户共享同一份缓存，国内只碰稳的 pages.dev；
+    顺带播种本机目录清单（只含公开仓库 slug，无任何用户数据）。
+    路径②（兜底）：服务端没数据 / 没开遥测 → 直连 GitHub 分批拉
+    （按预约票数排优先级、每轮最多 _REPO_DL_BUDGET 个、单仓 7 天 TTL、
+    连续 3 个失败熔断）—— 配了 GitHub token（5000 次/小时）一轮全拉完。
     """
 
     done = Signal(dict)
@@ -11394,6 +11433,49 @@ class CatalogDownloadsWorker(QThread):
         return _catalog_downloads_by_key(stores, self._reserved_apps)
 
     def run(self):
+        # ① 服务端汇总优先：Cloudflare 一处去 GitHub 拉（分批限速），所有用户
+        #    共享同一份缓存。国内直连 api.github.com 常抽风，而 pages.dev 稳。
+        if self._try_server():
+            return
+        # ② 兜底：服务端没数据/没开遥测 → 维持直连分批（原有路径）
+        self._run_direct()
+
+    def _try_server(self):
+        """从遥测端点的 /download/totals 读共享缓存；成功返回 True。
+
+        顺带把本机目录播种给服务端（POST /download/catalog，只含公开的
+        仓库 slug，无任何用户数据）—— 第一个到的用户播下种，服务端后台
+        分批代拉，之后所有用户直接读现成的。
+        """
+        try:
+            origin = _telemetry_origin()
+            if not origin or not telemetry_enabled():
+                return False
+            slugs = [r for r, _k in _catalog_repos(self._reserved_apps, {})]
+            try:
+                _post_json(origin + "/download/catalog", {"repos": slugs})
+            except Exception:
+                pass   # 播种失败不打紧，别的用户会播
+            status, text = _download_totals_http_get(
+                origin + "/download/totals")
+            if status != 200:
+                return False
+            by_repo = parse_download_totals(text)
+            if not by_repo:
+                return False   # 服务端还没拉出数据 → 走兜底，别让榜空着
+            now = time.time()
+            cache = _load_json(_repo_downloads_path())
+            stores = dict(cache.get("repos") or {})
+            for slug, d in by_repo.items():
+                stores[slug] = {"downloads": d, "fetched_at": now}
+            _save_json(_repo_downloads_path(),
+                       {"repos": stores, "attempted_at": now})
+            self.done.emit(self._by_key(stores))
+            return True
+        except Exception:
+            return False
+
+    def _run_direct(self):
         now = time.time()
         cache = _load_json(_repo_downloads_path())
         stores = dict(cache.get("repos") or {})
