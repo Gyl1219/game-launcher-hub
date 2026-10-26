@@ -11282,6 +11282,146 @@ class GithubQuotaWorker(QThread):
             self.done.emit(None)
 
 
+def _fetch_release_downloads(repo, max_pages=3):
+    """某仓库全部 release 资产的累计下载量（GitHub 的 download_count 是累计值）。
+
+    每页 100 个 release，最多翻 max_pages 页 —— 老仓库 release 可能超过 100 个，
+    但越老的下载量占比越小，3 页（300 个）封顶是配额与准确度的折中
+    （未认证 GitHub API 限 60 次/小时，这里每仓每 6 小时才花 1~3 次）。
+    网络失败抛异常（调用方按"保留旧值"处理）；一个 release 都没拿到也抛，
+    避免把 0 当成真值写进缓存。
+    """
+    total, got_any = 0, False
+    for page in range(1, max_pages + 1):
+        code, _h, body = _github_fetch(
+            "https://api.github.com/repos/%s/releases?per_page=100&page=%d"
+            % (repo, page))
+        if code != 200:
+            break
+        arr = json.loads(body.decode("utf-8"))
+        if not isinstance(arr, list):
+            break
+        got_any = got_any or bool(arr)
+        for rel in arr:
+            for a in (rel.get("assets") or []):
+                try:
+                    total += int(a.get("download_count") or 0)
+                except (TypeError, ValueError):
+                    pass
+        if len(arr) < 100:
+            break
+    if not got_any:
+        raise RuntimeError("no release data for %s" % repo)
+    return total
+
+
+# ===== 下载榜：全目录（官方 + 预约）仓库的 release 累计下载量 =====
+# 用户要求：下载榜要「所有的里面选前几名」，不是只有启动器适配的那 6 个。
+# 下载量是 GitHub 公开数据（全网同一份），客户端直接拉即可，不需要服务端汇总；
+# 约束只有 API 配额（未认证 60 次/小时），所以按预约票数排优先级 + 限量分批。
+
+_REPO_DL_TTL_SEC = 7 * 24 * 3600   # 单仓 7 天内直接用缓存（累计量变化很慢）
+_REPO_DL_BUDGET = 25               # 每轮最多拉 25 个仓（未认证配额内；有 token 可放开）
+_REPO_DL_RETRY_SEC = 10 * 60       # 一轮拉完 10 分钟内不重复开拉（防反复开页面打网络）
+_GITHUB_URL_RE = re.compile(r"github\.com/([^/\s\"'#?]+)/([^/\s\"'#?]+)")
+
+
+def _repo_downloads_path():
+    return os.path.join(_cache_dir(), "repo_downloads.json")
+
+
+def _catalog_repos(reserved_apps, wish_counts):
+    """全目录仓库清单，按「官方 6 个在前 → 预约按票数降序」排序。
+
+    预约条目没有独立 repo 字段，从 website 里的 github.com 链接提取
+    （79 条里实测 54 条有）；提取不到的（官网非 GitHub）不参与下载榜 ——
+    这是数据边界，不硬造。同仓库多个条目只留第一个（防重复拉取）。
+    返回 [(repo_slug, key)]，顺序即拉取优先级。
+    """
+    seen, order = set(), []
+    for key, repo in _GITHUB_REPOS.items():      # 官方 6 个永远最优先
+        if repo not in seen:
+            seen.add(repo)
+            order.append((repo, key))
+    try:
+        items = sorted(
+            (a for a in (reserved_apps or []) if isinstance(a, dict)),
+            key=lambda a: -int(wish_counts.get(a.get("key", ""), 0) or 0))
+    except Exception:
+        items = [a for a in (reserved_apps or []) if isinstance(a, dict)]
+    for a in items:
+        key = a.get("key", "")
+        m = _GITHUB_URL_RE.search(str(a.get("website") or ""))
+        if not key or not m:
+            continue
+        repo = "%s/%s" % (m.group(1), m.group(2).rstrip("/"))
+        if repo.endswith(".git"):
+            repo = repo[:-4]
+        if repo not in seen:
+            seen.add(repo)
+            order.append((repo, key))
+    return order
+
+
+def _catalog_downloads_by_key(stores, reserved_apps):
+    """repo 维度的缓存 {repo: {downloads, fetched_at}} → {key: downloads}。"""
+    out = {}
+    for repo, key in _catalog_repos(reserved_apps, {}):
+        if key in out:
+            continue
+        v = (stores.get(repo) or {}).get("downloads")
+        if isinstance(v, int) and v >= 0:
+            out[key] = v
+    return out
+
+
+class CatalogDownloadsWorker(QThread):
+    """全目录下载量：官方 6 个 + 预约里能提取到 GitHub 仓库的，逐仓拉累计下载量。
+
+    为什么不塞进 GitHubStatsWorker：目录约 60 个仓库，一轮全拉会吃光
+    未认证 60 次/小时的配额。这里按预约票数排优先级、每轮最多
+    _REPO_DL_BUDGET 个、单仓 7 天 TTL —— 用几天把榜单补全；
+    设置页配了 GitHub token（5000 次/小时）则一轮全拉完。
+    """
+
+    done = Signal(dict)
+
+    def __init__(self, reserved_apps, parent=None):
+        super().__init__(parent)
+        self._reserved_apps = list(reserved_apps or [])
+
+    def _by_key(self, stores):
+        return _catalog_downloads_by_key(stores, self._reserved_apps)
+
+    def run(self):
+        now = time.time()
+        cache = _load_json(_repo_downloads_path())
+        stores = dict(cache.get("repos") or {})
+        if now - float(cache.get("attempted_at") or 0) < _REPO_DL_RETRY_SEC:
+            self.done.emit(self._by_key(stores))
+            return
+        wish = merge_wish_counts(_load_wish_totals(), _wish_counts())
+        budget = _REPO_DL_BUDGET
+        fail_streak = 0
+        for repo, _key in _catalog_repos(self._reserved_apps, wish):
+            if budget <= 0 or fail_streak >= 3:
+                break   # 连续 3 个失败多半是限流/断网，别把预算烧光
+            prev = stores.get(repo) or {}
+            if now - float(prev.get("fetched_at") or 0) < _REPO_DL_TTL_SEC:
+                continue                       # 新鲜的跳过（不花配额）
+            budget -= 1                        # 失败也花了配额，照记
+            try:
+                d = _fetch_release_downloads(repo)
+            except Exception:
+                fail_streak += 1
+                continue
+            fail_streak = 0
+            stores[repo] = {"downloads": d, "fetched_at": now}
+        _save_json(_repo_downloads_path(),
+                   {"repos": stores, "attempted_at": now})
+        self.done.emit(self._by_key(stores))
+
+
 class GitHubStatsWorker(QThread):
     """后台拉取各上游仓库的 star 数与近 30 天提交数。
 
@@ -11289,6 +11429,8 @@ class GitHubStatsWorker(QThread):
     - fetched_at 只在拿到新数据时更新；attempted_at 每次尝试都更新，
       用于「失败后 30 分钟内不反复重试」
     - 提交数用 per_page=1 + Link 头的 last 页码，一次请求拿到窗口内总数
+    - 下载量不在这条管线：目录有 ~60 个仓库会吃光配额，
+      由 CatalogDownloadsWorker 按 7 天 TTL 分批拉
     """
 
     done = Signal(dict)
@@ -11784,6 +11926,8 @@ class RankRail(QWidget):
         self.board_activity = RankBoard("活跃度", "近30天提交", self._apps_by_key)
         self.board_stars = RankBoard("星标数", "社区体量", self._apps_by_key)
         self.board_usage = RankBoard("我的使用", "本机启动", self._apps_by_key)
+        # 下载榜：各仓库 release 资产的累计下载量（公开数据，与活跃/星标同一条管线）
+        self.board_downloads = RankBoard("下载榜", "release 累计", self._apps_by_key)
         # 预约榜：谁被要得多就先适配谁。还没人投时占位（不是"暂无数据"的错愕感）
         self.board_wish = RankBoard("预约榜", "我想要票数", self._reserved_by_key)
         # 四个榜均分整栏高度（stretch=1）：全屏时左轮播涨得很高，
@@ -11791,7 +11935,7 @@ class RankRail(QWidget):
         # 配合 RankBoard 内部的底部 addStretch，富余空间落在每块卡的底部，
         # 行内容仍顶部对齐，不会把三行拉散。
         for b in (self.board_activity, self.board_stars, self.board_usage,
-                  self.board_wish):
+                  self.board_downloads, self.board_wish):
             root.addWidget(b, 1)
         self.set_github({})
         self.refresh_usage()
@@ -11816,7 +11960,7 @@ class RankRail(QWidget):
             placeholder="虚位以待，快去投一票")
 
     def resizeEvent(self, e):
-        """栏宽变化 → 按自身宽度算倍率下发给三个榜（字号/图标/间距一起缩放）。
+        """栏宽变化 → 按自身宽度算倍率下发给五个榜（字号/图标/间距一起缩放）。
 
         这是"全屏排行榜字和图标没变大"的根治：以前只把卡片外壳撑高，
         里面的 18px 图标、12px 字全是写死的。现在以默认栏宽 272 为 1.0 基准，
@@ -11827,7 +11971,9 @@ class RankRail(QWidget):
             if w > 0:
                 s = max(1.0, min(RankBoard.MAX_SCALE,
                                  w / float(RankBoard.BASE_W)))
-                for b in (self.board_activity, self.board_stars, self.board_usage):
+                for b in (self.board_activity, self.board_stars,
+                          self.board_usage, self.board_downloads,
+                          self.board_wish):
                     b.apply_scale(s)
         except Exception:
             pass
@@ -11849,6 +11995,27 @@ class RankRail(QWidget):
         ph = "网络受限，暂无数据"
         self.board_activity.set_rows(act, ph)
         self.board_stars.set_rows(stars, ph)
+
+    def set_catalog_downloads(self, downloads):
+        """下载榜：{key: 累计下载量}，覆盖官方 + 预约全目录（CatalogDownloadsWorker）。
+
+        先按数值排序再格式化 —— 复用的 _fmt_count 输出 "1.2k" 这类字符串，
+        字符串排序会把 10.0k 排到 9999 后面，必须先按数值排。
+        """
+        names = {**self._apps_by_key, **self._reserved_by_key}
+        rows = []
+        for key, v in (downloads or {}).items():
+            if key not in names:
+                continue
+            try:
+                v = int(v)
+            except (TypeError, ValueError):
+                continue
+            if v >= 0:
+                rows.append((key, v))
+        rows.sort(key=lambda x: -x[1])
+        self.board_downloads.set_rows(
+            [(k, _fmt_count(v)) for k, v in rows], "数据收集中，用几天补全")
 
     def refresh_usage(self):
         counts = _load_json(_launch_counts_path())
@@ -12359,6 +12526,25 @@ class OverviewPage(QWidget):
                 self._stats_worker = GitHubStatsWorker()
                 self._stats_worker.done.connect(self._on_stats_done)
                 self._stats_worker.start()
+            # 下载榜：先用缓存渲染，再限量分批拉全目录（官方 + 预约）
+            dl = _load_json(_repo_downloads_path())
+            stores = dl.get("repos") or {}
+            if stores:
+                self._apply_catalog_downloads(stores)
+            self._catalog_dl_worker = CatalogDownloadsWorker(self._reserved)
+            self._catalog_dl_worker.done.connect(self._on_catalog_downloads)
+            self._catalog_dl_worker.start()
+        except Exception:
+            pass
+
+    def _apply_catalog_downloads(self, stores):
+        """repo 维度的缓存 → key 维度喂给榜单（与 worker 同一换算函数）。"""
+        self.rank_rail.set_catalog_downloads(
+            _catalog_downloads_by_key(stores or {}, self._reserved))
+
+    def _on_catalog_downloads(self, by_key):
+        try:
+            self.rank_rail.set_catalog_downloads(by_key or {})
         except Exception:
             pass
 
