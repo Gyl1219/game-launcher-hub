@@ -1,4 +1,4 @@
-﻿# 游戏助手启动器 (game-launcher-hub)
+# 游戏助手启动器 (game-launcher-hub)
 
 > **非官方第三方工具**，与 ok-script 项目方及各游戏官方均无隶属关系。
 >
@@ -69,9 +69,9 @@ AUTO-MAS 的后端**（AGPL-3.0，锁 commit、保留上游 LICENSE 与 NOTICE�
 | **版本 / changelog 查看** | ❌ | ✅ 读本地 git 仓库，与原启动器同源 |
 | **一键更新助手** | ❌ | ✅ 窗口内更新并应用到 working |
 | 卸载（含清理残留） | ❌ | ✅ 三档：保留缓存 / 彻底清除 / 取消 |
-| 体积 | **GB 级**（Electron，主程序 196 MB） | 源码 500 KB；打包单文件 exe **约 112 MB**（+ 后端 53 MB） |
+| 体积 | **GB 级**（Electron，主程序 196 MB） | 源码 500 KB；打包单文件 exe **约 112 MB**（AUTO-MAS 按需安装，不随包） |
 | 技术栈 | Electron + Python 后端 | 纯 Python（PySide6 + qfluentwidgets）+ 监督式拉起同一后端 |
-| 协议 | AGPL-3.0 | GPL-3.0（**分发含 AUTO-MAS 的产物前必须先改 AGPL-3.0**，见 CONTRIBUTING） |
+| 协议 | AGPL-3.0 | GPL-3.0（仓库含 AGPL 的 `vendor/auto-mas` 源码，但**发布的 exe 不含 AGPL 代码**，见下方许可证说明） |
 | 遥测 | 收集版本号 + 运行时错误 + 性能追踪（Sentry SaaS），**默认开启** | **首次启动问一次，你选**；可随时关（详见下） |
 
 ### 集成方式（不 fork、不改上游）
@@ -112,8 +112,13 @@ AUTO-MAS 的后端**（AGPL-3.0，锁 commit、保留上游 LICENSE 与 NOTICE�
 
 > 📦 **打包相关**：AUTO-MAS 自带 Python 环境实测 449 MB、后端源码 57.7 MB，
 > 打包版如何处理（含「打包版会回落 sys.executable 再开一个启动器」这个已修的坑）
-> 与 **AGPL-3.0 分发红线**，见
-> [wiki/AUTO-MAS-打包与许可证评估.md](./wiki/AUTO-MAS-打包与许可证评估.md)。
+> 见 [wiki/AUTO-MAS-打包与许可证评估.md](./wiki/AUTO-MAS-打包与许可证评估.md)。
+
+> ⚖ **许可证**：本仓库为 GPL-3.0；仓库内 `vendor/auto-mas/` 是上游 AUTO-MAS 后端的
+> 源码副本，遵循其原有 AGPL-3.0（保留上游 LICENSE 与 NOTICE，未改上游一行代码）。
+> **发布的 exe 不含 AGPL 代码** —— 按需安装设计，后端不在随包资源里，
+> 用户点右上角「AUTO-MAS」时才由官方安装程序单独安装官方发布包。
+> 若将来要改成随包后端，则必须先把本项目改为 AGPL-3.0 或双许可。
 
 ### 覆盖的游戏也不同（关键）
 

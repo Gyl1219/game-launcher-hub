@@ -7,12 +7,19 @@
 > ⚠️ **许可证硬约束（动 AUTO-MAS 相关代码前必读）**
 > `vendor/auto-mas/` 是 [AUTO-MAS](https://cnb.cool/AUTO-MAS-Project/AUTO-MAS.git) 的
 > **AGPL-3.0** 后端源码（vendor 方式内嵌，锁 commit、**不改上游一行**，来源与约束见
-> `vendor/auto-mas/NOTICE.md`）。AGPL 与 GPL-3.0 **不兼容**：本仓库当前是 GPL-3.0，
-> 只满足「不分发」前提。**对外分发含 AUTO-MAS 的产物前，必须先把本项目改为 AGPL-3.0
-> （或双许可）**，并同步改 `LICENSE` / `README` / `spec` 与发布页说明。
-> 提 PR 时也不要修改 `vendor/auto-mas/` 内任何文件（要修就向上游提）。
-> 打包体积/路线的实测数据与方案对比见
-> [wiki/AUTO-MAS-打包与许可证评估.md](./wiki/AUTO-MAS-打包与许可证评估.md)。
+> `vendor/auto-mas/NOTICE.md`）。AGPL 与 GPL-3.0 **不兼容**：本仓库当前是 GPL-3.0。
+>
+> **当前采取的路线（v1.3.0 起）**：AUTO-MAS 是**按需安装**的 —— 打包版**不含**
+> AUTO-MAS 的任何代码（`spec` 的 `datas` 只有 `assets` 与两个 config 模板），
+> 用户点右上角「AUTO-MAS」时才由官方安装程序单独安装官方发布包。
+> 所以**发布的 exe 仍是 GPL-3.0**，不触发 AGPL 分发义务。
+>
+> ⚠️ **但这条红线会随打包策略变化**：一旦改成「随包后端」（体积约 170 MB 起，
+> 见 [wiki/AUTO-MAS-打包与许可证评估.md](./wiki/AUTO-MAS-打包与许可证评估.md)），
+> **必须先把本项目改为 AGPL-3.0（或双许可）**，并同步改 `LICENSE` / `README` /
+> `spec` 与发布页说明。改打包策略前先读那份评估。
+>
+> 另外：提 PR 时不要修改 `vendor/auto-mas/` 内任何文件（要修就向上游提）。
 
 ---
 
