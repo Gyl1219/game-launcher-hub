@@ -607,22 +607,27 @@ class GitVersionFetcher(QThread):
                 order = []
             # 先增量 fetch 新 tags（10 秒超时、失败容忍），避免本地 tag 陈旧漏报新版本。
             # 不用 --depth=1：是 fetch 不是 clone，不裁剪历史，不影响 PyAppify 自己 checkout 旧版本。
+            #
+            # 多源回退（2026-10-26）：不再只 fetch 写死的 origin。原启动器 repo 的 origin
+            # 可能是 CNB 也可能是 GitHub，单一源在国内网络下常超时，漏报新版本。
+            # 这里按 origin → 其对偶镜像 的顺序试，任一成功即可，每源仍限 10 秒。
             try:
-                subprocess.run([git, "-C", repo, "fetch", "--tags", "origin"],
-                               capture_output=True, text=True,
-                               encoding="utf-8", errors="replace",
-                               timeout=10,
-                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                rc_o, origin_url, _ = _git_run(
+                    git, ["remote", "get-url", "origin"], repo, timeout=15)
+                srcs = (_mirror_fetch_sources(origin_url, repo, git)
+                        if rc_o == 0 else []) or ["origin"]
+                for _src in srcs:
+                    _rc, _, _ = _git_run(git, ["fetch", "--tags", _src],
+                                         repo, timeout=10)
+                    if _rc == 0:
+                        break
             except Exception:
                 pass
-            out = subprocess.run([git, "-C", repo, "tag"],
-                                 capture_output=True, text=True,
-                                 encoding="utf-8", errors="replace",
-                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            if out.returncode != 0:
+            rc_tag, tags_raw, _ = _git_run(git, ["tag"], repo, timeout=30)
+            if rc_tag != 0:
                 self._emit_cached(app_json)
                 return
-            tags = [t.strip() for t in out.stdout.splitlines() if t.strip()]
+            tags = [t.strip() for t in tags_raw.splitlines() if t.strip()]
             tag_set = set(tags)
             ordered = [v for v in order if v in tag_set]
             extra = [t for t in tags if t not in set(ordered)]
@@ -639,15 +644,12 @@ class GitVersionFetcher(QThread):
             for v in ordered:
                 notes = changelog_map.get(v) if changelog_map else None
                 if not notes:
-                    msg = subprocess.run([git, "-C", repo, "log", "-1",
-                                          "--format=%B", v],
-                                         capture_output=True, text=True,
-                                         encoding="utf-8", errors="replace",
-                                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                    if msg.returncode != 0:
+                    _rc, msg_out, _ = _git_run(git, ["log", "-1", "--format=%B", v],
+                                               repo, timeout=20)
+                    if _rc != 0:
                         notes = []
                     else:
-                        notes = [ln.strip() for ln in msg.stdout.splitlines()
+                        notes = [ln.strip() for ln in msg_out.splitlines()
                                  if ln.strip()]
                 items.append({"version": v, "update_note": notes})
             if not items:
@@ -760,6 +762,48 @@ def parse_git_progress(line):
     return pct, (line or "").strip()
 
 
+def _mirror_fetch_sources(git_url, repo_dir, git):
+    """镜像仓库更新时可取的远端地址列表（按优先级，已去重）。
+
+    2026-10-26 修复（「下拉框显示 v3.7.11、点更新却报 pathspec 不匹配」）：
+    原来 checkout 前只 fetch 写死的 `origin`，而镜像仓库当年是用 **GitHub** URL
+    clone 的，于是 origin 恒指向 GitHub。可用户的 profile（China）git_url 是
+    **CNB 镜像**——结果「检查更新」走 CNB（国内通）、「实际下载」走 GitHub（常超时），
+    两条路错位：tag 拉不下来，checkout 就报 pathspec 不匹配。
+
+    现在以 profile 的 git_url 为准，把 origin 也列进来做双源回退，任一成功即可。
+
+    ⚠ **排序原则：已知可靠的排前，推导出来的排最后。**
+    CNB 镜像名不一定与 GitHub 同名（ok-ww 就是 `ok-ww-update` → `ok-ww-update2`），
+    `_github_to_cnb` 推出来的地址是**猜的**，可能不存在。实测访问不存在的 CNB 仓库
+    会触发 Git Credential Manager 弹窗（见 `_git_no_prompt_env`），虽然我们已经
+    禁用了凭据提示让它快速失败，但把猜测源排前面纯属浪费一轮超时。
+    """
+    known = []
+    guesses = []
+
+    def _add(bucket, u):
+        u = (u or "").strip()
+        if u and u not in known and u not in guesses:
+            bucket.append(u)
+
+    _add(known, git_url)                    # ① profile 指定的源（权威，来自 app.json）
+    origin = ""
+    if git and os.path.isdir(os.path.join(repo_dir, ".git")):
+        try:
+            rc, origin, _ = _git_run(git, ["remote", "get-url", "origin"],
+                                     repo_dir, timeout=15)
+            if rc != 0:
+                origin = ""
+        except Exception:
+            origin = ""
+    _add(known, origin)                     # ② 镜像仓库当初 clone 用的源
+    # ③④ 兜底：把已知源换到对偶站点试（名字可能不同，失败就跳过）
+    for u in list(known):
+        _add(guesses, _github_to_cnb(u))
+    return known + guesses
+
+
 def ensure_mirror(key, git_url, target_tag=None, progress_cb=None):
     """在 LAUNCHER_REPOS_DIR/<key> 维护一份独立镜像仓库。
 
@@ -801,22 +845,29 @@ def ensure_mirror(key, git_url, target_tag=None, progress_cb=None):
             git = None
         if git:
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            # 先确保目标 tag 在本地（clone 时未必把 tag 带全）
-            try:
-                subprocess.run(
-                    [git, "-C", repo_dir, "fetch", "--tags", "origin"],
-                    capture_output=True, text=True,
-                    encoding="utf-8", errors="replace",
-                    timeout=60, creationflags=flags)
-            except Exception:
-                pass
-            r = subprocess.run(
-                [git, "-C", repo_dir, "checkout", "-f", target_tag],
-                capture_output=True, text=True,
-                encoding="utf-8", errors="replace",
-                timeout=60, creationflags=flags)
-            if r.returncode != 0:
-                err = (r.stderr or r.stdout or "").strip()
+            # 先确保目标 tag 在本地（clone 时未必把 tag 带全）。
+            # 多源顺序尝试：profile 的 git_url → 其 CNB 镜像 → 仓库 origin → origin 的 CNB，
+            # 见 _mirror_fetch_sources 注释（只 fetch "origin" 会让 CNB profile 走 GitHub）。
+            #
+            # 每个源 45 秒上限：源最多 4 个，单源 60s × 4 = 4 分钟会把用户晾死；
+            # 而且「拉不下来」通常是秒级超时，不是慢，拖长没意义。
+            fetch_errs = []
+            for src in _mirror_fetch_sources(git_url, repo_dir, git):
+                rc, _, ferr = _git_run(git, ["fetch", "--tags", src],
+                                       repo_dir, timeout=45)
+                if rc == 0:
+                    break
+                fetch_errs.append("%s\n      %s" % (src, ferr or "失败"))
+            # 全部源都失败也不致命：本地可能已有这个 tag，交给下面的 checkout 判定
+            rc, _, cerr = _git_run(git, ["checkout", "-f", target_tag],
+                                   repo_dir, timeout=60)
+            if rc != 0:
+                err = cerr
+                # fetch 全挂时把远端原因一并带上，否则用户只看到 pathspec 不匹配，
+                # 会以为是「没有这个版本」，而真凶其实是拉不下来（见 2026-10-26）
+                if fetch_errs:
+                    err = "从以下远端拉取新版本均失败：\n  %s\n\n本地 checkout 错误：%s" % (
+                        "\n  ".join(fetch_errs), err)
                 raise RuntimeError(
                     f"切换到目标版本 {target_tag} 失败：{err}\n"
                     f"仓库：{repo_dir}\n"
@@ -2167,6 +2218,19 @@ def install_excepthook():
         pass
 
 
+def _github_to_cnb(url):
+    """GitHub 仓库 URL → CNB 镜像地址；不是 GitHub 返回 ""。
+
+    CNB 上有同一 owner/repo 的官方镜像，实测 git fetch 内容与 GitHub 字节一致，
+    而国内连 GitHub 常超时/握手失败，所以凡 GitHub 源都值得配一条 CNB 兜底。
+    """
+    m = re.match(r"https?://(?:www\.)?github\.com/([^/\s]+)/([^/\s]+?)(?:\.git)?/?$",
+                 (url or "").strip())
+    if not m:
+        return ""
+    return "https://cnb.cool/%s/%s" % (m.group(1), m.group(2))
+
+
 def _cnb_git_mirror(repo, git):
     """从仓库 origin URL 推导 CNB 镜像地址（仅 GitHub origin 可推）。
 
@@ -2180,11 +2244,7 @@ def _cnb_git_mirror(repo, git):
                               repo, timeout=15)
         if rc != 0:
             return ""
-        m = re.match(r"https?://(?:www\.)?github\.com/([^/\s]+)/([^/\s]+?)(?:\.git)?/?$",
-                     (url or "").strip())
-        if not m:
-            return ""
-        return "https://cnb.cool/%s/%s" % (m.group(1), m.group(2))
+        return _github_to_cnb(url)
     except Exception:
         return ""
 
@@ -4011,16 +4071,48 @@ def load_app_json(path):
         return {}
 
 
+def _git_no_prompt_env():
+    """子进程环境变量：禁止 git 弹任何凭据输入框。
+
+    2026-10-26 实机教训：试一个 CNB 上不存在的仓库地址时，Git Credential Manager
+    弹出了「Enter your credentials for https://cnb.cool/」窗口。而我们所有 git 调用
+    都是 `capture_output=True` 的**无终端**子进程——用户看不见原因、我们也收不到输入，
+    窗口就一直挂到 timeout（60s/180s），整个更新流程被拖死，还让人误以为卡死。
+
+    公共仓库（本项目只碰 GitHub / CNB 的公开镜像）根本不需要凭据，
+    所以一律：禁用凭据助手 + 禁止终端提示 + 禁用 GCM 交互 = **宁可立刻失败，也不要弹窗**。
+    """
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GCM_INTERACTIVE"] = "never"
+    env["GIT_ASKPASS"] = "echo"
+    env["SSH_ASKPASS"] = "echo"
+    env["GIT_CONFIG_NOSYSTEM"] = "1"   # 别让系统级 credential.helper 把弹窗带回来
+    return env
+
+
+def _git_cmd(git, args):
+    """拼 git 命令行：注入 -c 参数，双重保险确保不会弹凭据框。
+
+    环境变量可能被外层覆盖（例如从 IDE 启动时），所以命令行里再显式关一次。
+    """
+    return [git,
+            "-c", "credential.helper=",
+            "-c", "core.askPass=echo"] + list(args)
+
+
 def _git_run(git, args, repo_dir, timeout=120):
     """跑一条 git 命令，返回 (returncode, stdout, stderr)。
 
     统一：CREATE_NO_WINDOW（不弹黑窗）、UTF-8 解码 + errors=replace
-    （路径可能含中文，GBK/UTF-8 混排也不能崩）。
+    （路径可能含中文，GBK/UTF-8 混排也不能崩）、禁止凭据弹窗（见
+    _git_no_prompt_env）。
     """
     import subprocess as _sp
-    r = _sp.run([git] + list(args), cwd=repo_dir,
+    r = _sp.run(_git_cmd(git, args), cwd=repo_dir,
                 capture_output=True, text=True, encoding="utf-8",
                 errors="replace", timeout=timeout,
+                env=_git_no_prompt_env(),
                 creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0))
     return r.returncode, (r.stdout or "").strip(), (r.stderr or "").strip()
 

@@ -11,8 +11,15 @@
 ⚠ 已知环境限制：同一进程内 QLocalSocket 的 waitFor* 不会派发
    QLocalServer 的 newConnection 槽，所以"进程内收 activate"测不出来。
    这不是产品缺陷（跨进程实测通过），故不在本文件断言。
+
+⚠ 锁目录隔离（2026-10-26）：本测试改判的是**锁的逻辑**，不是"用户现在有没有开着启动器"。
+   原先它直接用真实的 LAUNCHER_DIR/.cache/launcher.lock，于是只要作者自己开着
+   启动器跑回归，第一个 guard 就抢不到锁（被那个真实例占着），4 条断言全红——
+   看起来像"单实例功能回归了"，其实功能好得很，是测试与运行中的实例抢同一把锁。
+   现在把 LAUNCHER_DIR 指到临时目录，锁路径随之隔离，判定只取决于被测代码本身。
+   思路同"网络类冒烟测试要能区分'我坏了'和'网/配额不行'"：环境问题不该让回归变红。
 """
-import os, sys, io
+import os, sys, io, tempfile, shutil
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
@@ -21,6 +28,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import launcher
 from PySide6.QtCore import QCoreApplication
 from PySide6.QtNetwork import QLocalServer
+
+# 必须在任何 SingleInstanceGuard 实例化之前改，锁路径是调用时才解析的
+_ISO_DIR = tempfile.mkdtemp(prefix="si_iso_")
+launcher.LAUNCHER_DIR = _ISO_DIR
+launcher.LAUNCHER_CACHE_DIR = os.path.join(_ISO_DIR, ".cache")
 
 app = QCoreApplication.instance() or QCoreApplication(sys.argv)
 OK, FAIL = [], []
@@ -89,4 +101,5 @@ for f in FAIL:
     print("   FAILED:", f)
 sys.stdout.flush()
 sys.stderr.flush()
+shutil.rmtree(_ISO_DIR, ignore_errors=True)
 os._exit(1 if FAIL else 0)
