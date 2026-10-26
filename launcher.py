@@ -752,14 +752,108 @@ def fetch_release_changelogs(key, owner, repo):
     return out
 
 
+# 进度行里出现这些字样时，说明**只有已下载量、没有总量**（dulwich 的 Receiving 阶段
+# 就是这样：`Receiving objects: 3.20 MiB | 1.10 MiB/s`，见 dulwich/client.py:1177），
+# 算不出真实百分比 → UI 显示忙碌态，而不是编一个假的百分比。
+_PROGRESS_BUSY_RE = re.compile(
+    r"(Receiving objects|Compressing objects|Counting objects)", re.I)
+
+
 def parse_git_progress(line):
-    """从 dulwich / git 进度文本解析出百分比（取最后一个 N%）。无则 -1。"""
+    """从 dulwich / git 进度文本解析出 (百分比, 状态文字)。解析不出返回 -1。
+
+    2026-10-27 修复（用户反馈「进度条 100% 了，下面还在跑 generating index: 1365/1366，
+    这进度是假的吧」）：
+
+    dulwich 一次 fetch 会输出**两种格式**的进度：
+      ① `Receiving objects: 87% (1200/1380), 3.2 MiB | 1.1 MiB/s`  ← 带百分号
+      ② `generating index: 1365/1366`                              ← **只有分数，没有百分号**
+           （见 dulwich/object_store.py:2136，接收完 pack 后建索引的阶段）
+
+    旧实现只认 ``(\\d+)%``，于是 ② 全解析成 -1。而 UI 层遇到 -1 只改文字、
+    **不动进度条**，结果进度条停在接收阶段的 100%，文字却还在涨 —— 看起来像造假。
+
+    但光把 ② 直接换算成百分比也不够：那样进度条会从 100% **掉回 0% 再涨到 99%**，
+    倒退更让人困惑。所以这里做**阶段分段映射**，保证单调递增：
+
+        阶段                    进度条区间    说明
+        Counting / Compressing  0 ~ 10      服务端准备（dulwich 一般没有）
+        Receiving objects       10 ~ 85      真正在下载 pack（最耗时）
+        Resolving deltas        85 ~ 90
+        generating index        90 ~ 99      接收完建索引（用户截图正是在这一段）
+        Updating files / 完成   99 ~ 100     写工作区
+        认不出的行              -1           UI 只更新文字，不动进度条
+
+    各阶段的百分号/分数在本区间内做线性插值，因此整体仍是一路向上。
+    """
     if isinstance(line, bytes):
         line = line.decode("utf-8", "replace")
-    pct = -1
-    for m in re.finditer(r"(\d+)%", line):
-        pct = int(m.group(1))
-    return pct, (line or "").strip()
+    text = (line or "").strip()
+    raw = line or ""
+
+    def _lerp(lo, hi, cur, total):
+        """把 cur/total 线性映射到 [lo, hi] 区间（含端点收边）。"""
+        if total <= 0:
+            return lo
+        cur = max(0, min(cur, total))
+        return int(lo + (hi - lo) * cur / total)
+
+    def _local_pct():
+        """取本行自带的进度：优先百分号，其次纯分数。返回 (cur, total) 或 None。"""
+        # ① 百分号形式
+        m = re.search(r"(\d+)%", raw)
+        if m:
+            return int(m.group(1)), 100
+        # ② 分数形式。必须排除速率串（`1/2 MiB`、`3/4 files/s` 之类）：
+        #    真正的进度行形如 `generating index: 1365/1366`，
+        #    数字后直接是行尾/`\r`/逗号，不会紧跟单位。
+        m = re.search(r"(?<![\d.])(\d+)\s*/\s*(\d+)(?![\d.])\s*(?:$|[\r,;)])", raw)
+        if m:
+            cur, total = int(m.group(1)), int(m.group(2))
+            if total > 0 and 0 <= cur <= total:
+                return cur, total
+        return None
+
+    low = text.lower()
+    local = _local_pct()
+
+    # ---- 按阶段映射到单调区间 ----
+    if "generating index" in low:
+        # 接收已完成，正在建索引（用户截图卡在这一段）
+        if local:
+            return _lerp(90, 99, *local), text
+        return 90, text
+    if "updating files" in low or "checkout" in low or "writing" in low:
+        if local:
+            return _lerp(99, 100, *local), text
+        return 99, text
+    if "resolving deltas" in low:
+        if local:
+            return _lerp(85, 90, *local), text
+        return 85, text
+    if "receiving" in low:
+        if local:
+            return _lerp(10, 85, *local), text
+        # 无总量（dulwich 实时只报 MiB 与速率）→ -1，UI 走忙碌态，
+        # 绝不硬编一个 10% 假装有进度
+        return -1, text
+    if "compressing" in low:
+        # Counting → Compressing → Receiving 是 dulwich 的实际顺序，
+        # 三段首尾必须严丝合缝，否则中间会倒退（测试守着单调性）：
+        #   Counting [0,5] → Compressing [5,10] → Receiving [10,85]
+        if local:
+            return _lerp(5, 10, *local), text
+        return -1, text
+    if "counting" in low:
+        if local:
+            return _lerp(0, 5, *local), text
+        return -1, text
+
+    # ---- 认不出的行：只给百分比（若有），不做阶段映射 ----
+    if local:
+        cur, total = local
+        return max(0, min(100, _lerp(0, 100, cur, total))), text
+    return -1, text
 
 
 def _mirror_fetch_sources(git_url, repo_dir, git):
@@ -9279,6 +9373,7 @@ class UpdateDialog(QDialog):
         self.versions = versions  # 从新到旧
         self.current = current
         self._worker = None
+        self._busy = False   # 进度条是否处于忙碌态（不确定进度）
 
         self.setWindowTitle(f"更新 {app['display']}")
         self.setMinimumWidth(480)
@@ -9382,16 +9477,41 @@ class UpdateDialog(QDialog):
         self._worker.start()
 
     def on_progress(self, pct, text):
+        """进度回调。pct<0 表示这条只是状态文字（不动进度条）。
+
+        2026-10-27 加**单调保护**：dulwich 会在阶段间穿插输出，偶尔出现
+        `Receiving 85%` 之后又来一条更早阶段的 `Counting 3%`；直接 setValue
+        会让进度条肉眼可见地倒退，用户会以为出错了。进度条只许往前不走回头路。
+        （真正完成时的 100% 由 on_done 设置，不受此限。）
+        """
+        # 忙碌态（不确定进度）：dulwich 的 Receiving 阶段**只报已下载 MiB 与速率、
+        # 不报总量**（见 dulwich/client.py:1177 `_report_progress`），
+        # 所以这一段根本算不出真实百分比。宁可显示"在动但不知何时完"的忙碌态，
+        # 也不假装停在 10% 或编一个假百分比——后者正是用户这次怀疑"进度造假"的由来。
+        #
+        # 注意条件里带 pct < 0：`Receiving objects: 100% (1380/1380), done.`
+        # 那种**有百分比**的收尾行仍走正常进度，不能也被判成忙碌态。
+        if text and pct < 0 and _PROGRESS_BUSY_RE.search(text):
+            if not self._busy:
+                self._busy = True
+                self.bar.setRange(0, 0)      # Qt 的忙碌态：来回滚动
+            self.status.setText(text[:80])
+            return
+        if self._busy:
+            self._busy = False
+            self.bar.setRange(0, 100)        # 有确定进度了，切回正常模式
         if pct >= 0:
-            self.bar.setValue(pct)
-            self.status.setText(
-                (text[:80] if text else "") or f"下载中… {pct}%"
-            )
+            cur = self.bar.value()
+            self.bar.setValue(max(cur, pct))
+            self.status.setText((text[:80] if text else "") or f"下载中… {pct}%")
         else:
             self.status.setText(text or "下载中…")
 
     def on_done(self, local_dir):
         target = _normalize_tag(self.versions[self.combo.currentIndex()])
+        if self._busy:
+            self._busy = False
+            self.bar.setRange(0, 100)
         self.bar.setValue(100)
         self.status.setText(
             f"下载完成，正在更新到原启动器 working/（{target}）…"
