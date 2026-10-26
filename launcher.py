@@ -10980,6 +10980,116 @@ def _wish_voted():
     return _load_json(_wish_voted_path())
 
 
+# ===== 「我想要」全网票数（v1.3.1）=====
+# 卡片上原来只显示本机点击数，用户会误读成"没人想要"。现在把服务端按匿名 ID
+# 去重后的全网汇总拉回来展示（汇总只有 key→数字，无任何用户数据，公开接口）。
+
+WISH_TOTALS_TTL = 6 * 3600   # 缓存新鲜度（秒）；过期仍可展示，只是不再当"刚拉的"
+
+
+def _wish_totals_path():
+    return os.path.join(_cache_dir(), "wish_totals.json")
+
+
+def _load_wish_totals():
+    """上次成功拉取的全网票数（可能过期/为空——离线兜底用，绝不抛异常）。"""
+    try:
+        data = _load_json(_wish_totals_path())
+        wishes = data.get("wishes") if isinstance(data, dict) else None
+        return wishes if isinstance(wishes, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_wish_totals(wishes):
+    _save_json(_wish_totals_path(),
+               {"fetched_at": int(time.time()), "wishes": wishes})
+
+
+def _telemetry_origin():
+    """从上报端点推服务端 origin（`https://x/collect` → `https://x`）。
+
+    没开遥测 / 端点为空（用户选择彻底不上报）→ 返回 ""：那就**读也不去读**，
+    与"没开遥测就是空操作"同一条纪律（上报与读取都算跟那台服务器打交道）。
+    """
+    ep = str(_telemetry_cfg().get("endpoint") or "").strip()
+    if not ep or not telemetry_enabled():
+        return ""
+    m = re.match(r"(https?://[^/\s]+)", ep)
+    return m.group(1) if m else ""
+
+
+def _wish_totals_url():
+    origin = _telemetry_origin()
+    return origin + "/wish/totals" if origin else ""
+
+
+def _wish_totals_http_get(url):
+    """拉汇总的 HTTP 层，独立出来给测试 monkeypatch。返回 (status, text)。"""
+    req = urllib.request.Request(url, headers={"User-Agent": "game-launcher-hub"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return r.status, r.read().decode("utf-8", "replace")
+
+
+def parse_wish_totals(text):
+    """解析 /wish/totals 响应 → {key: int}。坏数据一律空 dict，宁可显示 0。"""
+    try:
+        data = json.loads(text)
+        wishes = data.get("wishes")
+        if not isinstance(wishes, dict):
+            return {}
+        out = {}
+        for k, v in wishes.items():
+            try:
+                n = int(v)
+            except (TypeError, ValueError):
+                continue
+            if n > 0 and isinstance(k, str) and k:
+                out[k[:64]] = n
+        return out
+    except Exception:
+        return {}
+
+
+def merge_wish_counts(server, local):
+    """展示值 = max(全网汇总, 本机计数)。
+
+    为什么取 max 而不是相加：本机投过且遥测开着时，那一票**已经在**汇总里，
+    相加会重复计；遥测关着时汇总里没有这一票，max 保证至少显示本机自己的。
+    （测试守着这条：把这里改回"只显示本机"会让 wish_totals_test 变红。）
+    """
+    out = {}
+    server = server if isinstance(server, dict) else {}
+    local = local if isinstance(local, dict) else {}
+    for k in set(server) | set(local):
+        try:
+            out[k] = max(int(server.get(k, 0) or 0), int(local.get(k, 0) or 0))
+        except Exception:
+            out[k] = 0
+    return out
+
+
+class WishTotalsWorker(QThread):
+    """拉一次「我想要」全网汇总。失败/未开遥测/端点为空 → 静默，不影响界面。"""
+
+    totals_ok = Signal(dict)
+
+    def run(self):
+        try:
+            url = _wish_totals_url()
+            if not url or not telemetry_enabled():
+                return
+            status, text = _wish_totals_http_get(url)
+            if status != 200:
+                return
+            wishes = parse_wish_totals(text)
+            if wishes:
+                _save_wish_totals(wishes)
+                self.totals_ok.emit(wishes)
+        except Exception:
+            pass   # 拉不到就继续用本地计数（或上次缓存），绝不为这个弹窗
+
+
 def _parse_last_page(link_header):
     """从 GitHub 分页响应的 Link 头取最后一页页码（per_page=1 时即总条数）。
 
@@ -11820,6 +11930,7 @@ class ReservedCard(QWidget):
             "border-radius:8px;}")
         self.app = app
         self._on_vote = on_vote
+        self._votes = int(votes or 0)
         key = app.get("key", "")
 
         root = QVBoxLayout(self)
@@ -11849,7 +11960,8 @@ class ReservedCard(QWidget):
         self.vote_btn.setCursor(Qt.PointingHandCursor)
         self.vote_btn.clicked.connect(lambda: self._vote())
         row.addWidget(self.vote_btn)
-        row.addWidget(CaptionLabel("%d 人想要" % votes))
+        self._votes_label = CaptionLabel("%d 人想要" % self._votes)
+        row.addWidget(self._votes_label)
         row.addStretch(1)
         site = (app.get("website") or "").strip()
         if site:
@@ -11868,6 +11980,9 @@ class ReservedCard(QWidget):
             pass
         self.vote_btn.setText("已想要")
         self.vote_btn.setEnabled(False)
+        # 票数立刻 +1：点了没反应会被当成"按钮是假的"（用户真问过进度条同样的事）
+        self._votes += 1
+        self._votes_label.setText("%d 人想要" % self._votes)
         if self._on_vote is not None:
             self._on_vote(key)
 
@@ -11903,6 +12018,8 @@ class ReservedSection(QWidget):
         super().__init__(parent)
         self._apps = list(apps or [])
         self._page = self.PAGE_SIZE
+        # 全网票数：先用上次缓存（可能过期，有总比 0 强），再异步刷新
+        self._totals = _load_wish_totals()
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -11930,13 +12047,28 @@ class ReservedSection(QWidget):
 
         note = CaptionLabel(
             "说明：这些助手尚未完成适配，暂不提供下载安装。点「我想要」可投票，"
-            "票数高的优先安排适配。左边的数字只统计本机点击；若在设置页开启了遥测，"
-            "投票还会匿名汇总给开发者（只含助手名与随机匿名 ID，不含任何本机信息）。"
+            "票数高的优先安排适配。「N 人想要」是全体用户的匿名投票汇总"
+            "（每台机器每项只计一票；未开启统计时只显示本机票数，开启后本机投票"
+            "也会匿名汇总上去——只含助手名与随机匿名 ID，不含任何本机信息）。"
             "MirrorChyan 的依赖组件（MaaFramework、dotnet10 等）是其他助手的运行依赖"
             "而非独立应用，故未列入。")
         note.setWordWrap(True)
         root.addWidget(note)
 
+        self.rebuild()
+        self._start_totals_worker()
+
+    def _start_totals_worker(self):
+        """拉一次全网汇总（每轮应用生命周期一次）。没开统计就不跟服务器说话。"""
+        if not _wish_totals_url() or not telemetry_enabled():
+            return
+        self._totals_worker = WishTotalsWorker(self)
+        self._totals_worker.totals_ok.connect(self._on_totals)
+        self._totals_worker.start()
+
+    def _on_totals(self, wishes):
+        """汇总到了：换数据重建（跨线程信号，Qt 自动排队回 UI 线程）。"""
+        self._totals = dict(wishes or {})
         self.rebuild()
 
     def _schedule_rebuild(self):
@@ -11957,7 +12089,8 @@ class ReservedSection(QWidget):
             self.groups_box.addWidget(CaptionLabel("没有匹配的助手"))
             return
         shown = items[:self._page]
-        counts, voted = _wish_counts(), _wish_voted()
+        counts = merge_wish_counts(self._totals, _wish_counts())
+        voted = _wish_voted()
         for eco in _ECOSYSTEM_ORDER:
             group = [a for a in shown
                      if (a.get("ecosystem") or "standalone") == eco]
@@ -11987,7 +12120,8 @@ class ReservedSection(QWidget):
             self.groups_box.addWidget(more)
 
     def _sorted(self):
-        counts = _wish_counts()
+        # 排序用合并后的票数（全网汇总 + 本机），与卡片显示同一数据源
+        counts = merge_wish_counts(self._totals, _wish_counts())
         return sorted(
             self._apps,
             key=lambda a: (-int(counts.get(a.get("key", ""), 0) or 0),
