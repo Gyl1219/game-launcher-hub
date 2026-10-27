@@ -96,44 +96,56 @@ chk("③ 榜单包在横向滚动区里（窄窗保底的关键）",
 chk("③ 窄窗保底宽 = 320×5 + 间距（≈1650，用户定稿）",
     page.rank_rail._inner.minimumWidth() == 320 * 5 + 12 * 4,
     page.rank_rail._inner.minimumWidth())
-chk("③ 单卡定高且整行统一（五块同高，随倍率走）",
-    len({b.height() for b in page.rank_rail._boards}) == 1
-    and abs(page.rank_rail.board_activity.height()
-            - round(launcher.RankBoard.CARD_H * 320 / 272.0)) <= 1,
-    [b.height() for b in page.rank_rail._boards])
-chk("③ 卡内垂直滚动存在（溢出不撑爆页面）",
-    all(b._rows_scroll.widgetResizable() for b in page.rank_rail._boards))
-chk("③ 字号倍率按【实际宽/272】动态（320px→1.176，用户定稿公式）",
-    all(abs(b._s - 320 / 272.0) < 0.01 for b in page.rank_rail._boards),
-    [round(b._s, 3) for b in page.rank_rail._boards])
-chk("③ 圆角浮层容器样式", page.rank_rail.board_activity.objectName() == "rankCard")
+cards = page.rank_rail._cards          # 卡片外壳列表（内部成员依赖，见 _RankCard 注释）
+boards = [c._board for c in cards]     # 板体（内部成员依赖）
+chk("③ 独立卡片外壳（rankCard）×5", len(cards) == 5
+    and all(c.objectName() == "rankCard" for c in cards))
+chk("③ 单卡定高且整行统一（五卡同高，随倍率走）",
+    len({c.height() for c in cards}) == 1
+    and all(abs(c.height() - round(launcher.RankBoard.CARD_H
+        * min(1.7, max(1.0, c.width() / 272.0)))) <= 1 for c in cards),
+    [c.height() for c in cards])
+chk("③ 卡内垂直滚动存在（溢出不撑爆页面；经壳访问板体内部成员）",
+    all(c._board._rows_scroll.widgetResizable() for c in cards))
+chk("③ 字号倍率按【外壳实际宽/272】动态（用户定稿公式）",
+    all(abs(b._s - min(1.7, max(1.0, c.width() / 272.0))) < 0.01
+        for b, c in zip(boards, cards)),
+    [round(b._s, 3) for b in boards])
+chk("③ 圆角浮层容器样式（外壳 objectName=rankCard）",
+    all(c.objectName() == "rankCard" for c in cards))
+chk("③ 弱阴影已挂载（构造一次，resize 不重建）",
+    all(c.graphicsEffect() is not None for c in cards))
+chk("③ 外壳头部标题文本正确",
+    [c._title.text() for c in cards] ==
+    ["活跃度", "星标数", "我的使用", "下载榜", "预约榜"],
+    [c._title.text() for c in cards])
 chk("④ 卡片网格存在（3 张官方卡）", page._card_grid.count() == 3, page._card_grid.count())
 
 print("\n--- 1b) 区间自适应：min320 / max420 / 富余转间距（用户定稿）---")
 # 宽窗：卡片顶到 420 上限，富余全部进卡片间的弹簧
 page.resize(2400, 900)
 app.processEvents()
-widths = [b.width() for b in page.rank_rail._boards]
+widths = [c.width() for c in cards]
 chk("宽窗：全部卡片到 420 上限", all(w == 420 for w in widths), widths)
 chk("宽窗：倍率 = 420/272 ≈ 1.54",
-    all(abs(b._s - 420 / 272.0) < 0.01 for b in page.rank_rail._boards),
-    [round(b._s, 3) for b in page.rank_rail._boards])
-chk("宽窗：定高随倍率走（= round(182×1.54)）",
-    len({b.height() for b in page.rank_rail._boards}) == 1
-    and abs(page.rank_rail.board_activity.height()
+    all(abs(b._s - 420 / 272.0) < 0.01 for b in boards),
+    [round(b._s, 3) for b in boards])
+chk("宽窗：定高随倍率走（= round(182×1.54)，无封顶）",
+    len({c.height() for c in cards}) == 1
+    and abs(cards[0].height()
             - round(launcher.RankBoard.CARD_H * 420 / 272.0)) <= 1,
-    [b.height() for b in page.rank_rail._boards])
+    [c.height() for c in cards])
 _spacer = page.rank_rail._inner.layout().itemAt(1).geometry().width()
 chk("宽窗：富余转为卡片间距（弹簧 > 12px 初始值）", _spacer > 12, _spacer)
 # 中间档：卡片落在 320~420 区间内
 page.resize(1900, 900)
 app.processEvents()
-mid = [b.width() for b in page.rank_rail._boards]
+mid = [c.width() for c in cards]
 chk("中档窗口：卡片在 320~420 区间内等分", all(320 <= w <= 420 for w in mid), mid)
 # 窄窗：全部压到 320 下限，横向滚动条出现
 page.resize(1300, 900)
 app.processEvents()
-narrow = [b.width() for b in page.rank_rail._boards]
+narrow = [c.width() for c in cards]
 chk("窄窗：卡片全部压到 320 下限", all(w == 320 for w in narrow), narrow)
 chk("窄窗：外层横向滚动条出现",
     page.rank_rail._scroll.horizontalScrollBar().isVisible()
