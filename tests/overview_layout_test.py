@@ -115,6 +115,8 @@ chk("③ 圆角浮层容器样式（外壳 objectName=rankCard）",
     all(c.objectName() == "rankCard" for c in cards))
 chk("③ 弱阴影已挂载（构造一次，resize 不重建）",
     all(c.graphicsEffect() is not None for c in cards))
+chk("③ 卡片 QSS 挂在外壳上（上轮漏搬的回归点：壳无样式=视觉零变化）",
+    all("rgba(30,34,42,0.92)" in c.styleSheet() for c in cards))
 chk("③ 外壳头部标题文本正确",
     [c._title.text() for c in cards] ==
     ["活跃度", "星标数", "我的使用", "下载榜", "预约榜"],

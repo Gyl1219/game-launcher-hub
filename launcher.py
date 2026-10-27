@@ -12051,6 +12051,14 @@ class _RankCard(QFrame):
     def __init__(self, title, subtitle, board, parent=None):
         super().__init__(parent)
         self.setObjectName("rankCard")
+        # QSS 背景在 QWidget/QFrame 子类上默认不画（paintEvent 走默认实现），
+        # 必须显式声明 styled background，否则卡片壳视觉上"完全没变化"
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        # 卡片 QSS 挂在外壳上（上一轮漏搬：RankBoard 瘦身删了样式，
+        # 外壳没接住 → 榜单视觉零变化，就是用户报告的那个"没变化"）
+        self.setStyleSheet(
+            "QWidget#rankCard{background-color:rgba(30,34,42,0.92);"
+            "border-radius:12px;}")
         self._board = board
 
         root = QVBoxLayout(self)
