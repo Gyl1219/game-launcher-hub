@@ -93,9 +93,19 @@ chk("③ 五榜横排存在", all(hasattr(page.rank_rail, a) for a in
 chk("③ 榜单包在横向滚动区里（窄窗保底的关键）",
     page.rank_rail._scroll.widgetResizable() is True
     and page.rank_rail._scroll.widget() is page.rank_rail._inner)
-chk("③ 窄窗保底宽 = 240×5 + 间距",
-    page.rank_rail._inner.minimumWidth() == 240 * 5 + 10 * 4,
+chk("③ 窄窗保底宽 = 320×5 + 间距（≈1650，用户定稿）",
+    page.rank_rail._inner.minimumWidth() == 320 * 5 + 12 * 4,
     page.rank_rail._inner.minimumWidth())
+chk("③ 单卡定高且整行统一（五块同高）",
+    len({b.height() for b in page.rank_rail._boards}) == 1
+    and page.rank_rail.board_activity.height() == launcher.RankBoard.CARD_H,
+    [b.height() for b in page.rank_rail._boards])
+chk("③ 卡内垂直滚动存在（溢出不撑爆页面）",
+    all(b._rows_scroll.widgetResizable() for b in page.rank_rail._boards))
+chk("③ 固定倍率 1.1（不随窗口宽度变化）",
+    all(b._s == 1.1 for b in page.rank_rail._boards),
+    [b._s for b in page.rank_rail._boards])
+chk("③ 圆角浮层容器样式", page.rank_rail.board_activity.objectName() == "rankCard")
 chk("④ 卡片网格存在（3 张官方卡）", page._card_grid.count() == 3, page._card_grid.count())
 
 print("\n--- 2) 榜单行点击分流：官方→详情信号；预约→官网 ---")
