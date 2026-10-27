@@ -51,8 +51,8 @@ from PySide6.QtGui import (QIcon, QPixmap, QDesktopServices, QImage, QPainter,
 from PySide6.QtWidgets import (
     QApplication, QWidget, QDialog, QHBoxLayout, QVBoxLayout, QGridLayout,
     QMessageBox, QLabel, QScrollArea, QTextEdit, QProgressBar, QProgressDialog,
-    QStackedWidget, QCheckBox, QFileDialog, QPushButton,
-    QGraphicsScene, QGraphicsPixmapItem, QGraphicsBlurEffect,
+    QStackedWidget, QCheckBox, QFileDialog, QPushButton, QSizePolicy,
+    QSpacerItem, QGraphicsScene, QGraphicsPixmapItem, QGraphicsBlurEffect,
 )
 from qfluentwidgets import (
     setTheme, Theme, CardWidget, IconWidget, StrongBodyLabel,
@@ -11905,18 +11905,18 @@ class RankBoard(QWidget):
 
     row_clicked = Signal(str)
 
-    # 横排基准字号固定倍率（用户定稿）：不再随窗口宽度动态缩放
-    BASE_SCALE = 1.1
-    MAX_SCALE = 1.7           # apply_scale 的上限夹具（保留兼容既有调用）
-    # 单卡固定高度（用户定稿）：整行榜单高度统一，条目溢出走卡内垂直滚动
-    CARD_H = 200
+    # 字号倍率按【卡片实际宽 / BASE_W=272】动态缩放（用户定稿），夹 1.0~1.7
+    BASE_W = 272
+    MAX_SCALE = 1.7
+    # 单卡定高基准（1.0 倍）：实际高 = round(CARD_H × scale)，整行统一，
+    # 条目溢出走卡内垂直滚动
+    CARD_H = 182
 
     def __init__(self, title, subtitle, apps_by_key, parent=None):
         super().__init__(parent)
         self._apps_by_key = apps_by_key   # key -> (显示名, 图标相对路径)
-        self._expanded = False
         self._rows = []                   # [(key, 名称, 图标, 指标文案)]
-        self._s = self.BASE_SCALE
+        self._s = 1.0                      # 真实倍率由首次 Resize 按实际宽算
         # 展开时最多显示的行数（预约榜条目多，None = 不限；溢出走卡内滚动）
         self.expanded_limit = None
 
@@ -11970,29 +11970,53 @@ class RankBoard(QWidget):
         self.setFixedHeight(self.CARD_H)
 
     def apply_scale(self, s):
-        """设置倍率并重绘（横排定稿：固定 1.1，由 RankRail 初始化时设一次）。"""
+        """设置倍率并重绘 + 同步标题字号与根布局边距（倍率由 RankRail 按宽算）。"""
         s = max(1.0, min(self.MAX_SCALE, s))
         if s == self._s:
             return
         self._s = s
+        self._apply_scale_style()
         self._render()
+
+    def _apply_scale_style(self):
+        s = self._s
+        fs = max(12, int(round(12 * s)))       # 正文/指标字号
+        hs = max(13, int(round(13 * s)))       # 标题字号
+        self._title.setStyleSheet(
+            "font-size:%dpx; font-weight:600;" % hs)
+        # 副标题/占位的颜色要写在这里：setStyleSheet 是整体替换，
+        # 只给字号会把 __init__ 里的颜色冲掉
+        self._sub.setStyleSheet("font-size:%dpx; color:#8a8d96;")
+        self.empty_lbl.setStyleSheet("font-size:%dpx; color:#8a8d96;")
+        lay = self.layout()
+        m = max(8, int(round(8 * s)))
+        lay.setContentsMargins(m, m, m, m)
+        lay.setSpacing(max(4, int(round(4 * s))))
+        self.rows_box.setSpacing(max(3, int(round(3 * s))))
 
     def set_rows(self, rows, placeholder="暂无数据"):
         """rows: [(key, 指标文案)]，调用方排好序；空列表显示占位文案。"""
+        # 占位文案要记住：apply_scale 的重渲染走 _render() 无参调用，
+        # 不记住的话自定义占位（"虚位以待"/"数据收集中"）会被打回默认
+        self._placeholder = placeholder
         self._rows = []
         for key, metric in rows:
             name, icon = self._apps_by_key.get(key, (key, ""))
             self._rows.append((key, name, icon, metric))
         self._render(placeholder)
 
-    def _render(self, placeholder="暂无数据"):
+    def _render(self, placeholder=None):
+        if placeholder is None:
+            placeholder = getattr(self, "_placeholder", "暂无数据")
         while self.rows_box.count():
             it = self.rows_box.takeAt(0)
             w = it.widget()
             if w is not None:
                 w.deleteLater()
-        shown = self._rows if self._expanded else self._rows[:3]
-        if self._expanded and self.expanded_limit:
+        # 全部行直接显示（用户反馈"星数榜怎么只有3个"）：卡内滚动接管溢出；
+        # expanded_limit 仅作兜底上限（预约榜 12 行）
+        shown = list(self._rows)
+        if self.expanded_limit:
             shown = shown[:self.expanded_limit]
         if not shown:
             self.empty_lbl.setText(placeholder)
@@ -12007,8 +12031,9 @@ class RankBoard(QWidget):
         for i, (key, name, icon, metric) in enumerate(shown):
             row = _ClickableRow(key)
             h = QHBoxLayout(row)
-            h.setContentsMargins(2, 5, 2, 5)   # 行高增加留白
-            h.setSpacing(12)                   # 名次 / 名称 / 数值拉开间距
+            h.setContentsMargins(2, max(4, int(round(5 * s))),
+                                 2, max(4, int(round(5 * s))))
+            h.setSpacing(max(12, int(round(12 * s))))   # 名次/名称/数值拉开间距
             rank = QLabel(str(i + 1))
             rank.setFixedWidth(rw)
             rank.setStyleSheet("font-size:%dpx;" % fs + (
@@ -12034,13 +12059,6 @@ class RankBoard(QWidget):
             h.addWidget(ml)
             row.clicked.connect(self.row_clicked)
             self.rows_box.addWidget(row)
-
-    def mouseReleaseEvent(self, e):
-        # 点标题展开/收起（Top3 <-> 全部）
-        self._expanded = not self._expanded
-        self._render()
-        super().mouseReleaseEvent(e)
-
 
 class RankRail(QWidget):
     """五块小榜的横排容器：活跃度 / 星标 / 我的使用 / 下载榜 / 预约榜。
@@ -12094,8 +12112,16 @@ class RankRail(QWidget):
         # 预约榜展开会列出全部投票项（几十行），横排里高度有上限 → 展开也只
         # 放前 12 行，避免把整页撑爆；其它榜条目少，展开不设限
         self.board_wish.expanded_limit = 12
-        for b in self._boards:
+        for i, b in enumerate(self._boards):
+            if i:
+                # 卡片间的弹性弹簧：卡片到 420 上限后，多余空间进这里
+                # （用户定稿：多余空间转为卡片之间间距）
+                h.addSpacerItem(QSpacerItem(12, 0, QSizePolicy.Expanding,
+                                            QSizePolicy.Fixed))
             h.addWidget(b, 1)
+            b.installEventFilter(self)            # 宽度变化 → 动态倍率（见 eventFilter）
+            b.setMinimumWidth(self.BOARD_MIN_W)   # 区间下限
+            b.setMaximumWidth(420)                # 区间上限
             b.row_clicked.connect(self.row_clicked)
         inner.setMinimumWidth(self.BOARD_MIN_W * 5 + 12 * 4)   # 5 块 ≈1650
         self._inner = inner
@@ -12104,11 +12130,9 @@ class RankRail(QWidget):
         self.set_github({})
         self.refresh_usage()
         self.set_wish_rows({})
-        # 横排基准字号固定倍率 1.1（用户定稿）——不再随窗口宽度动态缩放
+        # 初始倍率按最小宽 320 预设；进入视口后由 eventFilter 按实际宽校正
         for b in self._boards:
-            b.apply_scale(RankBoard.BASE_SCALE)
-        # 单卡定高 → 外层滚动区高度 = 卡高 + 横向滚动条预留，整行高度统一
-        self._scroll.setFixedHeight(RankBoard.CARD_H + 14)
+            b.apply_scale(self.BOARD_MIN_W / float(RankBoard.BASE_W))
 
     def set_wish_rows(self, counts):
         """预约榜：counts 为 {key: 合并票数}；只显示 ≥1 票的，按票数降序。
@@ -12127,6 +12151,32 @@ class RankRail(QWidget):
         self.board_wish.set_rows(
             [(k, "%d 票" % v) for v, k in rows],
             placeholder="虚位以待，快去投一票")
+
+    def eventFilter(self, obj, event):
+        """卡片宽度变化 → 字号按【实际宽 / 272】动态缩放 + 定高随倍率走。
+
+        倍率夹 1.0~1.7（320px→1.18、420px→1.54）；s 不变时早退，
+        防 setFixedHeight 触发的新 Resize 造成事件风暴。
+        """
+        if obj in self._boards and event.type() == QEvent.Resize:
+            b = obj
+            try:
+                if b.width() > 0:
+                    b.apply_scale(b.width() / float(RankBoard.BASE_W))
+                    h = min(460, int(round(RankBoard.CARD_H * b._s)))
+                    if b.height() != h:
+                        b.setFixedHeight(h)
+            except Exception:
+                pass
+            self._sync_scroll_height()
+        return super().eventFilter(obj, event)
+
+    def _sync_scroll_height(self):
+        """外层滚动区高度 = 卡高 + 横向滚动条预留 14px（整行高度统一）。"""
+        try:
+            self._scroll.setFixedHeight(self.board_activity.height() + 14)
+        except Exception:
+            pass
 
     def set_github(self, repos):
         """repos: key -> {"stars": n, "commits30d": n}；缺 key / 缺字段都容忍。"""

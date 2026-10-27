@@ -159,24 +159,15 @@ act = rail.board_activity._rows
 chk("活跃度按提交数降序", [r[0] for r in act] == ["ok-ww", "ok-nte", "maa-end"])
 chk("星标按数量降序", [r[0] for r in rail.board_stars._rows] == ["ok-ww", "maa-end", "ok-nte"])
 chk("未知 key 被过滤", all(r[0] != "ghost" for r in rail.board_stars._rows))
-chk("Top3 默认只显示 3 行", rail.board_activity.rows_box.count() == 3)
-
-rail.board_activity._expanded = True
-rail.board_activity._render()
-chk("展开后显示全部行", rail.board_activity.rows_box.count() == 3)  # 只有 3 个有数据
-rail.board_activity._expanded = False   # 展开状态跨数据刷新保持，这里手动收起再测默认态
-rail.board_activity._render()
+# 2026-10-28 视觉规格：Top3 折叠退役 —— 全部行直接显示，溢出走卡内滚动
+chk("全部行直接显示（不再 Top3 折叠）", rail.board_activity.rows_box.count() == 3)
 
 more = {k: {"stars": i * 10, "commits30d": i * 10} for i, k in
         enumerate(["ok-nte", "ok-ww", "ok-end-field", "whimbox",
                    "onedragon-zzz", "maa-end"])}
 rail.set_github(more)
-chk("6 个都有数据时默认仍只显示 3 行", rail.board_activity.rows_box.count() == 3)
-rail.board_activity._expanded = True
-rail.board_activity._render()
-chk("展开后显示 6 行", rail.board_activity.rows_box.count() == 6)
-rail.board_activity._expanded = False
-rail.board_activity._render()
+chk("6 个都有数据时 6 行全显（溢出由卡内滚动接管）",
+    rail.board_activity.rows_box.count() == 6)
 
 # 空数据 → 占位文案
 rail.set_github({})
