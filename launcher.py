@@ -11072,6 +11072,34 @@ def parse_download_totals(text):
         return {}
 
 
+def parse_stats_totals(text):
+    """解析 /stats/totals → {repo_slug: {"downloads","stars","commits30d"}}。
+
+    任一维缺失记 None；全空的条目丢弃。坏数据一律空 dict。
+    """
+    try:
+        data = json.loads(text)
+        stats = data.get("stats")
+        if not isinstance(stats, dict):
+            return {}
+        out = {}
+        for k, v in stats.items():
+            if not (isinstance(k, str) and isinstance(v, dict)):
+                continue
+            def _i(x):
+                try:
+                    return int(x)
+                except (TypeError, ValueError):
+                    return None
+            d, s, c = _i(v.get("d")), _i(v.get("s")), _i(v.get("c"))
+            if d is None and s is None and c is None:
+                continue
+            out[k[:120]] = {"downloads": d, "stars": s, "commits30d": c}
+        return out
+    except Exception:
+        return {}
+
+
 def _download_totals_http_get(url):
     """拉下载量汇总的 HTTP 层，独立出来给测试 monkeypatch。返回 (status, text)。"""
     req = urllib.request.Request(url, headers={"User-Agent": "game-launcher-hub"})
@@ -11401,15 +11429,21 @@ def _catalog_repos(reserved_apps, wish_counts):
     return order
 
 
-def _catalog_downloads_by_key(stores, reserved_apps):
-    """repo 维度的缓存 {repo: {downloads, fetched_at}} → {key: downloads}。"""
+def _catalog_stats_by_key(stores, reserved_apps):
+    """repo 维度缓存 {repo: {downloads/stars/commits30d, fetched_at}} →
+    {key: {"downloads","stars","commits30d"}}（缺维缺 key 都容忍）。"""
     out = {}
     for repo, key in _catalog_repos(reserved_apps, {}):
         if key in out:
             continue
-        v = (stores.get(repo) or {}).get("downloads")
-        if isinstance(v, int) and v >= 0:
-            out[key] = v
+        v = stores.get(repo) or {}
+        entry = {}
+        for f in ("downloads", "stars", "commits30d"):
+            x = v.get(f)
+            if isinstance(x, int) and x >= 0:
+                entry[f] = x
+        if entry:
+            out[key] = entry
     return out
 
 
@@ -11431,7 +11465,7 @@ class CatalogDownloadsWorker(QThread):
         self._reserved_apps = list(reserved_apps or [])
 
     def _by_key(self, stores):
-        return _catalog_downloads_by_key(stores, self._reserved_apps)
+        return _catalog_stats_by_key(stores, self._reserved_apps)
 
     def run(self):
         # ① 服务端汇总优先：Cloudflare 一处去 GitHub 拉（分批限速），所有用户
@@ -11466,18 +11500,33 @@ class CatalogDownloadsWorker(QThread):
                 _post_json(origin + "/download/catalog", {"repos": slugs})
             except Exception:
                 pass   # 播种失败不打紧，别的用户会播
-            status, text = _download_totals_http_get(
-                origin + "/download/totals")
-            if status != 200:
-                return False
-            by_repo = parse_download_totals(text)
-            if not by_repo:
-                return False   # 服务端还没拉出数据 → 走兜底，别让榜空着
+            served = False
             now = time.time()
             cache = _load_json(_repo_downloads_path())
             stores = dict(cache.get("repos") or {})
-            for slug, d in by_repo.items():
-                stores[slug] = {"downloads": d, "fetched_at": now}
+            # ① /stats/totals 富文档（v4）：下载+星标+提交三维
+            status, text = _download_totals_http_get(
+                origin + "/stats/totals")
+            if status == 200:
+                by_repo = parse_stats_totals(text)
+                if by_repo:
+                    for slug, v in by_repo.items():
+                        stores[slug] = {**{f: x for f, x in v.items()
+                                           if x is not None},
+                                        "fetched_at": now}
+                    served = True
+            # ② 旧服务端没有 /stats/totals → 退回扁平下载端点
+            if not served:
+                status, text = _download_totals_http_get(
+                    origin + "/download/totals")
+                if status == 200:
+                    by_repo = parse_download_totals(text)
+                    if by_repo:
+                        for slug, d in by_repo.items():
+                            stores[slug] = {"downloads": d, "fetched_at": now}
+                        served = True
+            if not served:
+                return False   # 服务端还没拉出数据 → 走兜底，别让榜空着
             _save_json(_repo_downloads_path(),
                        {"repos": stores, "attempted_at": now})
             self.done.emit(self._by_key(stores))
@@ -12169,6 +12218,10 @@ class RankRail(QWidget):
         for c in self._cards:
             c.apply_scale(self.BOARD_MIN_W / float(RankBoard.BASE_W))
 
+    def _names(self):
+        """key -> (显示名, 图标)：官方 + 预约合并映射（星标/活跃榜全目录用）。"""
+        return {**self._apps_by_key, **self._reserved_by_key}
+
     def set_wish_rows(self, counts):
         """预约榜：counts 为 {key: 合并票数}；只显示 ≥1 票的，按票数降序。
 
@@ -12217,10 +12270,10 @@ class RankRail(QWidget):
             pass
 
     def set_github(self, repos):
-        """repos: key -> {"stars": n, "commits30d": n}；缺 key / 缺字段都容忍。"""
+        """星标/活跃两榜的数据源（全目录：官方 + 预约条目，合成后喂入）。"""
         act, stars = [], []
         for key, info in (repos or {}).items():
-            if key not in self._apps_by_key or not isinstance(info, dict):
+            if key not in self._names() or not isinstance(info, dict):
                 continue
             c, s = info.get("commits30d"), info.get("stars")
             if isinstance(c, int):
@@ -12592,6 +12645,11 @@ class OverviewPage(QWidget):
         self._cards = cards
         self._reserved = list(reserved or [])
         self.overview_cards = []
+        # 榜单三维合成的两个数据源（key -> 数据）：
+        #   _gh_stats      官方 6 仓的 GitHub 统计兜底（GitHubStatsWorker）
+        #   _catalog_stats 全目录三维（CatalogDownloadsWorker，服务端/直连）
+        self._gh_stats = {}
+        self._catalog_stats = {}
         self._mas_state = "off"
 
         # 整页放进滚动区：预约条目有几十条，不下滑就看不到，不能让页面无限长
@@ -12815,7 +12873,8 @@ class OverviewPage(QWidget):
             now = time.time()
             repos = cache.get("repos") or {}
             if repos:
-                self.rank_rail.set_github(repos)
+                self._gh_stats = repos
+                self._refresh_rank_boards()
             fresh = now - float(cache.get("fetched_at") or 0) < _STATS_TTL_SEC
             recent_fail = (now - float(cache.get("attempted_at") or 0)
                            < _STATS_RETRY_SEC)
@@ -12827,30 +12886,47 @@ class OverviewPage(QWidget):
             dl = _load_json(_repo_downloads_path())
             stores = dl.get("repos") or {}
             if stores:
-                self._apply_catalog_downloads(stores)
-            self._catalog_dl_worker = CatalogDownloadsWorker(self._reserved)
-            self._catalog_dl_worker.done.connect(self._on_catalog_downloads)
+                self._catalog_stats = _catalog_stats_by_key(stores, self._reserved)
+                self._refresh_rank_boards()
+            self._catalog_dl_worker.done.connect(self._on_catalog_stats)
             self._catalog_dl_worker.start()
         except Exception:
             pass
 
-    def _apply_catalog_downloads(self, stores):
-        """repo 维度的缓存 → key 维度喂给榜单（与 worker 同一换算函数）。"""
-        self.rank_rail.set_catalog_downloads(
-            _catalog_downloads_by_key(stores or {}, self._reserved))
-
-    def _on_catalog_downloads(self, by_key):
-        try:
-            self.rank_rail.set_catalog_downloads(by_key or {})
-        except Exception:
-            pass
+    def _on_catalog_stats(self, by_key):
+        """全目录三维到达（worker 信号）→ 存下并合成刷新三块榜。"""
+        self._catalog_stats = dict(by_key or {})
+        self._refresh_rank_boards()
 
     def _on_stats_done(self, repos):
-        try:
-            self.rank_rail.set_github(repos or {})
-        except Exception:
-            pass
+        """官方 6 仓的 GitHub 统计兜底到达 → 合成刷新。"""
+        self._gh_stats = dict(repos or {})
+        self._refresh_rank_boards()
 
+    def _refresh_rank_boards(self):
+        """星标/活跃/下载三榜的合成口径：
+           全目录数据（catalog）优先，官方 GitHub 统计兜底缺失维度；
+           星标/活跃两榜喂 set_github（预约 key 也收），下载榜喂
+           set_catalog_downloads（{key: int}）。"""
+        cat = self._catalog_stats or {}
+        gh = self._gh_stats or {}
+        stars, act = {}, {}
+        for k in set(cat) | set(gh):
+            c, g = (cat.get(k) or {}), (gh.get(k) or {})
+            if isinstance(c.get("stars"), int):
+                stars[k] = c["stars"]
+            elif isinstance(g.get("stars"), int):
+                stars[k] = g["stars"]
+            if isinstance(c.get("commits30d"), int):
+                act[k] = c["commits30d"]
+            elif isinstance(g.get("commits30d"), int):
+                act[k] = g["commits30d"]
+        combined = {k: {"stars": stars.get(k), "commits30d": act.get(k)}
+                    for k in set(stars) | set(act)}
+        self.rank_rail.set_github(combined)
+        dl = {k: v["downloads"] for k, v in cat.items()
+              if isinstance(v.get("downloads"), int)}
+        self.rank_rail.set_catalog_downloads(dl)
     def set_mas_available(self, on):
         """mas_enabled=false 时整块入口隐藏（功能未启用，不给假入口）。"""
         try:

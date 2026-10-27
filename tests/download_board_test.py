@@ -122,15 +122,27 @@ orig_post = launcher._post_json
 orig_dlget = launcher._download_totals_http_get
 
 
-def server_on(totals_obj):
-    """打开服务端路径：origin/开关/POST/GET 全部替身化。"""
+def server_on(stats_by_slug):
+    """打开服务端路径：origin/开关/POST/GET 全部替身化。
+
+    stats_by_slug: {slug: {"downloads","stars","commits30d"}}，
+    同时伪造 /stats/totals（富文档）与 /download/totals（扁平）两个端点。
+    """
     posts = []
     launcher._telemetry_origin = lambda: "https://glh-tele.pages.dev"
     launcher.telemetry_enabled = lambda: True
     launcher._post_json = lambda url, payload: posts.append(
         (url, payload)) or 200
-    launcher._download_totals_http_get = lambda url: (
-        200, json.dumps({"downloads": totals_obj}))
+
+    def fake_get(url):
+        if url.endswith("/stats/totals"):
+            body = {s: {"d": v.get("downloads"), "s": v.get("stars"),
+                        "c": v.get("commits30d")}
+                    for s, v in stats_by_slug.items()}
+            return 200, json.dumps({"stats": body})
+        return 200, json.dumps({"downloads": {s: v.get("downloads")
+                                              for s, v in stats_by_slug.items()}})
+    launcher._download_totals_http_get = fake_get
     return posts
 
 
@@ -141,7 +153,9 @@ def server_off():
 # A1) 服务端有数据 → 用共享缓存，不花直连配额
 calls = []
 launcher._fetch_release_downloads = rec_fd
-posts = server_on({"BnanZ0/ok-nte": 33, "foo/one": 11})
+posts = server_on({"BnanZ0/ok-nte": {"downloads": 33, "stars": 7,
+                                     "commits30d": 2},
+                   "foo/one": {"downloads": 11}})
 open(launcher._repo_downloads_path(), "w", encoding="utf-8").write(
     json.dumps({"repos": {}, "attempted_at": 0}))
 w = launcher.CatalogDownloadsWorker(reserved)
@@ -153,8 +167,10 @@ chk("播种请求带全量 slug（公开仓库清单，无用户数据）",
     posts and posts[0][1]["repos"][:2] == ["BnanZ0/ok-nte",
                                            "ok-oldking/ok-wuthering-waves"],
     posts)
-chk("服务端数据按 key 输出（官方 + 预约）",
-    got and got[0].get("ok-nte") == 33 and got[0].get("r1") == 11, got)
+chk("服务端数据按 key 输出（官方 + 预约，三维）",
+    got and got[0].get("ok-nte") == {"downloads": 33, "stars": 7,
+                                     "commits30d": 2}
+    and got[0].get("r1") == {"downloads": 11}, got)
 
 # A2) 服务端没数据（还没拉出来）→ 自动落到直连分批
 calls = []
@@ -196,7 +212,9 @@ chk("TTL 按仓生效：新鲜的没拉", ("BnanZ0/ok-nte" not in calls)
     and ("foo/one" not in calls), calls)
 chk("过期的照拉（未覆盖的仓库继续补全）",
     "ok-oldking/ok-wuthering-waves" in calls, calls)
-chk("缓存值照常输出", got4 and got4[0].get("ok-nte") == 99 and got4[0].get("r1") == 11, got4)
+chk("缓存值照常输出（三维形）",
+    got4 and got4[0].get("ok-nte") == {"downloads": 99}
+    and got4[0].get("r1") == {"downloads": 11}, got4)
 
 # C) 10 分钟内已尝试过 → 直接出缓存不再开拉（attempted_at 守卫）
 calls = []

@@ -188,6 +188,36 @@ app.processEvents()
 chk("清空 → 3 张卡恢复、占位消失",
     page._card_grid.count() == 3 and not page._grid_empty.isVisible())
 
+print("\n--- 3b) 三维合成：catalog 优先、GitHub 统计兜底、预约 key 全收 ---")
+# 模拟两个数据源到达（OverviewPage._on_* 处理器的入参形状）
+page._gh_stats = {"ok-ww": {"stars": 100, "commits30d": 10},
+                  "ok-nte": {"stars": 200, "commits30d": 20}}
+page._catalog_stats = {"ok-ww": {"downloads": 653000, "stars": 999,
+                                 "commits30d": 88},
+                       "rmaa": {"downloads": 5, "stars": 3, "commits30d": 1}}
+page._refresh_rank_boards()
+app.processEvents()
+stars_rows = {r[0]: r[3] for r in page.rank_rail.board_stars._rows}
+chk("catalog 有 → 用 catalog 星数（999 盖过 100）",
+    stars_rows.get("ok-ww") == "999", stars_rows)
+chk("catalog 缺 → 用 GitHub 统计兜底", stars_rows.get("ok-nte") == "200",
+    stars_rows)
+chk("预约 key 的星数也进榜（全目录）", stars_rows.get("rmaa") == "3", stars_rows)
+act_rows = {r[0]: r[3] for r in page.rank_rail.board_activity._rows}
+chk("提交数同理（catalog 优先）",
+    act_rows.get("ok-ww") == "88" and act_rows.get("ok-nte") == "20", act_rows)
+dl_rows = {r[0]: r[3] for r in page.rank_rail.board_downloads._rows}
+chk("下载榜来自 catalog（653k / 5）",
+    dl_rows.get("ok-ww") == "653k" and dl_rows.get("rmaa") == "5", dl_rows)
+# 兜底路径：catalog 清空 → 官方 GitHub 统计接管
+page._catalog_stats = {}
+page._refresh_rank_boards()
+app.processEvents()
+stars_rows2 = {r[0]: r[3] for r in page.rank_rail.board_stars._rows}
+chk("catalog 清空 → GitHub 统计接管星标榜",
+    stars_rows2.get("ok-ww") == "100" and stars_rows2.get("ok-nte") == "200",
+    stars_rows2)
+
 print("\n--- 4) 负向对照：预约榜行点击若退回'无行为'则红 ---")
 # RankBoard 的 row_clicked 是行点击的源头，砍掉它下面两条都断
 chk("【负向】RankBoard 有 row_clicked 信号",
