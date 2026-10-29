@@ -9,6 +9,12 @@
 >
 > 当前支持 ok-script 系（ok-nte / ok-ww / ok-end-field）+ 非该系的奇想盒（Whimbox，lite 接入）、绝区零一条龙（generic 接入）与 MaaEnd 终末地小助手（zip 发布接入），架构上不绑定单一框架，后续可接入其它生态。
 
+> [!IMPORTANT]
+> **关于接入新助手**：本项目为个人业余维护，精力有限，**不接单、不承诺时间表**。
+> 想要哪个助手，去总览页「预约」区给它投「我想要」—— **票数高的优先适配**；
+> 尚未适配的 79 个项目已全部收录在预约区，你的一票直接影响顺序。
+> 也接受带理由的 issue（说明需求场景与该助手的维护活跃度）。
+
 ## 下载
 
 到 [Releases](https://github.com/Gyl1219/game-launcher-hub/releases) 下载打包好的 `game-launcher-hub.exe`（单文件、免安装，自带 Python 运行时）；或克隆仓库后直接 `pythonw launcher.py` 跑源码（依赖 PySide6 / qfluentwidgets / dulwich）。
