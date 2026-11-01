@@ -51,7 +51,7 @@ from PySide6.QtGui import (QIcon, QPixmap, QDesktopServices, QImage, QPainter,
 from PySide6.QtWidgets import (
     QApplication, QWidget, QDialog, QHBoxLayout, QVBoxLayout, QGridLayout,
     QMessageBox, QLabel, QScrollArea, QTextEdit, QProgressBar, QProgressDialog,
-    QStackedWidget, QCheckBox, QFileDialog, QPushButton, QSizePolicy,
+    QStackedWidget, QFileDialog, QPushButton, QSizePolicy,
     QSpacerItem, QGraphicsScene, QGraphicsPixmapItem, QGraphicsBlurEffect,
     QFrame, QGraphicsDropShadowEffect, QSystemTrayIcon,
 )
@@ -60,7 +60,7 @@ from qfluentwidgets import (
     CaptionLabel, BodyLabel, PushButton, PrimaryPushButton, ComboBox,
     FluentIcon, IndeterminateProgressBar,
     LineEdit, InfoBar, InfoBarPosition, RoundMenu, Action,
-    TransparentToolButton, SearchLineEdit, SegmentedWidget,
+    TransparentToolButton, SearchLineEdit, SegmentedWidget, CheckBox,
 )
 
 
@@ -13244,7 +13244,7 @@ class SettingsPage(QWidget):
         self.self_check_btn.clicked.connect(self._on_self_check)
         btn_row.addWidget(self.self_check_btn)
         # 预发布（测试版）默认不提示，勾上才把 beta/预发布算进来
-        self.self_pre_chk = QCheckBox("包含测试版")
+        self.self_pre_chk = CheckBox("包含测试版")
         self.self_pre_chk.setCursor(Qt.PointingHandCursor)
         self.self_pre_chk.setToolTip(
             "默认只提示正式版。勾上后，预发布（测试版）也会被视为可更新版本。")
@@ -13282,13 +13282,13 @@ class SettingsPage(QWidget):
         root.addWidget(tip_t)
 
         tcfg = self._read_cfg().get("telemetry") or {}
-        self.tele_chk = QCheckBox("允许匿名上报错误（帮助改进）")
+        self.tele_chk = CheckBox("允许匿名上报错误（帮助改进）")
         self.tele_chk.setCursor(Qt.PointingHandCursor)
         self.tele_chk.setChecked(bool(tcfg.get("enabled")))
         self.tele_chk.stateChanged.connect(self._on_tele_toggle)
         root.addWidget(self.tele_chk)
 
-        self.tele_ping_chk = QCheckBox("同时发送启动计数（统计有多少人在用）")
+        self.tele_ping_chk = CheckBox("同时发送启动计数（统计有多少人在用）")
         self.tele_ping_chk.setCursor(Qt.PointingHandCursor)
         self.tele_ping_chk.setChecked(bool(tcfg.get("ping")))
         self.tele_ping_chk.setEnabled(bool(tcfg.get("enabled")))
@@ -13302,7 +13302,7 @@ class SettingsPage(QWidget):
         self._refresh_tele_tip()
 
         # 关闭到托盘（用户定稿）：默认关，开启后点关闭隐藏到托盘
-        self.tray_chk = QCheckBox("关闭时最小化到托盘（后台任务继续）")
+        self.tray_chk = CheckBox("关闭时最小化到托盘（后台任务继续）")
         self.tray_chk.setCursor(Qt.PointingHandCursor)
         self.tray_chk.setChecked(bool(self._read_cfg().get("tray_close_to_tray")))
         self.tray_chk.stateChanged.connect(self._save_tray_toggle)
@@ -13352,7 +13352,7 @@ class SettingsPage(QWidget):
         tip_mas.setWordWrap(True)
         root.addWidget(tip_mas)
 
-        self.mas_enabled_chk = QCheckBox("启用 AUTO-MAS 任务编排")
+        self.mas_enabled_chk = CheckBox("启用 AUTO-MAS 任务编排")
         self.mas_enabled_chk.setCursor(Qt.PointingHandCursor)
         cfg = self._read_cfg()
         mas_enabled = bool(cfg.get("mas_enabled", True))
