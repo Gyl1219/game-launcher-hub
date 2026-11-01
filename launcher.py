@@ -791,6 +791,11 @@ def parse_git_progress(line):
         line = line.decode("utf-8", "replace")
     text = (line or "").strip()
     raw = line or ""
+    # 阶段重置标记：ensure_mirror 用单参 bytes 回调（与 dulwich 进度回调同协议），
+    # 发 "phase: <说明>"。两参调用会让 MirrorUpdater._on_progress 直接 TypeError
+    #（实机报错：takes 2 positional arguments but 3 were given）。
+    if text.startswith("phase:"):
+        return -2, text[6:].strip()
 
     def _lerp(lo, hi, cur, total):
         """把 cur/total 线性映射到 [lo, hi] 区间（含端点收边）。"""
@@ -913,14 +918,14 @@ def ensure_mirror(key, git_url, target_tag=None, progress_cb=None):
 
     if not os.path.isdir(os.path.join(repo_dir, ".git")):
         if progress_cb:
-            progress_cb(-2, "首次克隆镜像仓库…")
+            progress_cb("phase: 首次克隆镜像仓库…".encode("utf-8"))
         porcelain.clone(git_url, repo_dir, progress=progress_cb)
     else:
         repo = Repo(repo_dir)
         try:
             client, path = get_transport_and_path(git_url)
             if progress_cb:
-                progress_cb(-2, "从镜像增量拉取新版本…")
+                progress_cb("phase: 从镜像增量拉取新版本…".encode("utf-8"))
             client.fetch(path, repo, progress=progress_cb)
         except Exception:
             # 增量 fetch 失败不致命：本地已有旧镜像，仍可 checkout 已有 tag
@@ -953,7 +958,8 @@ def ensure_mirror(key, git_url, target_tag=None, progress_cb=None):
             fetch_errs = []
             for src in _mirror_fetch_sources(git_url, repo_dir, git):
                 if progress_cb:
-                    progress_cb(-2, "从 %s 拉取标签…" % src.split("//")[-1][:44])
+                    progress_cb(("phase: 从 %s 拉取标签…"
+                                 % src.split("//")[-1][:44]).encode("utf-8"))
                 rc, _, ferr = _git_run(git, ["fetch", "--tags", src],
                                        repo_dir, timeout=45)
                 if rc == 0:
@@ -961,7 +967,8 @@ def ensure_mirror(key, git_url, target_tag=None, progress_cb=None):
                 fetch_errs.append("%s\n      %s" % (src, ferr or "失败"))
             # 全部源都失败也不致命：本地可能已有这个 tag，交给下面的 checkout 判定
             if progress_cb:
-                progress_cb(-2, "切换到目标版本 %s …" % target_tag)
+                progress_cb(("phase: 切换到目标版本 %s …"
+                             % target_tag).encode("utf-8"))
             rc, _, cerr = _git_run(git, ["checkout", "-f", target_tag],
                                    repo_dir, timeout=60)
             if rc != 0:

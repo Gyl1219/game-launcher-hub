@@ -247,5 +247,20 @@ probe3.on_progress(-1, "Receiving objects: 3.20 MiB | 1.10 MiB/s")
 chk("【实机回归】无总量阶段切忙碌条（不再渲染满格）",
     probe3.busy_bar.visible is True and probe3.bar.visible is False)
 
+print("\n--- 6) ensure_mirror 单参协议链路（实机 TypeError 回归）---")
+# 实机报错：ensure_mirror 两参调用 _on_progress → TypeError → 更新失败。
+# 回归口径：_on_progress 收单参 bytes（phase: 前缀 = -2 重置标记）
+_sig = type("S", (), {"emit": lambda s, *a: emitted.append(a)})()
+mu = launcher.MirrorUpdater.__new__(launcher.MirrorUpdater)
+mu.progress = _sig
+emitted = []
+_sig.emit = lambda *a: emitted.append(a)
+mu._on_progress(b"phase: \xe4\xbb\x8e\xe9\x95\x9c\xe5\x83\x8f\xe5\xa2\x9e\xe9\x87\x8f\xe6\x8b\x89\xe5\x8f\x96\xe6\x96\xb0\xe7\x89\x88\xe6\x9c\xac\xe2\x80\xa6")
+chk("phase 单参标记 → (-2, 文本)（不再 TypeError）",
+    len(emitted) == 1 and emitted[0][0] == -2 and "镜像" in emitted[0][1], emitted)
+mu._on_progress(b"Receiving objects: 50% (10/20)\r")
+chk("dulwich 常规行照常解析（Receiving 映射到 10~85 段）",
+    10 <= emitted[-1][0] <= 85, emitted[-1])
+
 print("\n%d failed" % len(fails))
 sys.exit(1 if fails else 0)
