@@ -152,13 +152,14 @@ v3, _ = P(b"Receiving objects: 150% (1/1)")
 chk("越界百分比被夹到 100 以内", 0 <= v3 <= 100, v3)
 
 # ==================== 5) UI 单调保护（不进消息循环，只验逻辑）====================
-print("\n--- 5) on_progress 的单调保护 ---")
+print("\n--- 5) on_progress 的单调保护与阶段重置 ---")
 
 
 class _FakeBar:
     def __init__(self):
         self._v = 0
         self._lo, self._hi = 0, 100
+        self.visible = True
 
     def value(self):
         return self._v
@@ -169,9 +170,16 @@ class _FakeBar:
     def setRange(self, lo, hi):
         self._lo, self._hi = lo, hi
 
-    def is_busy(self):
-        """Qt 的忙碌态：range 为 (0,0)。"""
-        return self._lo == 0 and self._hi == 0
+    def setVisible(self, vis):
+        self.visible = vis
+
+
+class _FakeBusyBar:
+    def __init__(self):
+        self.visible = False
+
+    def setVisible(self, vis):
+        self.visible = vis
 
 
 class _FakeLabel:
@@ -184,14 +192,17 @@ class _FakeLabel:
 
 class _Probe:
     """把一个最小对象绑上 UpdateDialog.on_progress 所需的属性。"""
-    bar = _FakeBar()
-    status = _FakeLabel()
-    _busy = False
+
+    def __init__(self):
+        self.bar = _FakeBar()
+        self.busy_bar = _FakeBusyBar()
+        self.status = _FakeLabel()
+        self._busy = False
+        self._bar_floor = 0
 
 
 _Probe.on_progress = launcher.UpdateDialog.on_progress
 probe = _Probe()
-chk("初始不是忙碌态", probe.bar.is_busy() is False)
 
 probe.on_progress(50, "Receiving objects: 50%")
 chk("正常前进", probe.bar.value() == 50, probe.bar.value())
@@ -205,22 +216,36 @@ chk("pct=-1 时文字确实更新了", "generating index" in probe.status._t, pr
 probe.on_progress(98, "generating index: 1365/1366")
 chk("建索引阶段进度条继续推进到 98", probe.bar.value() == 98, probe.bar.value())
 
-# 忙碌态：dulwich 实时行没有总量 → 显示"在动但不知何时完"
+# 忙碌态：dulwich 实时行没有总量 → 双条切换（确定条隐藏、忙碌条滚动）
 probe2 = _Probe()
-probe2.bar = _FakeBar()
-probe2.status = _FakeLabel()
-probe2._busy = False
 probe2.on_progress(-1, "Receiving objects: 3.20 MiB | 1.10 MiB/s")
-chk("无总量的 Receiving 进入忙碌态（不编假百分比）",
-    probe2.bar.is_busy() is True, (probe2.bar._lo, probe2.bar._hi))
-chk("忙碌态下进度条数值不动", probe2.bar.value() == 0, probe2.bar.value())
+chk("无总量的 Receiving 切忙碌条（确定条隐藏）",
+    probe2.busy_bar.visible is True and probe2.bar.visible is False)
+chk("忙碌态下确定条数值不动", probe2.bar.value() == 0, probe2.bar.value())
 chk("忙碌态文字仍显示在下载什么", "MiB" in probe2.status._t, probe2.status._t)
-# 出现确定进度时必须退出忙碌态
+# 出现确定进度时必须切回确定条
 _gi_pct, _gi_text = P(b"generating index: 0/1366\r")
 probe2.on_progress(_gi_pct, _gi_text)
-chk("进入有确定进度的阶段后退出忙碌态",
-    probe2.bar.is_busy() is False, (probe2.bar._lo, probe2.bar._hi))
+chk("进入确定进度阶段切回确定条",
+    probe2.busy_bar.visible is False and probe2.bar.visible is True)
 chk("退出忙碌态后进度条恢复推进", probe2.bar.value() == _gi_pct, probe2.bar.value())
+
+# 【用户实机场景】增量更新的第二段拉取：上一段到 100 后，新阶段必须重置
+probe3 = _Probe()
+probe3.on_progress(90, "generating index: 1200/1300")
+probe3.on_progress(99, "generating index: 1299/1300")
+probe3.on_progress(100, "Updating files: done")     # 第一段拉完，条满
+probe3.on_progress(-2, "从镜像增量拉取新版本…")      # 新 tag 的第二段拉取开始
+chk("【实机回归】-2 重置：进度条回零（不再卡满格）",
+    probe3.bar.value() == 0 and probe3._bar_floor == 0,
+    (probe3.bar.value(), probe3._bar_floor))
+probe3.on_progress(10, "Receiving objects: 10%")    # 新阶段的真实进度
+chk("新阶段从真实进度起步（不被旧 100 锁死）",
+    probe3.bar.value() == 10, probe3.bar.value())
+# 无总量行 → 忙碌条（不再渲染成满格）
+probe3.on_progress(-1, "Receiving objects: 3.20 MiB | 1.10 MiB/s")
+chk("【实机回归】无总量阶段切忙碌条（不再渲染满格）",
+    probe3.busy_bar.visible is True and probe3.bar.visible is False)
 
 print("\n%d failed" % len(fails))
 sys.exit(1 if fails else 0)

@@ -912,11 +912,15 @@ def ensure_mirror(key, git_url, target_tag=None, progress_cb=None):
     from dulwich.client import get_transport_and_path
 
     if not os.path.isdir(os.path.join(repo_dir, ".git")):
+        if progress_cb:
+            progress_cb(-2, "首次克隆镜像仓库…")
         porcelain.clone(git_url, repo_dir, progress=progress_cb)
     else:
         repo = Repo(repo_dir)
         try:
             client, path = get_transport_and_path(git_url)
+            if progress_cb:
+                progress_cb(-2, "从镜像增量拉取新版本…")
             client.fetch(path, repo, progress=progress_cb)
         except Exception:
             # 增量 fetch 失败不致命：本地已有旧镜像，仍可 checkout 已有 tag
@@ -948,12 +952,16 @@ def ensure_mirror(key, git_url, target_tag=None, progress_cb=None):
             # 而且「拉不下来」通常是秒级超时，不是慢，拖长没意义。
             fetch_errs = []
             for src in _mirror_fetch_sources(git_url, repo_dir, git):
+                if progress_cb:
+                    progress_cb(-2, "从 %s 拉取标签…" % src.split("//")[-1][:44])
                 rc, _, ferr = _git_run(git, ["fetch", "--tags", src],
                                        repo_dir, timeout=45)
                 if rc == 0:
                     break
                 fetch_errs.append("%s\n      %s" % (src, ferr or "失败"))
             # 全部源都失败也不致命：本地可能已有这个 tag，交给下面的 checkout 判定
+            if progress_cb:
+                progress_cb(-2, "切换到目标版本 %s …" % target_tag)
             rc, _, cerr = _git_run(git, ["checkout", "-f", target_tag],
                                    repo_dir, timeout=60)
             if rc != 0:
@@ -9375,6 +9383,7 @@ class UpdateDialog(QDialog):
         self.current = current
         self._worker = None
         self._busy = False   # 进度条是否处于忙碌态（不确定进度）
+        self._bar_floor = 0  # 单调地板：新拉取阶段（-2）时清零，阶段内防倒退
 
         self.setWindowTitle(f"更新 {app['display']}")
         self.setMinimumWidth(480)
@@ -9418,6 +9427,11 @@ class UpdateDialog(QDialog):
         self.bar.setValue(0)
         self.bar.setTextVisible(True)
         v.addWidget(self.bar)
+        # 忙碌态专用条（阶段无总量时切换显示）：QProgressBar 的 range(0,0)
+        # 在样式化进度条上渲染成满格 —— 正是"没好进度就满了"的实机截图来源
+        self.busy_bar = IndeterminateProgressBar()
+        v.addWidget(self.busy_bar)
+        self.busy_bar.setVisible(False)
 
         self.status = CaptionLabel(
             "点击「开始更新」直接下载并更新到原启动器源程序目录 working/：\n"
@@ -9478,32 +9492,40 @@ class UpdateDialog(QDialog):
         self._worker.start()
 
     def on_progress(self, pct, text):
-        """进度回调。pct<0 表示这条只是状态文字（不动进度条）。
+        """进度回调。pct 约定（ensure_mirror / MirrorUpdater 发出）：
 
-        2026-10-27 加**单调保护**：dulwich 会在阶段间穿插输出，偶尔出现
-        `Receiving 85%` 之后又来一条更早阶段的 `Counting 3%`；直接 setValue
-        会让进度条肉眼可见地倒退，用户会以为出错了。进度条只许往前不走回头路。
-        （真正完成时的 100% 由 on_done 设置，不受此限。）
+          >= 0  确定进度（阶段映射或字节真值），单调地板 _bar_floor 防倒退
+          -1    该阶段只有实时 MiB/速率、算不出百分比（dulwich Receiving 实时行）
+                → 切忙碌条（滚动），进度条隐藏；文字里的 MiB/速度在动
+          -2    新的拉取阶段开始（换源/切 checkout）→ 进度条回零、地板清零
+
+        2026-10-27 的单调保护保留（阶段穿插输出不倒退），但以 -2 重置为界 ——
+        否则增量更新的第二段拉取会永远卡在上一段的 100%（实机截图："明明没好
+        进度就满了"）。忙碌态也不再走 range(0,0)：样式化进度条在 range(0,0)
+        下渲染成满格，同样被当成"满了"。
         """
-        # 忙碌态（不确定进度）：dulwich 的 Receiving 阶段**只报已下载 MiB 与速率、
-        # 不报总量**（见 dulwich/client.py:1177 `_report_progress`），
-        # 所以这一段根本算不出真实百分比。宁可显示"在动但不知何时完"的忙碌态，
-        # 也不假装停在 10% 或编一个假百分比——后者正是用户这次怀疑"进度造假"的由来。
-        #
-        # 注意条件里带 pct < 0：`Receiving objects: 100% (1380/1380), done.`
-        # 那种**有百分比**的收尾行仍走正常进度，不能也被判成忙碌态。
+        if pct == -2:
+            self._busy = False
+            self.busy_bar.setVisible(False)
+            self.bar.setVisible(True)
+            self.bar.setRange(0, 100)
+            self._bar_floor = 0
+            self.bar.setValue(0)
+            self.status.setText(text or "准备拉取…")
+            return
         if text and pct < 0 and _PROGRESS_BUSY_RE.search(text):
-            if not self._busy:
-                self._busy = True
-                self.bar.setRange(0, 0)      # Qt 的忙碌态：来回滚动
+            self._busy = True
+            self.bar.setVisible(False)
+            self.busy_bar.setVisible(True)
             self.status.setText(text[:80])
             return
         if self._busy:
             self._busy = False
-            self.bar.setRange(0, 100)        # 有确定进度了，切回正常模式
+            self.busy_bar.setVisible(False)
+            self.bar.setVisible(True)
         if pct >= 0:
-            cur = self.bar.value()
-            self.bar.setValue(max(cur, pct))
+            self._bar_floor = max(getattr(self, "_bar_floor", 0), pct)
+            self.bar.setValue(min(100, self._bar_floor))
             self.status.setText((text[:80] if text else "") or f"下载中… {pct}%")
         else:
             self.status.setText(text or "下载中…")
