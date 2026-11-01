@@ -47,13 +47,13 @@ import hashlib
 
 from PySide6.QtCore import Qt, QTimer, QThread, Signal, QUrl, QPoint, QSize, QEvent, QObject, QRectF
 from PySide6.QtGui import (QIcon, QPixmap, QDesktopServices, QImage, QPainter,
-                           QLinearGradient, QColor, QPainterPath)
+                           QLinearGradient, QColor, QPainterPath, QAction)
 from PySide6.QtWidgets import (
     QApplication, QWidget, QDialog, QHBoxLayout, QVBoxLayout, QGridLayout,
     QMessageBox, QLabel, QScrollArea, QTextEdit, QProgressBar, QProgressDialog,
     QStackedWidget, QCheckBox, QFileDialog, QPushButton, QSizePolicy,
     QSpacerItem, QGraphicsScene, QGraphicsPixmapItem, QGraphicsBlurEffect,
-    QFrame, QGraphicsDropShadowEffect,
+    QFrame, QGraphicsDropShadowEffect, QSystemTrayIcon,
 )
 from qfluentwidgets import (
     setTheme, Theme, CardWidget, IconWidget, StrongBodyLabel,
@@ -13301,6 +13301,13 @@ class SettingsPage(QWidget):
         root.addWidget(self.tele_tip)
         self._refresh_tele_tip()
 
+        # 关闭到托盘（用户定稿）：默认关，开启后点关闭隐藏到托盘
+        self.tray_chk = QCheckBox("关闭时最小化到托盘（后台任务继续）")
+        self.tray_chk.setCursor(Qt.PointingHandCursor)
+        self.tray_chk.setChecked(bool(self._read_cfg().get("tray_close_to_tray")))
+        self.tray_chk.stateChanged.connect(self._save_tray_toggle)
+        root.addWidget(self.tray_chk)
+
         # 「发送测试」按钮：不部署服务端也能验通路。
         # 它起一个本机假接收端，用真实发送逻辑打一条样本过去，然后回显收到的内容。
         # 为什么需要：endpoint 留空时上报函数会**静默 return**，
@@ -13454,6 +13461,16 @@ class SettingsPage(QWidget):
             return
         self.tele_ping_chk.setEnabled(self.tele_chk.isChecked())
         self._refresh_tele_tip()
+
+    def _save_tray_toggle(self):
+        """托盘开关写回 config.json（独立键 tray_close_to_tray，默认关）。"""
+        cfg = self._read_cfg()
+        cfg["tray_close_to_tray"] = bool(self.tray_chk.isChecked())
+        try:
+            with open(self._cfg_path(), "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            QMessageBox.warning(self, "保存失败", "写 config.json 失败：%s" % e)
 
     # ---------- 发送测试（不部署也能验通路）----------
     def _on_tele_selftest(self):
@@ -15797,6 +15814,50 @@ class SettingsDialog(QDialog):
         super().keyPressEvent(e)
 
 
+class _TrayIcon(QSystemTrayIcon):
+    """托盘图标：关闭到托盘的载体（设置页可开关，默认关）。
+
+    菜单：显示主窗口 / 退出。「退出」置 _tray_force_exit 后走正常
+    closeEvent 清理（心跳/扫描线程/AUTO-MAS 后端优雅关闭都会执行）。
+    """
+
+    def __init__(self, win):
+        super().__init__(
+            QIcon(os.path.join(ASSETS_DIR, "launcher-icon.png")), win)
+        self._win = win
+        menu = RoundMenu()
+        act_show = QAction(FluentIcon.HOME.icon(), "显示主窗口", menu)
+        act_show.triggered.connect(self.restore)
+        menu.addAction(act_show)
+        menu.addSeparator()
+        act_quit = QAction(FluentIcon.CLOSE.icon(), "退出", menu)
+        act_quit.triggered.connect(self.quit_app)
+        menu.addAction(act_quit)
+        self.setContextMenu(menu)
+        self.setToolTip("游戏助手启动器")
+        self.activated.connect(self._on_activated)
+        self.show()
+
+    def restore(self):
+        """从托盘唤起主窗口并置前（托盘菜单与图标单击共用）。"""
+        self._win.restore_window()
+
+    def _on_activated(self, reason):
+        # 单击/双击托盘图标 → 唤起主窗口
+        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+            self.restore()
+
+    def show_minimized_tip(self):
+        self.showMessage("游戏助手启动器", "已最小化到托盘，任务继续运行",
+                         QSystemTrayIcon.Information, 2000)
+
+    def quit_app(self):
+        # 置强制退出标记后走正常 closeEvent：托盘隐藏态下心跳/扫描线程/
+        # AUTO-MAS 后端都还在，必须走同一套优雅清理，不能直接 exit。
+        self._win._tray_force_exit = True
+        self._win.close()
+
+
 class Launcher(QWidget):
     def __init__(self):
         super().__init__()
@@ -15808,6 +15869,12 @@ class Launcher(QWidget):
         self.resize(1240, 800)
         # 窗口图标用「游戏助手启动器」通用图标，而不是某个具体游戏图标
         self.setWindowIcon(QIcon(os.path.join(ASSETS_DIR, "launcher-icon.png")))
+
+        # 托盘（用户定稿，对齐 tubatools）：设置页开启「关闭时最小化到托盘」后，
+        # 点关闭隐藏到这里，AUTO-MAS 编排任务继续跑；菜单可唤起/退出。
+        self._tray_force_exit = False
+        self._tray_minimized = False
+        self._tray = _TrayIcon(self)
 
         root = QHBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -15925,12 +15992,33 @@ class Launcher(QWidget):
             pass
         super().changeEvent(event)
 
+    def restore_window(self):
+        """从托盘/最小化恢复主窗口并置前（托盘菜单与单实例激活共用）。"""
+        if self.isHidden():
+            self.show()
+        if self.isMinimized():
+            self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
     def closeEvent(self, event):
         """退出：停心跳、回收扫描线程、优雅关闭 AUTO-MAS 后端。
 
         后端不清会留孤儿 python 进程（Job Object 只在句柄关闭时兜底，
         正常退出路径必须显式走 close 接口）。
+
+        托盘分支（用户定稿）：设置页开启「关闭时最小化到托盘」时，
+        点关闭 = 隐藏窗口、任务继续（心跳/后端都不停）；真正的退出
+        走托盘菜单「退出」（置 _tray_force_exit 后进同一套清理）。
         """
+        if (not getattr(self, "_tray_force_exit", False)
+                and bool(_load_cfg_safe().get("tray_close_to_tray"))):
+            event.ignore()
+            self.hide()
+            self._tray_minimized = True
+            if getattr(self, "_tray", None) is not None:
+                self._tray.show_minimized_tip()
+            return
         try:
             heartbeat().set_enabled(False)
             proc_scanner().shutdown()
@@ -16442,10 +16530,9 @@ def main():
     if guard is not None:
         def _activate(_msg=""):
             try:
-                if win.isMinimized():
-                    win.showNormal()
-                win.raise_()
-                win.activateWindow()
+                # 托盘隐藏态下再双击 exe 也要能唤起（只 raise 不 show 的
+                # 旧写法对隐藏窗口无效——实测踩过）
+                win.restore_window()
             except Exception:
                 pass
         guard.signalled.connect(_activate)
