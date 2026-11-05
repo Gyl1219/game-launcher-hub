@@ -523,6 +523,30 @@ def _git_start_bounded(worker):
     _git_pump()
 
 
+def _version_cache_path(key):
+    """某助手的版本检查结果缓存路径（GitVersionFetcher 每次成功都覆盖写它）。"""
+    return os.path.join(LAUNCHER_DIR, "logs", "versions-{}.json".format(key))
+
+
+def _read_version_cache(path):
+    """读上次的版本检查结果，返回 (items 或 None, 距写入的秒数 或 None)。
+
+    有界并发队列把 git fetch 限到 4 路，但 fetch --tags + changelog API 本身
+    仍是秒级起步的网络操作 —— 启动时要的其实是「上次检查的结论」，
+    先读盘瞬间出徽章，30 分钟内不再打扰网络（stale-while-revalidate）。
+    """
+    try:
+        st = os.stat(path)
+        with open(path, "r", encoding="utf-8") as f:
+            items = json.load(f)
+        if isinstance(items, list) and items:
+            import time as _time
+            return items, max(0.0, _time.time() - st.st_mtime)
+    except Exception:
+        pass
+    return None, None
+
+
 class GitVersionFetcher(QThread):
     """后台从各游戏**本地 git 仓库**读取「版本 + 更新说明」列表。
 
@@ -8798,6 +8822,20 @@ class AppCard(CardWidget):
         # 数据完全一致；不再 spawn 原启动器 exe，避免弹出原启动器 GUI）。只读。
         exe = self.app.get("exe", "")
         if exe and os.path.isfile(exe):
+            # 缓存优先（用户定稿「检查更新有点慢」）：GitVersionFetcher 每次成功
+            # 都把结果写 logs/versions-<key>.json —— 先立即用它填版本列表/徽章，
+            # 零网络等待；写入时间在 30 分钟内就不再发起 git fetch（限频），
+            # 过期才走下面的后台刷新（异步，不阻塞界面）。
+            _cache_file = _version_cache_path(self.app.get("key", ""))
+            _cached, _age = _read_version_cache(_cache_file)
+            if _cached:
+                try:
+                    self._on_versions_fetched(_cached)
+                except Exception:
+                    pass
+                if _age is not None and _age < 1800:
+                    self._version_fetch_started = True
+                    return
             if self._version_fetcher and self._version_fetcher.isRunning():
                 self._version_fetcher.requestInterruption()
                 self._version_fetcher.wait(1000)
