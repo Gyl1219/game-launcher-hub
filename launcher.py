@@ -16223,6 +16223,13 @@ class _TrayIcon(QSystemTrayIcon):
         # AUTO-MAS 后端都还在，必须走同一套优雅清理，不能直接 exit。
         self._win._tray_force_exit = True
         self._win.close()
+        # 隐藏态下 close() 不会触发 lastWindowClosed（窗口本来就不可见，
+        # 不算「最后一个可见窗口关闭」）—— 清理跑了但进程留在托盘退不出去
+        #（用户实机反馈）。close 的清理完成后显式退出事件循环。
+        try:
+            QApplication.instance().quit()
+        except Exception:
+            pass
 
 
 class Launcher(QWidget):

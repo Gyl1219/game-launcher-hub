@@ -118,6 +118,10 @@ class _FakeTray:
     def quit_app(self):
         self.win._tray_force_exit = True
         self.win.close()
+        try:
+            launcher.QApplication.instance().quit()
+        except Exception:
+            pass
 
 
 launcher._TrayIcon = _FakeTray
@@ -149,10 +153,27 @@ host.hide()
 w0.restore()
 chk("宿主隐藏时 restore() 能唤起", host.isVisible())
 host._tray_force_exit = False
+_quit_calls = []
+
+
+class _FakeApp:
+    @staticmethod
+    def instance():
+        return _FakeApp
+
+    @staticmethod
+    def quit():
+        _quit_calls.append("quit")
+
+
+_real_qapp = launcher.QApplication
+launcher.QApplication = _FakeApp
 w0.quit_app()
-chk("托盘「退出」置强制退出标记并触发关闭",
-    host._tray_force_exit is True and host.close_called == 1,
-    (host._tray_force_exit, host.close_called))
+launcher.QApplication = _real_qapp
+chk("托盘「退出」置强制退出标记、触发关闭并显式 quit（隐藏态退出的关键）",
+    host._tray_force_exit is True and host.close_called == 1
+    and _quit_calls == ["quit"],
+    (host._tray_force_exit, host.close_called, _quit_calls))
 w0.hide()
 w0.setParent(None)
 del w0
@@ -226,6 +247,32 @@ w4.hide()
 w4.restore_window()
 app.processEvents()
 chk("隐藏态唤起（单实例激活同款路径）", w4.isVisible())
+
+print("\n--- 7) 托盘隐藏态退出（实机回归：close 不触发 lastWindowClosed）---")
+# 实机：窗口隐藏后托盘「退出」→ close() 的清理跑了但进程留在托盘。
+# 修复后 quit_app 必须显式 QApplication.quit()。
+quit_calls = []
+
+
+class _FakeApp:
+    @staticmethod
+    def instance():
+        return _FakeApp
+
+    @staticmethod
+    def quit():
+        quit_calls.append("quit")
+
+
+real_qapp = launcher.QApplication
+launcher.QApplication = _FakeApp
+w5 = make_launcher({"tray_close_to_tray": True})
+w5.hide()
+w5._tray.quit_app()
+chk("隐藏态托盘退出：置强制退出标记", w5._tray_force_exit is True)
+chk("隐藏态托盘退出：显式调用了 QApplication.quit()（进程真正退出）",
+    quit_calls == ["quit"], quit_calls)
+launcher.QApplication = real_qapp
 
 print("\n%d failed" % len(fails))
 # 本测试若构造真实 QSystemTrayIcon，Python 退出期析构顺序不可控，
