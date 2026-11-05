@@ -16697,8 +16697,13 @@ class SingleInstanceGuard(QObject):
 
     # ---------- 文件锁 ----------
     def _lock_path(self):
-        d = os.path.join(LAUNCHER_DIR, ".cache")
+        # 用户定稿：单实例锁必须**全局** —— 装机版 / 源码 / dist 副本的
+        # LAUNCHER_DIR 各不相同，按目录加锁会让两份同时跑（实机截图：
+        # 新旧两个窗口并排）。锁放用户级固定路径，跨副本互斥；
+        # 第二个实例通过全局套接字唤醒第一个，然后自己退出。
         try:
+            d = os.path.join(os.path.expanduser("~"), ".workbuddy",
+                             "game-launcher-hub")
             os.makedirs(d, exist_ok=True)
         except Exception:
             d = LAUNCHER_DIR

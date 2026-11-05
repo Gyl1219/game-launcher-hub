@@ -96,6 +96,32 @@ chk("7) LAUNCHER_ALLOW_MULTI 逃生阀已实现", "LAUNCHER_ALLOW_MULTI" in src)
 chk("7b) 已接进 main()（不是只写了个常量）",
     src.count("LAUNCHER_ALLOW_MULTI") >= 2, str(src.count("LAUNCHER_ALLOW_MULTI")))
 
+# ===== 实机回归：锁必须全局（装机版/源码/dist 副本互斥）=====
+# 用户实机：两个不同 LAUNCHER_DIR 的实例并排跑 —— 旧实现按目录加锁。
+print("\n--- 锁全局化（跨副本互斥）---")
+import launcher as _L
+
+_lp = _L.SingleInstanceGuard()._lock_path()
+OK.append("锁路径在用户级固定位置（不在 LAUNCHER_DIR 下）: "
+          + str(".workbuddy" in _lp and "launcher.lock" in _lp))
+
+_g1 = _L.SingleInstanceGuard()
+_ok1 = _g1._try_lock_file()
+OK.append("第一个实例拿到锁: %s" % _ok1)
+_g2 = _L.SingleInstanceGuard()
+_ok2 = _g2._try_lock_file()
+OK.append("第二个实例（模拟不同目录副本）拿不到锁: %s" % (_ok2 is False))
+try:
+    _g1.release()
+except Exception:
+    _g1._lock_fh and _g1._lock_fh.close()
+_ok3 = _g2._try_lock_file()
+OK.append("第一个释放后第二个可获取: %s" % _ok3)
+try:
+    _g2.release()
+except Exception:
+    _g2._lock_fh and _g2._lock_fh.close()
+
 print("\n通过 %d / 失败 %d" % (len(OK), len(FAIL)))
 for f in FAIL:
     print("   FAILED:", f)
