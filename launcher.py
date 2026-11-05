@@ -12994,7 +12994,10 @@ class OverviewPage(QWidget):
         lite/generic 卡走各自 worker，v1 队列不覆盖（它们的更新按钮照旧单走）。
         """
         jobs = []
-        for card in getattr(self, "overview_cards", []):
+        # 注意：遍历的是 AppCard（self._cards，有 snapshot/update 状态），
+        # 不是 overview_cards —— 那是展示卡 OverviewCard，没有 snapshot，
+        # 遍历它会静默收集到 0 个（实机：按钮永不出现）。
+        for card in getattr(self, "_cards", {}).values():
             try:
                 snap = card.snapshot()
             except Exception:

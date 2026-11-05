@@ -44,6 +44,7 @@ class _Rec:
 
 # singleShot 改同步：队列确定性排空（真实运行里 600ms 间隔只是缓冲）
 launcher.QTimer.singleShot = staticmethod(lambda ms, fn: fn())
+real_singleshot = launcher.QTimer.singleShot
 
 
 class _FakeMirror(QObject):
@@ -121,6 +122,40 @@ chk("应用失败计入失败名单", rec3.finished[0][1] == [("B", "模拟同�
 
 launcher.MirrorUpdater = real_mirror
 launcher.ApplyWorker = real_apply
+
+print("\n--- 4) 任务收集：遍历 AppCard（实机回归：此前遍历展示卡收集到 0）---")
+
+
+class _FakeAppCard:
+    def __init__(self, key, display, installed, has_update, badge, git_url):
+        self.app = {"key": key, "display": display}
+        self.profile = {"git_url": git_url}
+        self._snap = {"reserved": False, "installed": installed,
+                      "has_update": has_update, "badge": badge}
+
+    def snapshot(self):
+        return dict(self._snap)
+
+
+op = launcher.OverviewPage.__new__(launcher.OverviewPage)
+op._cards = {
+    "ww": _FakeAppCard("ww", "鸣潮", True, True, "可更新 v3.7.19", "https://x/ww"),
+    "nva": _FakeAppCard("nva", "异环", True, True, "可更新 v1.4.23", "https://x/nva"),
+    "ok": _FakeAppCard("ok", "绝区零", True, False, "已安装", "https://x/ok"),
+    "noflag": _FakeAppCard("noflag", "某卡", True, True, "有新版本可用", "https://x/nf"),
+    "nogit": _FakeAppCard("nogit", "无源", True, True, "可更新 v1", ""),
+}
+jobs = launcher.OverviewPage._collect_update_jobs(op)
+chk("收集到 2 个可更新（badge 可更新前缀 + 有 git_url）",
+    sorted(j["key"] for j in jobs) == ["nva", "ww"], [j["key"] for j in jobs])
+chk("目标版本取自徽章", all(j["target"].startswith("v") for j in jobs),
+    [j["target"] for j in jobs])
+op2 = launcher.OverviewPage.__new__(launcher.OverviewPage)
+op2._cards = {}
+chk("无可更新卡时收集为空（按钮隐藏条件成立）",
+    launcher.OverviewPage._collect_update_jobs(op2) == [])
+
+print("\n%d failed" % len(fails))
 
 print("\n%d failed" % len(fails))
 sys.exit(1 if fails else 0)
