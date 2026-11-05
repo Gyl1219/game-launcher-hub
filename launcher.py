@@ -53,7 +53,7 @@ from PySide6.QtWidgets import (
     QMessageBox, QLabel, QScrollArea, QTextEdit, QProgressBar, QProgressDialog,
     QStackedWidget, QFileDialog, QPushButton, QSizePolicy,
     QSpacerItem, QGraphicsScene, QGraphicsPixmapItem, QGraphicsBlurEffect,
-    QFrame, QGraphicsDropShadowEffect, QSystemTrayIcon, QRadioButton,
+    QFrame, QGraphicsDropShadowEffect, QSystemTrayIcon,
 )
 from qfluentwidgets import (
     setTheme, Theme, CardWidget, IconWidget, StrongBodyLabel,
@@ -61,6 +61,7 @@ from qfluentwidgets import (
     FluentIcon, IndeterminateProgressBar,
     LineEdit, InfoBar, InfoBarPosition, RoundMenu, Action,
     TransparentToolButton, SearchLineEdit, SegmentedWidget, CheckBox,
+    RadioButton,
 )
 
 
@@ -16243,10 +16244,10 @@ class _CloseChoiceDialog(QDialog):
         v = QVBoxLayout(self)
         v.setContentsMargins(24, 20, 24, 16)
         v.setSpacing(12)
-        self.hide_rb = QRadioButton("隐藏到任务栏托盘（后台任务继续）")
+        self.hide_rb = RadioButton("隐藏到任务栏托盘（后台任务继续）")
         self.hide_rb.setChecked(True)
         v.addWidget(self.hide_rb)
-        self.exit_rb = QRadioButton("退出启动器")
+        self.exit_rb = RadioButton("退出启动器")
         v.addWidget(self.exit_rb)
         self.remember_chk = CheckBox("不再提醒（记住我的选择）")
         v.addWidget(self.remember_chk)
