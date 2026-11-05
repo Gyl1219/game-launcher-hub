@@ -3791,6 +3791,79 @@ def _is_preserved(rel):
     return rel.parts[0] in _PRESERVE_TOPLEVEL or any(p in _PRESERVE_ANYWHERE for p in rel.parts)
 
 
+class _UpdateQueue(QObject):
+    """「全部更新」队列（用户定稿）：多张卡的更新串行执行（下载 → 应用 → 下一个）。
+
+    串行而不是并行：git 拉取和 working 同步都吃磁盘/网络，并行会把单卡速度拖垮；
+    单个失败不中断队列（后面的助手照常更新），失败汇总在 finished 里报。
+    """
+
+    item_started = Signal(str, str, str)   # key, display, target
+    item_progress = Signal(str, int, str)  # key, pct, text（-1 = 阶段文字）
+    item_done = Signal(str, bool, str)     # key, ok, msg
+    finished = Signal(int, list)           # 成功数, [(display, err)]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._jobs = []
+        self._i = 0
+        self._ok = 0
+        self._fails = []
+        self._worker = None
+        self._apply = None
+
+    def enqueue(self, jobs):
+        self._jobs = list(jobs)
+        self._i = 0
+        self._ok = 0
+        self._fails = []
+
+    def start(self):
+        self._next()
+
+    def _next(self):
+        if self._i >= len(self._jobs):
+            self.finished.emit(self._ok, self._fails)
+            return
+        job = self._jobs[self._i]
+        self.item_started.emit(job["key"], job["display"], job["target"])
+        self._worker = MirrorUpdater(
+            job["key"], job["git_url"], job["target"], parent=self)
+        self._worker.progress.connect(
+            lambda pct, text, k=job["key"]: self.item_progress.emit(k, pct, text))
+        self._worker.done.connect(
+            lambda local_dir, j=job: self._on_dl_done(j, local_dir))
+        self._worker.failed.connect(
+            lambda msg, j=job: self._on_item_fail(j, msg))
+        self._worker.start()
+
+    def _on_dl_done(self, job, local_dir):
+        self._apply = ApplyWorker(
+            job["app"], job["target"], local_dir, parent=self)
+        self._apply.progress.connect(
+            lambda text, k=job["key"]: self.item_progress.emit(k, -1, text))
+        self._apply.done.connect(
+            lambda ok, msg, j=job: self._on_apply_done(j, ok, msg))
+        self._apply.start()
+
+    def _on_apply_done(self, job, ok, msg):
+        if ok:
+            self._ok += 1
+        else:
+            self._fails.append((job["display"], msg))
+        self.item_done.emit(job["key"], ok, msg)
+        self._advance()
+
+    def _on_item_fail(self, job, msg):
+        self._fails.append((job["display"], msg))
+        self.item_done.emit(job["key"], False, msg)
+        self._advance()
+
+    def _advance(self):
+        self._i += 1
+        QTimer.singleShot(600, self._next)
+
+
 def _sync_repo_to_working(src_dir, dst_dir):
     """从镜像 src_dir 智能同步到 dst_dir：覆盖代码文件，保留运行数据目录/数据库，
     并删除 working/ 中镜像已移除的孤儿代码文件（仅非保留路径）。
@@ -12787,6 +12860,21 @@ class OverviewPage(QWidget):
         self.mas_cap = CaptionLabel("编排插件 · 未启动")
         self.mas_cap.setStyleSheet("color:#8a8d96;")
         mb.addWidget(self.mas_cap)
+        # 全部更新（用户定稿）：≥2 张卡有更新时显示，串行队列逐个下载+应用
+        self.update_all_btn = PushButton("全部更新")
+        self.update_all_btn.setFixedHeight(32)
+        self.update_all_btn.setCursor(Qt.PointingHandCursor)
+        self.update_all_btn.clicked.connect(self._on_update_all_clicked)
+        self.update_all_btn.setVisible(False)
+        search_row.addWidget(self.update_all_btn)
+        self._uq_infobar = None
+        self._update_queue = None
+        self._uq_timer = QTimer(self)
+        self._uq_timer.setInterval(15000)
+        self._uq_timer.timeout.connect(self._refresh_update_all_btn)
+        self._uq_timer.start()
+        QTimer.singleShot(300, self._refresh_update_all_btn)
+
         search_row.addWidget(self.mas_box)
         self.mas_box.setToolTip(
             "AUTO-MAS 不是游戏助手，是「管这些助手」的多账号任务编排插件：\n"
@@ -12889,6 +12977,109 @@ class OverviewPage(QWidget):
         rs = getattr(self, "reserved_section", None)
         if rs is not None:
             rs.search.setText(self.search_box.text() or "")
+
+    # ===== 全部更新队列（用户定稿） =====
+    def _refresh_update_all_btn(self):
+        """统计可更新卡片数：≥2 显示「全部更新 (N)」，否则隐藏。"""
+        try:
+            n = len(self._collect_update_jobs())
+        except Exception:
+            n = 0
+        self.update_all_btn.setVisible(n >= 2)
+        self.update_all_btn.setText(f"全部更新 ({n})" if n >= 2 else "全部更新")
+
+    def _collect_update_jobs(self):
+        """收集可更新任务：badge 带「可更新 <tag>」的卡片（MirrorUpdater 路线）。
+
+        lite/generic 卡走各自 worker，v1 队列不覆盖（它们的更新按钮照旧单走）。
+        """
+        jobs = []
+        for card in getattr(self, "overview_cards", []):
+            try:
+                snap = card.snapshot()
+            except Exception:
+                continue
+            if not snap.get("installed") or not snap.get("has_update"):
+                continue
+            badge = snap.get("badge") or ""
+            if not badge.startswith("可更新"):
+                continue
+            target = badge.replace("可更新", "").strip()
+            profile = getattr(card, "profile", {}) or {}
+            git_url = (profile.get("git_url") or "").strip()
+            if not target or not git_url:
+                continue
+            jobs.append({
+                "key": card.app.get("key", ""),
+                "display": card.app.get("display", card.app.get("key", "")),
+                "app": card.app,
+                "target": target,
+                "git_url": git_url,
+            })
+        return jobs
+
+    def _on_update_all_clicked(self):
+        jobs = self._collect_update_jobs()
+        if len(jobs) < 2:
+            return
+        names = "、".join(j["display"] for j in jobs)
+        resp = QMessageBox.question(
+            self, "全部更新",
+            f"将依次更新 {len(jobs)} 个助手：{names}\n\n"
+            "· 应用阶段会关闭对应运行中的助手\n"
+            "· 队列逐个执行，前面的失败不影响后面的\n\n确认开始？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if resp != QMessageBox.Yes:
+            return
+        self._update_queue = _UpdateQueue(self)
+        self._update_queue.item_started.connect(self._on_uq_started)
+        self._update_queue.finished.connect(self._on_uq_finished)
+        self._update_queue.enqueue(jobs)
+        self._update_queue.start()
+
+    def _close_uq_infobar(self):
+        try:
+            ib = getattr(self, "_uq_infobar", None)
+            if ib is not None:
+                ib.close()
+                self._uq_infobar = None
+        except Exception:
+            pass
+
+    def _on_uq_started(self, key, display, target):
+        """每个条目开始：InfoBar 换成当前进度（条目粒度，足够判断跑到哪了）。"""
+        self._close_uq_infobar()
+        try:
+            q = self._update_queue
+            done = q._i if q else 0
+            total = len(q._jobs) if q else 0
+            self._uq_infobar = InfoBar.info(
+                title=f"全部更新 {done + 1}/{total}",
+                content=f"正在更新 {display} → {target}",
+                orient=Qt.Horizontal, isClosable=False,
+                position=InfoBarPosition.TOP, duration=-1, parent=self)
+        except Exception:
+            pass
+
+    def _on_uq_finished(self, ok_count, fails):
+        self._close_uq_infobar()
+        try:
+            if not fails:
+                InfoBar.success(title="全部更新完成",
+                                content=f"{ok_count} 个助手已更新到最新版本",
+                                orient=Qt.Horizontal, isClosable=True,
+                                position=InfoBarPosition.TOP, duration=5000,
+                                parent=self)
+            else:
+                names = "、".join(f[0] for f in fails)
+                InfoBar.warning(title="部分更新失败",
+                                content=(f"成功 {ok_count} 个；失败：{names}"
+                                         "（详情见对应卡片的更新弹窗）"),
+                                orient=Qt.Horizontal, isClosable=True,
+                                position=InfoBarPosition.TOP, duration=8000,
+                                parent=self)
+        except Exception:
+            pass
 
     def _on_rank_row_clicked(self, key):
         """榜单行点击分流：官方助手 → 二级详情；预约条目（无详情页）→ 官网。"""
