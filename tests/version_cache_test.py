@@ -56,5 +56,21 @@ p = launcher._version_cache_path("ok-ww")
 chk("缓存路径在 logs/ 下", os.path.basename(os.path.dirname(p)) == "logs"
     and os.path.basename(p) == "versions-ok-ww.json", p)
 
+print("\n--- 4) 检查间隔设置（TTL 可配置，对齐 Magpie）---")
+real_cfg = launcher._load_cfg_safe
+launcher._load_cfg_safe = lambda: {}
+chk("默认 TTL 30 分钟", launcher._update_check_ttl() == 1800,
+    launcher._update_check_ttl())
+launcher._load_cfg_safe = lambda: {"update_check_interval_min": 360}
+chk("config 6 小时 → 21600s", launcher._update_check_ttl() == 21600,
+    launcher._update_check_ttl())
+launcher._load_cfg_safe = lambda: {"update_check_interval_min": 0}
+chk("误设 0 → 下限 5 分钟", launcher._update_check_ttl() == 300,
+    launcher._update_check_ttl())
+launcher._load_cfg_safe = lambda: {"update_check_interval_min": "1440"}
+chk("字符串 1440 也能解析", launcher._update_check_ttl() == 86400,
+    launcher._update_check_ttl())
+launcher._load_cfg_safe = real_cfg
+
 print("\n%d failed" % len(fails))
 sys.exit(1 if fails else 0)

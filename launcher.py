@@ -547,6 +547,20 @@ def _read_version_cache(path):
     return None, None
 
 
+def _update_check_ttl():
+    """「检查间隔」设置（用户定稿，对齐 Magpie）：缓存多少分钟内可信。
+
+    config.update_check_interval_min，默认 30；下限 5 分钟防误设成 0。
+    """
+    try:
+        raw = _load_cfg_safe().get("update_check_interval_min")
+        # 注意别写 `raw or 30`：显式 0 会被当缺省吞掉，永远到不了下限钳制
+        v = int(raw) if raw is not None else 30
+    except Exception:
+        v = 30
+    return max(5, v) * 60
+
+
 class GitVersionFetcher(QThread):
     """后台从各游戏**本地 git 仓库**读取「版本 + 更新说明」列表。
 
@@ -8833,7 +8847,7 @@ class AppCard(CardWidget):
                     self._on_versions_fetched(_cached)
                 except Exception:
                     pass
-                if _age is not None and _age < 1800:
+                if _age is not None and _age < _update_check_ttl():
                     self._version_fetch_started = True
                     return
             if self._version_fetcher and self._version_fetcher.isRunning():
@@ -13629,6 +13643,24 @@ class SettingsPage(QWidget):
         self.tray_chk.stateChanged.connect(self._save_tray_toggle)
         root.addWidget(self.tray_chk)
 
+        # 检查间隔（用户定稿，对齐 Magpie）：更新缓存的可信窗口，
+        # 窗口内重启不再发 git fetch / API 请求
+        iv_row = QHBoxLayout()
+        iv_lbl = CaptionLabel("检查间隔")
+        iv_lbl.setStyleSheet("color:#888780; font-size:12px;")
+        iv_row.addWidget(iv_lbl)
+        iv_row.addStretch(1)
+        self.interval_seg = SegmentedWidget()
+        for _k, _label in (("30", "30 分钟"), ("60", "1 小时"),
+                           ("360", "6 小时"), ("1440", "24 小时")):
+            self.interval_seg.addItem(_k, _label)
+        _cur = str(self._read_cfg().get("update_check_interval_min") or 30)
+        self.interval_seg.setCurrentItem(
+            _cur if _cur in ("30", "60", "360", "1440") else "30")
+        self.interval_seg.currentItemChanged.connect(self._save_check_interval)
+        iv_row.addWidget(self.interval_seg)
+        root.addLayout(iv_row)
+
         # 「发送测试」按钮：不部署服务端也能验通路。
         # 它起一个本机假接收端，用真实发送逻辑打一条样本过去，然后回显收到的内容。
         # 为什么需要：endpoint 留空时上报函数会**静默 return**，
@@ -13782,6 +13814,20 @@ class SettingsPage(QWidget):
             return
         self.tele_ping_chk.setEnabled(self.tele_chk.isChecked())
         self._refresh_tele_tip()
+
+    def _save_check_interval(self, key):
+        """检查间隔写回 config.update_check_interval_min（分钟）。"""
+        try:
+            v = int(key)
+        except Exception:
+            v = 30
+        cfg = self._read_cfg()
+        cfg["update_check_interval_min"] = max(5, v)
+        try:
+            with open(self._cfg_path(), "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            QMessageBox.warning(self, "保存失败", "写 config.json 失败：%s" % e)
 
     def _save_tray_toggle(self):
         """托盘开关写回 config.json（独立键 tray_close_to_tray，默认关）。"""
