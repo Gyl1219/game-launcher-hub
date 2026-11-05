@@ -53,7 +53,7 @@ from PySide6.QtWidgets import (
     QMessageBox, QLabel, QScrollArea, QTextEdit, QProgressBar, QProgressDialog,
     QStackedWidget, QFileDialog, QPushButton, QSizePolicy,
     QSpacerItem, QGraphicsScene, QGraphicsPixmapItem, QGraphicsBlurEffect,
-    QFrame, QGraphicsDropShadowEffect, QSystemTrayIcon,
+    QFrame, QGraphicsDropShadowEffect, QSystemTrayIcon, QRadioButton,
 )
 from qfluentwidgets import (
     setTheme, Theme, CardWidget, IconWidget, StrongBodyLabel,
@@ -1106,6 +1106,17 @@ def _load_cfg_safe():
             return json.load(f)
     except Exception:
         return {}
+
+
+def _save_cfg_file(cfg):
+    """config.json 全量写回（_load_cfg_safe 的对偶）。返回是否成功。"""
+    try:
+        with open(os.path.join(LAUNCHER_DIR, "config.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
 
 
 def _human_size(nbytes):
@@ -13636,12 +13647,8 @@ class SettingsPage(QWidget):
         root.addWidget(self.tele_tip)
         self._refresh_tele_tip()
 
-        # 关闭到托盘（用户定稿）：默认关，开启后点关闭隐藏到托盘
-        self.tray_chk = CheckBox("关闭时最小化到托盘（后台任务继续）")
-        self.tray_chk.setCursor(Qt.PointingHandCursor)
-        self.tray_chk.setChecked(bool(self._read_cfg().get("tray_close_to_tray")))
-        self.tray_chk.stateChanged.connect(self._save_tray_toggle)
-        root.addWidget(self.tray_chk)
+        # 关窗行为改由关闭时的选择框 + 「不再提醒」管理（tray_close_action），
+        # 设置页不再放开关 —— 避免两处状态不同步。
 
         # 检查间隔（用户定稿，对齐 Magpie）：更新缓存的可信窗口，
         # 窗口内重启不再发 git fetch / API 请求
@@ -13823,16 +13830,6 @@ class SettingsPage(QWidget):
             v = 30
         cfg = self._read_cfg()
         cfg["update_check_interval_min"] = max(5, v)
-        try:
-            with open(self._cfg_path(), "w", encoding="utf-8") as f:
-                json.dump(cfg, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            QMessageBox.warning(self, "保存失败", "写 config.json 失败：%s" % e)
-
-    def _save_tray_toggle(self):
-        """托盘开关写回 config.json（独立键 tray_close_to_tray，默认关）。"""
-        cfg = self._read_cfg()
-        cfg["tray_close_to_tray"] = bool(self.tray_chk.isChecked())
         try:
             with open(self._cfg_path(), "w", encoding="utf-8") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
@@ -16232,6 +16229,37 @@ class _TrayIcon(QSystemTrayIcon):
             pass
 
 
+class _CloseChoiceDialog(QDialog):
+    """关窗选择（用户定稿，对齐 TapTap）：隐藏到任务栏托盘 / 退出启动器。
+
+    「不再提醒」把选择写进 config.tray_close_action（hide / exit），
+    之后关窗直接执行不再弹；想改回来在设置里清掉该键即可。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("关闭启动器")
+        self.setModal(True)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(24, 20, 24, 16)
+        v.setSpacing(12)
+        self.hide_rb = QRadioButton("隐藏到任务栏托盘（后台任务继续）")
+        self.hide_rb.setChecked(True)
+        v.addWidget(self.hide_rb)
+        self.exit_rb = QRadioButton("退出启动器")
+        v.addWidget(self.exit_rb)
+        self.remember_chk = CheckBox("不再提醒（记住我的选择）")
+        v.addWidget(self.remember_chk)
+        ok = PrimaryPushButton("确定")
+        ok.clicked.connect(self.accept)
+        v.addWidget(ok)
+
+    def result_pair(self):
+        """返回 (动作, 是否记住)：动作是 "hide" 或 "exit"。"""
+        return ("hide" if self.hide_rb.isChecked() else "exit",
+                self.remember_chk.isChecked())
+
+
 class Launcher(QWidget):
     def __init__(self):
         super().__init__()
@@ -16381,18 +16409,39 @@ class Launcher(QWidget):
         后端不清会留孤儿 python 进程（Job Object 只在句柄关闭时兜底，
         正常退出路径必须显式走 close 接口）。
 
-        托盘分支（用户定稿）：设置页开启「关闭时最小化到托盘」时，
-        点关闭 = 隐藏窗口、任务继续（心跳/后端都不停）；真正的退出
-        走托盘菜单「退出」（置 _tray_force_exit 后进同一套清理）。
+        关窗选择（用户定稿，对齐 TapTap）：config.tray_close_action 未设置时
+        弹选择框（隐藏到托盘 / 退出 + 「不再提醒」）；记住选择后直接执行。
+        「隐藏」= 任务继续（心跳/后端都不停）；「退出」与托盘菜单「退出」
+        （置 _tray_force_exit）走同一套清理。
         """
-        if (not getattr(self, "_tray_force_exit", False)
-                and bool(_load_cfg_safe().get("tray_close_to_tray"))):
-            event.ignore()
-            self.hide()
-            self._tray_minimized = True
-            if getattr(self, "_tray", None) is not None:
-                self._tray.show_minimized_tip()
-            return
+        if not getattr(self, "_tray_force_exit", False):
+            act = (_load_cfg_safe().get("tray_close_action") or "")
+            if act not in ("hide", "exit"):
+                if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
+                    # 测试环境不弹模态框（mas_data 等构造 Launcher 的测试关窗会
+                    # 被真对话框挂死）；弹窗链路由 tray_test 用替身专门覆盖
+                    act = "exit"
+                else:
+                    try:
+                        dlg = _CloseChoiceDialog(self)
+                        if dlg.exec() != QDialog.Accepted:
+                            event.ignore()      # 用户点了 X / Esc：取消关闭
+                            return
+                        act, remember = dlg.result_pair()
+                        if remember:
+                            cfg = _load_cfg_safe()
+                            cfg["tray_close_action"] = act
+                            _save_cfg_file(cfg)
+                    except Exception:
+                        act = "exit"            # 对话框异常兜底：正常退出
+            if act == "hide":
+                event.ignore()
+                self.hide()
+                self._tray_minimized = True
+                if getattr(self, "_tray", None) is not None:
+                    self._tray.show_minimized_tip()
+                return
+            # act == "exit" → 走下面的完整退出清理
         try:
             heartbeat().set_enabled(False)
             proc_scanner().shutdown()

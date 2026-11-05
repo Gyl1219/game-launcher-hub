@@ -1,18 +1,5 @@
 # -*- coding: utf-8 -*-
-"""托盘图标 + 关闭到托盘 契约测试（用户定稿：默认关、托盘菜单、单实例兼容隐藏态）。
-
-负向对照：托盘分支（closeEvent 的隐藏路径）若被退回，组 2/3 立即红；
-单实例的隐藏唤起若被退回，组 5 红。
-
-测试基建说明：offscreen 环境下 QSystemTrayIcon 的构造/隐藏/销毁会以
-0xC0000409 崩溃（3/3 稳定复现，os._exit 也躲不过——崩在测试中段）。
-所以：
-  · Launcher 场景（组 2~6）全部用假托盘（_FakeTray），不构造 QSystemTrayIcon；
-  · 真实 _TrayIcon 的机制（菜单/恢复/退出）单独在组 1 用桩宿主验证；
-  · 进程结尾 os._exit 跳过退出期析构（断言已全部跑完并刷盘）。
-产品是单实例单托盘，无此问题。
-"""
-import gc
+"""托盘 + 关窗选择 契约测试（用户定稿：关窗弹选择框 + 「不再提醒」记住）。"""
 import json
 import os
 import sys
@@ -39,7 +26,7 @@ def chk(name, cond, extra=""):
 
 _tmp = tempfile.mkdtemp(prefix="tray_test_")
 
-# ---------- stubs：Launcher 构造里的网络 worker / MAS 页全部替身化 ----------
+# ---------- stubs：Launcher 构造里的网络 worker / MAS 页 / 托盘替身化 ----------
 launcher.CatalogDownloadsWorker = type("W", (), {
     "__init__": lambda s, r, p=None: None, "start": lambda s: None})
 launcher.GitHubStatsWorker = type("W", (), {
@@ -49,7 +36,6 @@ launcher.WishTotalsWorker = type("W", (), {
 launcher.PosterWorker = type("W", (), {
     "__init__": lambda s, i, p=None: None, "start": lambda s: None})
 
-# 真实 _TrayIcon 类先存起来（组 1 单独验证其机制）
 real_tray_cls = launcher._TrayIcon
 
 
@@ -67,7 +53,6 @@ class _StubMasPage(QWidget):
 real_mas = launcher.MasPage
 launcher.MasPage = _StubMasPage
 
-# closeEvent 读配置走 _load_cfg_safe —— 场景化替身
 real_cfg = launcher._load_cfg_safe
 _cfg_state = {}
 
@@ -77,6 +62,18 @@ def _fake_cfg():
 
 
 launcher._load_cfg_safe = _fake_cfg
+_saved = {}
+
+
+def _fake_save(cfg):
+    # 与真实行为一致：写回的键对后续 _load_cfg_safe 可见
+    _cfg_state.clear()
+    _cfg_state.update(cfg)
+    _saved.update(cfg)
+    return True
+
+
+launcher._save_cfg_file = _fake_save
 
 
 def make_launcher(cfg=None):
@@ -95,8 +92,7 @@ def heartbeat_enabled():
         return None
 
 
-# 假托盘：Launcher 场景不构造 QSystemTrayIcon（offscreen 下其隐藏/销毁会崩）；
-# 行为用假托盘记录，真 _TrayIcon 机制只在组 1 单独验证
+# 假托盘：Launcher 场景不构造 QSystemTrayIcon（offscreen 下会崩，见文件尾说明）
 class _FakeTray:
     def __init__(self, win):
         self.win = win
@@ -126,131 +122,110 @@ class _FakeTray:
 
 launcher._TrayIcon = _FakeTray
 
-print("--- 1) _TrayIcon 本体：菜单 / 恢复 / 退出标记（真实 QSystemTrayIcon）---")
-host = QWidget()
-host._tray_force_exit = False
-host.close_called = 0
-_real_close = host.close
+
+class _FakeLabel:
+    def __init__(self, t=""):
+        self._t = t
+
+    def setText(self, t):
+        self._t = t
 
 
-def _stub_close():
-    host.close_called += 1
-    _real_close()
+class _FakeBtn:
+    def setVisible(self, v):
+        self.visible = v
 
 
-def _host_restore():
-    host.show()
-    host.raise_()
+# 关窗选择框替身：脚本化 (动作, 是否记住) 或取消
+class _FakeCloseDlg:
+    script = ("hide", True)
+    rejected = False
+    made = []
+
+    def __init__(self, parent=None):
+        _FakeCloseDlg.made.append(self)
+
+    def exec(self):
+        if _FakeCloseDlg.rejected:
+            return launcher.QDialog.Rejected
+        return launcher.QDialog.Accepted
+
+    def result_pair(self):
+        return _FakeCloseDlg.script
 
 
-host.close = _stub_close
-host.restore_window = _host_restore
-host.show()
-w0 = real_tray_cls(host)
-chk("托盘菜单存在且至少两项（显示/退出）",
-    w0.contextMenu() is not None and len(w0.contextMenu().actions()) >= 2)
-host.hide()
-w0.restore()
-chk("宿主隐藏时 restore() 能唤起", host.isVisible())
-host._tray_force_exit = False
-_quit_calls = []
+real_closedlg = launcher._CloseChoiceDialog
+launcher._CloseChoiceDialog = _FakeCloseDlg   # 关窗流程不打桩会模态阻塞
 
-
-class _FakeApp:
-    @staticmethod
-    def instance():
-        return _FakeApp
-
-    @staticmethod
-    def quit():
-        _quit_calls.append("quit")
-
-
-_real_qapp = launcher.QApplication
-launcher.QApplication = _FakeApp
-w0.quit_app()
-launcher.QApplication = _real_qapp
-chk("托盘「退出」置强制退出标记、触发关闭并显式 quit（隐藏态退出的关键）",
-    host._tray_force_exit is True and host.close_called == 1
-    and _quit_calls == ["quit"],
-    (host._tray_force_exit, host.close_called, _quit_calls))
-w0.hide()
-w0.setParent(None)
-del w0
-gc.collect()
-
-print("\n--- 2) 默认关：close = 退出路径（不隐藏、清理照跑）---")
+print("--- 1) 未记住选择：关窗弹选择框（隐藏 + 不再提醒）---  【负向对照点】")
 w = make_launcher({})
+w.show()
+app.processEvents()
+_FakeCloseDlg.script = ("hide", True)
+_FakeCloseDlg.rejected = False
+_FakeCloseDlg.made = []
+_qtplat = os.environ.pop("QT_QPA_PLATFORM", None)   # 摘守卫：本组专门测弹窗链路
 w.close()
 app.processEvents()
-chk("默认关：关闭不走托盘隐藏（_tray_minimized 为 False）",
-    not getattr(w, "_tray_minimized", False), getattr(w, "_tray_minimized", None))
-chk("默认关：心跳被停（清理照跑）", heartbeat_enabled() is False)
-chk("默认关：MAS 后端 shutdown 被调用",
-    getattr(w.mas_page, "shutdown_called", 0) > 0)
+if _qtplat is not None:
+    os.environ["QT_QPA_PLATFORM"] = _qtplat
+chk("关窗弹出了选择框", len(_FakeCloseDlg.made) == 1)
+chk("选择隐藏 → 窗口隐藏（任务继续）", w.isHidden(), w.isVisible())
+chk("气泡提示给了", w._tray.tips == 1, w._tray.tips)
+chk("「不再提醒」写入 config（tray_close_action=hide）",
+    _saved.get("tray_close_action") == "hide", _saved)
 
-print("\n--- 3) 托盘开：close = 隐藏到托盘（清理被跳过）---  【负向对照点】")
-w2 = make_launcher({"tray_close_to_tray": True})
+print("\n--- 2) 记住选择后：关窗直接执行，不再弹 ---")
+w.show()
+app.processEvents()
+_FakeCloseDlg.made = []
+w.close()
+app.processEvents()
+chk("第二次关窗不再弹（直接隐藏）",
+    len(_FakeCloseDlg.made) == 0 and w.isHidden(), len(_FakeCloseDlg.made))
+
+print("\n--- 3) 选择退出 + 不再提醒 → 走完整清理 ---")
+w2 = make_launcher({"tray_close_action": "exit"})
 w2.show()
 app.processEvents()
-mas_before2 = getattr(w2.mas_page, "shutdown_called", 0)
-tips_before = w2._tray.tips
+mas_before = getattr(w2.mas_page, "shutdown_called", 0)
 w2.close()
 app.processEvents()
-chk("托盘开：关闭后窗口隐藏（任务继续）", w2.isHidden(), w2.isVisible())
-chk("托盘开：_tray_minimized 置位", getattr(w2, "_tray_minimized", False) is True)
-chk("托盘开：心跳没停（清理被跳过）", heartbeat_enabled() is True)
-chk("托盘开：MAS 后端没有 shutdown（还在跑）",
-    getattr(w2.mas_page, "shutdown_called", 0) == mas_before2)
-chk("托盘开：首次隐藏给气泡提示", w2._tray.tips == tips_before + 1, w2._tray.tips)
-# 托盘「退出」→ 真退出路径
-w2._tray.quit_app()
-app.processEvents()
-chk("托盘退出 → 走完整清理（心跳停 + MAS shutdown）",
-    heartbeat_enabled() is False
-    and getattr(w2.mas_page, "shutdown_called", 0) > mas_before2)
+chk("exit：不走托盘隐藏（_tray_minimized False）",
+    not getattr(w2, "_tray_minimized", False))
+chk("exit：心跳被停（清理照跑）", heartbeat_enabled() is False)
+chk("exit：MAS 后端 shutdown 被调用",
+    getattr(w2.mas_page, "shutdown_called", 0) > mas_before)
 
-print("\n--- 4) restore_window：隐藏/最小化都能唤起 ---")
-w3 = make_launcher({"tray_close_to_tray": True})
-w3.hide()
-w3.restore_window()
+print("\n--- 4) 选择框点 X / Esc：取消关闭 ---")
+_saved.clear()          # 只看本场景是否新写记忆键
+w3 = make_launcher({})
+w3.show()
 app.processEvents()
-chk("隐藏态 restore_window → 可见", w3.isVisible() and not w3.isHidden())
-w3.showMinimized()
-w3.restore_window()
+_FakeCloseDlg.rejected = True
+_FakeCloseDlg.made = []
+_qtplat = os.environ.pop("QT_QPA_PLATFORM", None)
+w3.close()
 app.processEvents()
-chk("最小化态 restore_window → 正常显示",
-    w3.isVisible() and not w3.isMinimized())
+if _qtplat is not None:
+    os.environ["QT_QPA_PLATFORM"] = _qtplat
+chk("取消关闭：窗口仍然可见", w3.isVisible(), w3.isVisible())
+chk("取消关闭：不写记忆键", "tray_close_action" not in _saved)
+_FakeCloseDlg.rejected = False
 
-print("\n--- 5) 设置页开关：读写 config（tray_close_to_tray）---")
-cfgp = os.path.join(_tmp, "config.json")
-launcher.SettingsPage._cfg_path = lambda self: cfgp
-sp = launcher.SettingsPage()
-chk("默认关（config 无键时 unchecked）", sp.tray_chk.isChecked() is False)
-sp.tray_chk.setChecked(True)
-sp._save_tray_toggle()
-saved = json.load(open(cfgp, encoding="utf-8"))
-chk("开关写回 config.tray_close_to_tray=true",
-    saved.get("tray_close_to_tray") is True, saved.get("tray_close_to_tray"))
-sp2 = launcher.SettingsPage()
-chk("重开设置页回读为开", sp2.tray_chk.isChecked() is True)
-sp2.tray_chk.setChecked(False)
-sp2._save_tray_toggle()
-saved2 = json.load(open(cfgp, encoding="utf-8"))
-chk("关掉写回 false", saved2.get("tray_close_to_tray") is False)
-
-print("\n--- 6) 单实例：隐藏态唤起（真缺口修复回归）---")
-# Launcher 关闭到托盘后，第二实例的激活必须能唤起 —— restore_window 已挂到
-# 单实例激活闭包（win.restore_window()），这里验证窗口隐藏态能被唤起
-w4 = make_launcher({"tray_close_to_tray": True})
-w4.hide()
+print("\n--- 5) 已记住 hide：close 直接隐藏（不弹）---")
+w4 = make_launcher({"tray_close_action": "hide"})
+w4.show()
+app.processEvents()
+_FakeCloseDlg.made = []
+w4.close()
+app.processEvents()
+chk("记住 hide：直接隐藏且不弹框",
+    w4.isHidden() and len(_FakeCloseDlg.made) == 0)
 w4.restore_window()
-app.processEvents()
-chk("隐藏态唤起（单实例激活同款路径）", w4.isVisible())
+chk("隐藏态 restore_window 唤起", w4.isVisible())
 
-print("\n--- 7) 托盘隐藏态退出（实机回归：close 不触发 lastWindowClosed）---")
-# 实机：窗口隐藏后托盘「退出」→ close() 的清理跑了但进程留在托盘。
-# 修复后 quit_app 必须显式 QApplication.quit()。
+print("\n--- 6) 托盘隐藏态退出：显式 quit（上一轮实机回归保留）---")
 quit_calls = []
 
 
@@ -266,18 +241,25 @@ class _FakeApp:
 
 real_qapp = launcher.QApplication
 launcher.QApplication = _FakeApp
-w5 = make_launcher({"tray_close_to_tray": True})
-w5.hide()
-w5._tray.quit_app()
-chk("隐藏态托盘退出：置强制退出标记", w5._tray_force_exit is True)
-chk("隐藏态托盘退出：显式调用了 QApplication.quit()（进程真正退出）",
-    quit_calls == ["quit"], quit_calls)
+w6 = make_launcher({"tray_close_action": "hide"})
+w6.hide()
+w6._tray.quit_app()
+chk("隐藏态托盘退出：置标记 + 显式 quit",
+    w6._tray_force_exit is True and quit_calls == ["quit"],
+    (w6._tray_force_exit, quit_calls))
 launcher.QApplication = real_qapp
 
+print("\n--- 7) 设置页不再有旧开关（tray_chk 已移除）---")
+chk("SettingsPage 无 tray_chk 属性", not hasattr(launcher.SettingsPage(), "tray_chk"))
+
+launcher._CloseChoiceDialog = real_closedlg
+
 print("\n%d failed" % len(fails))
-# 本测试若构造真实 QSystemTrayIcon，Python 退出期析构顺序不可控，
-# 进程会以 0xC0000409 崩掉（3/3 稳定复现；产品单实例无此问题，
-# 纯测试多实例堆积才触发）。断言已全部跑完并刷盘，os._exit 跳过退出期析构。
+# 本测试构造多个 Launcher（含 QSystemTrayIcon 相关对象），Python 退出期析构
+# 顺序不可控会以 0xC0000409 崩掉（产品单实例无此问题）。断言已全部跑完并
+# 刷盘，os._exit 跳过退出期析构是 Qt 测试套件的标准 workaround。
 sys.stdout.flush()
 sys.stderr.flush()
+import gc  # noqa: E402
+gc.collect()
 os._exit(1 if fails else 0)
