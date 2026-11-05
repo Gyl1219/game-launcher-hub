@@ -9171,6 +9171,33 @@ class AppCard(CardWidget):
         run_exe(self.window(), target, [], need_admin=True)
 
     # ===== 动作：窗口内更新（下载到本启动器目录，真实进度；应用交回原启动器） =====
+    def _on_update_bg(self, dlg):
+        """更新下载转入后台：卡片上挂常驻 InfoBar（完成/失败时关闭）。"""
+        try:
+            self._bg_infobar = InfoBar.info(
+                title="更新下载已转入后台",
+                content="下载完成后会提示继续安装",
+                orient=Qt.Horizontal, isClosable=True,
+                position=InfoBarPosition.TOP, duration=-1, parent=self)
+        except Exception:
+            pass
+
+    def _on_update_resume(self, dlg):
+        """下载完成待应用：关后台提示、唤起对话框继续。"""
+        try:
+            ib = getattr(self, "_bg_infobar", None)
+            if ib is not None:
+                ib.close()
+                self._bg_infobar = None
+        except Exception:
+            pass
+        try:
+            dlg.resume_from_background()
+            dlg.raise_()
+            dlg.activateWindow()
+        except Exception:
+            pass
+
     def open_update_dialog(self):
         # 先刷新按钮状态，确保 _current_target 是最新的
         self.refresh_update_button()
@@ -9206,7 +9233,9 @@ class AppCard(CardWidget):
         dlg = UpdateDialog(
             self, self.app, cur, versions, git_url, preselected=preselected
         )
-        dlg.exec()
+        dlg.backgrounded.connect(self._on_update_bg)
+        dlg.resume_requested.connect(self._on_update_resume)
+        dlg.show()
 
     # ===== 动作：卸载（移入回收站，可撤销；不动其他 app 目录） =====
     def uninstall_app(self):
@@ -9374,6 +9403,8 @@ class AppCard(CardWidget):
 
 class UpdateDialog(QDialog):
     """窗口内「更新到所选版本」对话框：点开始后自动下载并应用到原启动器 working/。
+    backgrounded = Signal(object)      # 转入后台（携带 self）
+    resume_requested = Signal(object)  # 下载完成待应用（携带 self）
 
     流程：点「开始更新」→ 一次确认 → 后台下载镜像到 launcher/repos/<key>（作缓存，
     加速下次增量 fetch）→ 自动终止运行进程 → 同步代码到 app['working']（覆盖代码、
@@ -9390,6 +9421,8 @@ class UpdateDialog(QDialog):
         self.current = current
         self._worker = None
         self._busy = False   # 进度条是否处于忙碌态（不确定进度）
+        self._bar_floor = 0  # 单调地板：新拉取阶段（-2）时清零，阶段内防倒退
+        self._backgrounded = False
         self._bar_floor = 0  # 单调地板：新拉取阶段（-2）时清零，阶段内防倒退
 
         self.setWindowTitle(f"更新 {app['display']}")
@@ -9427,12 +9460,19 @@ class UpdateDialog(QDialog):
         row.addWidget(self.combo, stretch=1)
         v.addLayout(row)
 
-        # 真实进度条
+        bar_row = QHBoxLayout()
         self.bar = QProgressBar()
         self.bar.setFixedHeight(16)
         self.bar.setRange(0, 100)
         self.bar.setValue(0)
-        self.bar.setTextVisible(True)
+        self.bar.setTextVisible(False)
+        bar_row.addWidget(self.bar, stretch=1)
+        self.pct_label = StrongBodyLabel("0%")
+        self.pct_label.setFixedWidth(56)
+        self.pct_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.pct_label.setStyleSheet("font-size:16px; font-weight:600;")
+        bar_row.addWidget(self.pct_label)
+        v.addLayout(bar_row)
         v.addWidget(self.bar)
         # 忙碌态专用条（阶段无总量时切换显示）：QProgressBar 的 range(0,0)
         # 在样式化进度条上渲染成满格 —— 正是"没好进度就满了"的实机截图来源
@@ -9454,6 +9494,10 @@ class UpdateDialog(QDialog):
         self.start_btn.clicked.connect(self.start_update)
         btn_row1.addWidget(self.start_btn)
 
+        self.bg_btn = PushButton("后台下载")
+        self.bg_btn.setFixedHeight(38)
+        self.bg_btn.setVisible(False)
+        self.bg_btn.clicked.connect(self._minimize_to_background)
         self.close_btn = PushButton("关闭")
         self.close_btn.setFixedHeight(38)
         self.close_btn.clicked.connect(self.reject)
@@ -9492,6 +9536,7 @@ class UpdateDialog(QDialog):
         self.combo.setEnabled(False)
         self.status.setText(f"正在下载 {target}…")
         self.bar.setValue(0)
+        self.bg_btn.setVisible(True)
         self._worker = MirrorUpdater(self.app["key"], self.git_url, target, parent=self)
         self._worker.progress.connect(self.on_progress)
         self._worker.done.connect(self.on_done)
@@ -9504,7 +9549,7 @@ class UpdateDialog(QDialog):
           >= 0  确定进度（阶段映射或字节真值），单调地板 _bar_floor 防倒退
           -1    该阶段只有实时 MiB/速率、算不出百分比（dulwich Receiving 实时行）
                 → 切忙碌条（滚动），进度条隐藏；文字里的 MiB/速度在动
-          -2    新的拉取阶段开始（换源/切 checkout）→ 进度条回零、地板清零
+          -2    新的拉取阶段开始（换源 / checkout）→ 进度条回零、地板清零
 
         2026-10-27 的单调保护保留（阶段穿插输出不倒退），但以 -2 重置为界 ——
         否则增量更新的第二段拉取会永远卡在上一段的 100%（实机截图："明明没好
@@ -9518,6 +9563,7 @@ class UpdateDialog(QDialog):
             self.bar.setRange(0, 100)
             self._bar_floor = 0
             self.bar.setValue(0)
+            self.pct_label.setText("0%")
             self.status.setText(text or "准备拉取…")
             return
         if text and pct < 0 and _PROGRESS_BUSY_RE.search(text):
@@ -9533,26 +9579,40 @@ class UpdateDialog(QDialog):
         if pct >= 0:
             self._bar_floor = max(getattr(self, "_bar_floor", 0), pct)
             self.bar.setValue(min(100, self._bar_floor))
+            self.pct_label.setText("%d%%" % self._bar_floor)
             self.status.setText((text[:80] if text else "") or f"下载中… {pct}%")
         else:
             self.status.setText(text or "下载中…")
-
     def on_done(self, local_dir):
         target = _normalize_tag(self.versions[self.combo.currentIndex()])
         if self._busy:
             self._busy = False
+            self.busy_bar.setVisible(False)
+            self.bar.setVisible(True)
             self.bar.setRange(0, 100)
         self.bar.setValue(100)
+        self.pct_label.setText("100%")
+        self.bg_btn.setVisible(False)
+        if getattr(self, "_backgrounded", False):
+            # 后台模式：应用阶段会终止运行中的进程，必须用户在场 —— 停在待确认
+            self.status.setText(
+                f"下载完成（{target}）。点主界面「下载完成」提示继续安装。"
+            )
+            self.resume_requested.emit(self)
+            return
         self.status.setText(
-            f"下载完成，正在更新到原启动器 working/（{target}）…"
+            f"下载完成，正在更新到原启动器 working/（{target}）。"
         )
-        # 下载完成自动应用：杀进程 → 同步代码 → 写 app.json（用户无需再点按钮）
+        self._start_apply(local_dir, target)
+
+    def _start_apply(self, local_dir, target):
+        # 下载完成后自动应用：杀进程 → 同步 working → 写 app.json。用户不用再点按钮。
         self._apply_worker = ApplyWorker(self.app, target, local_dir, parent=self)
         self._apply_worker.progress.connect(self.status.setText)
         self._apply_worker.done.connect(self.on_apply_done)
         self._apply_worker.start()
-
     def on_failed(self, msg):
+        self.bg_btn.setVisible(False)
         self.bar.setValue(0)
         self.status.setText(
             f"下载失败：{msg}\n\n可改点「打开原版管理窗口」由原启动器直接更新。"

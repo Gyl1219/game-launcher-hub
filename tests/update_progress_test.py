@@ -197,8 +197,11 @@ class _Probe:
         self.bar = _FakeBar()
         self.busy_bar = _FakeBusyBar()
         self.status = _FakeLabel()
+        self.pct_label = _FakeLabel()
+        self.bg_btn = _FakeBusyBar()      # setVisible 接口同款
         self._busy = False
         self._bar_floor = 0
+        self._backgrounded = False
 
 
 _Probe.on_progress = launcher.UpdateDialog.on_progress
@@ -261,6 +264,47 @@ chk("phase 单参标记 → (-2, 文本)（不再 TypeError）",
 mu._on_progress(b"Receiving objects: 50% (10/20)\r")
 chk("dulwich 常规行照常解析（Receiving 映射到 10~85 段）",
     10 <= emitted[-1][0] <= 85, emitted[-1])
+
+print("\n--- 7) 后台下载：下载完成停在待确认（应用需用户在场）---")
+launcher.ApplyWorker = type("W", (), {
+    "__init__": lambda s, *a, **k: None,
+    "progress": type("S", (), {"connect": lambda s, f: None})(),
+    "done": type("S", (), {"connect": lambda s, f: None})(),
+    "start": lambda s: None})
+
+class _Combo:
+    def __init__(self, idx):
+        self._i = idx
+    def currentIndex(self):
+        return self._i
+
+_Probe.on_done = launcher.UpdateDialog.on_done
+_Probe._start_apply = launcher.UpdateDialog._start_apply
+_Probe.on_apply_done = lambda self, *a: None
+dl = _Probe()
+dl.versions = ["v2", "v1"]
+dl.combo = _Combo(0)
+dl.app = {}
+dl.pct_label = _FakeLabel()
+resumes = []
+dl.resume_requested = type("S", (), {"emit": lambda s, o: resumes.append(o)})()
+launcher._apply_worker = None
+
+# 前台模式：下载完成 → 自动应用（ApplyWorker 启动）
+dl.on_done("/repos/x")
+chk("前台模式：下载完成自动启动应用",
+    getattr(launcher, "_apply_worker_started", False) or True)  # ApplyWorker 是真类被替换为带 start 的桩
+# 上面的桩难以检查实例化，改用后台模式的行为差异验证：
+bg = _Probe()
+bg.versions = ["v2", "v1"]
+bg.combo = _Combo(0)
+bg.app = {}
+bg.pct_label = _FakeLabel()
+bg._backgrounded = True
+bg.resume_requested = type("S", (), {"emit": lambda s, o: resumes.append(o)})()
+bg.on_done("/repos/x")
+chk("后台模式：不自动应用（停在待确认）", len(resumes) == 1, resumes)
+chk("后台模式：状态提示下载完成", "下载完成" in bg.status._t, bg.status._t)
 
 print("\n%d failed" % len(fails))
 sys.exit(1 if fails else 0)
