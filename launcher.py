@@ -12861,7 +12861,7 @@ class OverviewPage(QWidget):
         self.mas_cap.setStyleSheet("color:#8a8d96;")
         mb.addWidget(self.mas_cap)
         # 全部更新（用户定稿）：≥2 张卡有更新时显示，串行队列逐个下载+应用
-        self.update_all_btn = PushButton("全部更新")
+        self.update_all_btn = PrimaryPushButton("全部更新")  # 主题蓝底白字：这是页面主行动入口，要和扫描/编排按钮区分开
         self.update_all_btn.setFixedHeight(32)
         self.update_all_btn.setCursor(Qt.PointingHandCursor)
         self.update_all_btn.clicked.connect(self._on_update_all_clicked)
