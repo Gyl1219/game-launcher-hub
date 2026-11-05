@@ -13669,6 +13669,24 @@ class SettingsPage(QWidget):
         iv_row.addWidget(self.interval_seg)
         root.addLayout(iv_row)
 
+        # 关闭窗口（用户定稿）：与关窗选择框共用 tray_close_action，
+        # 「每次询问」= 清掉记忆，关窗恢复弹选择框
+        ca_row = QHBoxLayout()
+        ca_lbl = CaptionLabel("关闭窗口")
+        ca_lbl.setStyleSheet("color:#888780; font-size:12px;")
+        ca_row.addWidget(ca_lbl)
+        ca_row.addStretch(1)
+        self.close_action_seg = SegmentedWidget()
+        for _k, _label in (("ask", "每次询问"), ("hide", "隐藏到托盘"),
+                           ("exit", "直接退出")):
+            self.close_action_seg.addItem(_k, _label)
+        _ca = str(self._read_cfg().get("tray_close_action") or "")
+        self.close_action_seg.setCurrentItem(
+            _ca if _ca in ("hide", "exit") else "ask")
+        self.close_action_seg.currentItemChanged.connect(self._save_close_action)
+        ca_row.addWidget(self.close_action_seg)
+        root.addLayout(ca_row)
+
         # 「发送测试」按钮：不部署服务端也能验通路。
         # 它起一个本机假接收端，用真实发送逻辑打一条样本过去，然后回显收到的内容。
         # 为什么需要：endpoint 留空时上报函数会**静默 return**，
@@ -13822,6 +13840,16 @@ class SettingsPage(QWidget):
             return
         self.tele_ping_chk.setEnabled(self.tele_chk.isChecked())
         self._refresh_tele_tip()
+
+    def _save_close_action(self, key):
+        """关窗行为写回 config.tray_close_action：ask=每次询问（清掉记忆）。"""
+        cfg = self._read_cfg()
+        cfg["tray_close_action"] = "" if key == "ask" else key
+        try:
+            with open(self._cfg_path(), "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            QMessageBox.warning(self, "保存失败", "写 config.json 失败：%s" % e)
 
     def _save_check_interval(self, key):
         """检查间隔写回 config.update_check_interval_min（分钟）。"""
