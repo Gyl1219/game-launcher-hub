@@ -9539,9 +9539,10 @@ class AppCard(CardWidget):
 
 
 class UpdateDialog(QDialog):
-    """窗口内「更新到所选版本」对话框：点开始后自动下载并应用到原启动器 working/。
     backgrounded = Signal(object)      # 转入后台（携带 self）
     resume_requested = Signal(object)  # 下载完成待应用（携带 self）
+
+    """窗口内「更新到所选版本」对话框：点开始后自动下载并应用到原启动器 working/。
 
     流程：点「开始更新」→ 一次确认 → 后台下载镜像到 launcher/repos/<key>（作缓存，
     加速下次增量 fetch）→ 自动终止运行进程 → 同步代码到 app['working']（覆盖代码、
@@ -9756,6 +9757,32 @@ class UpdateDialog(QDialog):
         )
         self.start_btn.setEnabled(True)
         self.combo.setEnabled(True)
+        if getattr(self, "_backgrounded", False):
+            # 后台模式下失败：关掉宿主的常驻 InfoBar（发一次 resume 让它清理），
+            # 并把对话框唤回前台 —— 失败信息必须让用户看见。
+            self._backgrounded = False
+            self.resume_requested.emit(self)
+            self.show()
+            self.raise_()
+            self.activateWindow()
+
+    def _minimize_to_background(self):
+        """「后台下载」：隐藏对话框、下载继续；宿主卡片挂常驻 InfoBar。
+
+        下载完成后 on_done 走后台分支（停在待确认，应用必须用户在场）；
+        重新打开对话框（resume_from_background / 再次点「更新」）无缝续接。
+        """
+        if self._worker is None:
+            return  # 没有下载在跑时按钮本应隐藏，保险起见不动作
+        self._backgrounded = True
+        self.hide()
+        self.backgrounded.emit(self)
+
+    def resume_from_background(self):
+        """从后台模式唤回：显示对话框，下载完成时停在待确认状态可见。"""
+        self.show()
+        self.raise_()
+        self.activateWindow()
 
     # 注：原「应用到 working 目录」按钮 + apply_direct 方法已删除，
     # 下载完成后由 on_done 自动调用 ApplyWorker 完成 kill + 同步 + 写 current_version。

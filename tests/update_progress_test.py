@@ -306,5 +306,53 @@ bg.on_done("/repos/x")
 chk("后台模式：不自动应用（停在待确认）", len(resumes) == 1, resumes)
 chk("后台模式：状态提示下载完成", "下载完成" in bg.status._t, bg.status._t)
 
+print("\n--- 8) UpdateDialog 真类契约（实机 AttributeError 回归）---")
+# 实机报错：'UpdateDialog' object has no attribute '_minimize_to_background'
+# 根因：后台下载那次重构把信号写进了 docstring、两个方法没落地 —— 而本文件
+# 之前的用例全用假探针绑方法，真类缺成员照样全绿。本组直接查真类。
+from PySide6.QtCore import Signal as _RealSignal
+
+chk("UpdateDialog 有 _minimize_to_background 方法",
+    callable(getattr(launcher.UpdateDialog, "_minimize_to_background", None)),
+    getattr(launcher.UpdateDialog, "_minimize_to_background", None))
+chk("UpdateDialog 有 resume_from_background 方法",
+    callable(getattr(launcher.UpdateDialog, "resume_from_background", None)),
+    getattr(launcher.UpdateDialog, "resume_from_background", None))
+chk("backgrounded 是真 Signal（此前误写进 docstring）",
+    isinstance(launcher.UpdateDialog.__dict__.get("backgrounded"), _RealSignal),
+    type(launcher.UpdateDialog.__dict__.get("backgrounded")).__name__)
+chk("resume_requested 是真 Signal",
+    isinstance(launcher.UpdateDialog.__dict__.get("resume_requested"), _RealSignal),
+    type(launcher.UpdateDialog.__dict__.get("resume_requested")).__name__)
+
+# 行为回归：把真方法绑到探针上跑一遍
+_Probe._minimize_to_background = launcher.UpdateDialog._minimize_to_background
+_Probe.resume_from_background = launcher.UpdateDialog.resume_from_background
+_hidden, _emitted_bg = [], []
+mini = _Probe()
+mini._worker = object()          # 下载在跑
+mini.hide = lambda: _hidden.append(1)
+mini.backgrounded = type("S", (), {"emit": lambda s, o: _emitted_bg.append(o)})()
+mini._minimize_to_background()
+chk("后台化：置标记 + 隐藏 + 发 backgrounded 信号",
+    bool(_hidden) and bool(_emitted_bg) and mini._backgrounded is True,
+    (_hidden, _emitted_bg, mini._backgrounded))
+
+_noop_hide, _noop_bg = [], []
+mini2 = _Probe()
+mini2._worker = None             # 没有下载在跑
+mini2.hide = lambda: _noop_hide.append(1)
+mini2.backgrounded = type("S", (), {"emit": lambda s, o: _noop_bg.append(o)})()
+mini2._minimize_to_background()
+chk("无下载在跑时后台化不动作", not _noop_hide and not _noop_bg,
+    (_noop_hide, _noop_bg))
+
+_shown = []
+mini.show = lambda: _shown.append(1)
+mini.raise_ = lambda: None
+mini.activateWindow = lambda: None
+mini.resume_from_background()
+chk("唤回后台对话框：重新显示", _shown == [1], _shown)
+
 print("\n%d failed" % len(fails))
 sys.exit(1 if fails else 0)
